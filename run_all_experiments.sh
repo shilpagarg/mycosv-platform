@@ -4,10 +4,15 @@
 # with complete intermediate file preservation.
 #
 # Usage:
-#   bash run_all_experiments.sh              # Run all experiments
-#   bash run_all_experiments.sh --small      # Small-scale only
-#   bash run_all_experiments.sh --large      # Large-scale/million-scale only
-#   bash run_all_experiments.sh --real       # Real data only
+#   bash run_all_experiments.sh                    # Run all experiments
+#   bash run_all_experiments.sh --small            # Small-scale only
+#   bash run_all_experiments.sh --large            # Large-scale/million-scale only
+#   bash run_all_experiments.sh --real             # Real panels only (per-species NCBI + ENA)
+#   bash run_all_experiments.sh --million-real     # Only the real million-scale NCBI index build
+#
+# Environment overrides for --million-real:
+#   MILLION_REAL_MAX_ASSEMBLIES=1000    # how many NCBI fungal assemblies to download
+#   MILLION_REAL_TARGET_CENTROIDS=1000000  # total centroids after decoy padding (0 = no padding)
 #
 # IMPORTANT: we intentionally do NOT use `set -e` at the script level for the
 # real-data stage. A single panel/network/tool failure must not abort the rest
@@ -19,17 +24,23 @@ set -o pipefail
 
 WORK_DIR="/mnt/bmh01-rds/Shilpa_Group/2024/projects/fungi/AMF/scale"
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-EXPERIMENT_TYPE="${1:-all}"  # all, small, large, real
+EXPERIMENT_TYPE="${1:-all}"  # all, small, large, real, million-real
 
 # Strip leading dashes for convenience: --small and small are both accepted.
 EXPERIMENT_TYPE="${EXPERIMENT_TYPE#--}"
+
+# How many real NCBI fungal assemblies to download when building the real
+# million-scale routing index. Override with env var when needed.
+MILLION_REAL_MAX_ASSEMBLIES="${MILLION_REAL_MAX_ASSEMBLIES:-1000}"
+MILLION_REAL_TARGET_CENTROIDS="${MILLION_REAL_TARGET_CENTROIDS:-1000000}"
 
 # Create experiment directories
 SMALL_DIR="${WORK_DIR}/experiments/small_tests/${TIMESTAMP}"
 LARGE_DIR="${WORK_DIR}/experiments/large_scale/${TIMESTAMP}"
 REAL_DIR="${WORK_DIR}/experiments/real_data/${TIMESTAMP}"
+MILLION_REAL_DIR="${WORK_DIR}/experiments/million_real/${TIMESTAMP}"
 
-mkdir -p "${SMALL_DIR}" "${LARGE_DIR}" "${REAL_DIR}"
+mkdir -p "${SMALL_DIR}" "${LARGE_DIR}" "${REAL_DIR}" "${MILLION_REAL_DIR}" "${MILLION_REAL_DIR}"
 
 cd "${WORK_DIR}"
 
@@ -205,6 +216,42 @@ if [[ "$EXPERIMENT_TYPE" == "all" || "$EXPERIMENT_TYPE" == "large" ]]; then
 fi
 
 # ============================================================================
+# 4b. MILLION-SCALE *REAL* FUNGAL INDEX (downloads NCBI assemblies)
+# ============================================================================
+#
+# This stage downloads up to N real fungal assemblies from NCBI RefSeq, builds
+# a real MycoSV routing index over them, then pads the routing store with
+# synthetic decoys up to --target-centroids. This is the bridge between the
+# small per-panel real-data downloads and the previously-all-synthetic
+# million-scale benchmark. Disk/bandwidth heavy — opt-in via `million-real`
+# or `all`.
+# ============================================================================
+
+if [[ "$EXPERIMENT_TYPE" == "all" || "$EXPERIMENT_TYPE" == "million-real" ]]; then
+  echo -e "${YELLOW}[4b] Building real million-scale fungal routing index...${NC}"
+  echo "      Downloading up to ${MILLION_REAL_MAX_ASSEMBLIES} NCBI RefSeq assemblies"
+  echo "      Target centroids (real+decoys): ${MILLION_REAL_TARGET_CENTROIDS}"
+  echo "      Output: ${MILLION_REAL_DIR}"
+
+  if python3 run_real_fungal_benchmark.py prepare-million-real \
+      --out-dir "${MILLION_REAL_DIR}" \
+      --source ncbi-refseq \
+      --max-assemblies "${MILLION_REAL_MAX_ASSEMBLIES}" \
+      --target-centroids "${MILLION_REAL_TARGET_CENTROIDS}" \
+      --min-assembly-level scaffold \
+      --latest-only \
+      --threads 4 \
+      --seed 42 \
+      2>&1 | tee "${MILLION_REAL_DIR}/prepare_million_real.log"; then
+    mark_success "million_real.index_build"
+    echo -e "${GREEN}✓ Real million-scale index ready${NC}"
+  else
+    mark_failure "million_real.index_build"
+  fi
+  echo ""
+fi
+
+# ============================================================================
 # 5. REAL FUNGAL DATA BENCHMARKS
 # ============================================================================
 #
@@ -232,7 +279,12 @@ if [[ "$EXPERIMENT_TYPE" == "all" || "$EXPERIMENT_TYPE" == "real" ]]; then
     mkdir -p "${PANEL_DIR}"
 
     # Prepare real data — guarded so one panel's failure does not abort the rest.
-    echo "    - Preparing real data..."
+    # --query-mode mixed asks the preparer to also pull public ENA read runs
+    # for each panel species (short-reads + long-reads), which is what makes
+    # benchmark_short-reads/ and benchmark_long-reads/ produce actual results.
+    # Previously those folders were silently empty because the NCBI panel
+    # preparer only wrote assembly-mode query rows.
+    echo "    - Preparing real data (mixed: assembly + short-reads + long-reads)..."
     if python3 run_real_fungal_benchmark.py prepare \
         --out-dir "${PANEL_DIR}/prepared" \
         --panel "${panel}" \
@@ -240,6 +292,8 @@ if [[ "$EXPERIMENT_TYPE" == "all" || "$EXPERIMENT_TYPE" == "real" ]]; then
         --querys-per-species 5 \
         --max-ref-downloads 20 \
         --max-query-downloads 10 \
+        --query-mode mixed \
+        --read-accessions-per-species 2 \
         --allow-no-queries \
         2>&1 | tee "${PANEL_DIR}/prepare.log"; then
       mark_success "real.${panel}.prepare"
@@ -314,9 +368,10 @@ echo "Experiment Summary"
 echo "========================================${NC}"
 echo ""
 echo "All experiment outputs saved to:"
-echo "  Small-scale: ${SMALL_DIR}"
-echo "  Large-scale: ${LARGE_DIR}"
-echo "  Real data:   ${REAL_DIR}"
+echo "  Small-scale:   ${SMALL_DIR}"
+echo "  Large-scale:   ${LARGE_DIR}"
+echo "  Real data:     ${REAL_DIR}"
+echo "  Million-real:  ${MILLION_REAL_DIR}"
 echo ""
 echo "Stage outcomes:"
 echo "  Succeeded: ${#SUCCESS_STAGES[@]}"
@@ -327,20 +382,20 @@ if [[ ${#FAILED_STAGES[@]} -gt 0 ]]; then
 fi
 echo ""
 echo "Intermediate files preserved:"
-find "${SMALL_DIR}" "${LARGE_DIR}" "${REAL_DIR}" -type f \
+find "${SMALL_DIR}" "${LARGE_DIR}" "${REAL_DIR}" "${MILLION_REAL_DIR}" -type f \
   \( -name "*.vcf" -o -name "*.vcf.gz" -o -name "*.tsv" -o -name "*.fasta" -o -name "*.fastq" \) \
   2>/dev/null | wc -l | xargs echo "  Total:"
 echo ""
 echo "Disk usage:"
-du -sh "${SMALL_DIR}" "${LARGE_DIR}" "${REAL_DIR}" 2>/dev/null | awk '{print "  " $0}'
+du -sh "${SMALL_DIR}" "${LARGE_DIR}" "${REAL_DIR}" "${MILLION_REAL_DIR}" 2>/dev/null | awk '{print "  " $0}'
 echo ""
 echo "Log files:"
-find "${SMALL_DIR}" "${LARGE_DIR}" "${REAL_DIR}" -name "*.log" 2>/dev/null | wc -l | xargs echo "  Total:"
+find "${SMALL_DIR}" "${LARGE_DIR}" "${REAL_DIR}" "${MILLION_REAL_DIR}" -name "*.log" 2>/dev/null | wc -l | xargs echo "  Total:"
 echo ""
 echo -e "${GREEN}✓ All experiments complete! End time: $(date)${NC}"
 echo ""
 echo "Next steps:"
-echo "  1. Review logs for errors: grep -r 'ERROR' ${SMALL_DIR} ${LARGE_DIR} ${REAL_DIR}"
+echo "  1. Review logs for errors: grep -r 'ERROR' ${SMALL_DIR} ${LARGE_DIR} ${REAL_DIR} ${MILLION_REAL_DIR}"
 echo "  2. Analyze results: python3 analyze_results.py --input-dir ${LARGE_DIR}"
 echo "  3. Generate report: bash run_comprehensive_experiments.sh"
 echo ""

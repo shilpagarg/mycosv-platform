@@ -534,6 +534,36 @@ def fetch_ena_read_runs(accession: str) -> list[dict[str, str]]:
     return parse_ena_filereport_text(http_get_text(ena_filereport_url(accession)))
 
 
+def ena_filereport_species_url(species: str, max_rows: int = 200) -> str:
+    """Build an ENA filereport URL that returns public read runs for a species.
+
+    Used by prepare_from_ncbi when --query-mode is short-reads or long-reads
+    and the panel presets only describe a species (no read accession). The
+    scientific_name filter works against any rank ENA stores, so a genus name
+    like 'Rhizophagus' also resolves — which is important for AMF where
+    species-level assignments are patchy.
+    """
+    query = urllib.parse.urlencode({
+        # ENA portal needs this quoted exactly as: scientific_name="X"
+        "query": f'scientific_name="{species}"',
+        "result": "read_run",
+        "fields": ",".join(ENA_FILEREPORT_FIELDS),
+        "format": "tsv",
+        "download": "false",
+        "limit": str(max_rows),
+    })
+    return f"https://www.ebi.ac.uk/ena/portal/api/filereport?{query}"
+
+
+def fetch_ena_read_runs_by_species(species: str, max_rows: int = 200) -> list[dict[str, str]]:
+    try:
+        return parse_ena_filereport_text(http_get_text(ena_filereport_species_url(species, max_rows)))
+    except Exception:
+        # ENA returns 204/404 for unknown species; treat as "no runs" rather
+        # than aborting the whole panel preparation.
+        return []
+
+
 def sequence_kind_from_name(name: str) -> str:
     lower = name.lower()
     if lower.endswith((".fastq.gz", ".fq.gz", ".fastq", ".fq")):
@@ -1065,6 +1095,88 @@ def prepare_from_ncbi(args: argparse.Namespace) -> int:
                 "species": query_row["species"],
             })
 
+    # ------------------------------------------------------------------
+    # Reads-mode queries by ENA species lookup.
+    #
+    # When `--query-mode mixed` (default) or a reads variant is requested,
+    # resolve public ENA read runs for each panel species and download up to
+    # --read-accessions-per-species runs per (species, mode). This is the
+    # mechanism that makes benchmark_short-reads/ and benchmark_long-reads/
+    # non-empty for NCBI panels — without it the panels only produce
+    # assembly-mode queries, which is why those folders were empty.
+    # ------------------------------------------------------------------
+    requested_read_modes: list[str] = []
+    if args.query_mode == "mixed":
+        requested_read_modes = ["short-reads", "long-reads"]
+    elif args.query_mode in {"short-reads", "long-reads"}:
+        requested_read_modes = [args.query_mode]
+
+    if requested_read_modes and args.read_accessions_per_species > 0:
+        for sel in selectors:
+            species = sel.get("species", "")
+            if not species:
+                continue
+            default_benchmark = species_benchmark_defaults.get(species, {})
+            if not default_benchmark.get("benchmark_ref_fasta"):
+                # No reference was downloaded for this species — reads-mode
+                # benchmarks require one, so skip.
+                continue
+            ena_runs = fetch_ena_read_runs_by_species(species, max_rows=args.ena_max_rows_per_species)
+            if not ena_runs:
+                continue
+            for read_mode in requested_read_modes:
+                urls, meta_rows = select_ena_read_sources(
+                    ena_runs, read_mode, args.read_accessions_per_species
+                )
+                if not urls:
+                    continue
+                # Bundle the selected FASTQs for the first picked run into a
+                # single local file so query_list.txt stays one-path-per-line
+                # (MycoSV reads that format).
+                asm_name = normalize_name(f"{species}_{read_mode}_{meta_rows[0]['run_accession']}")
+                try:
+                    local_path = merge_sequence_sources(urls, queries_dir / asm_name)
+                except Exception as exc:
+                    sys.stderr.write(
+                        f"[warn] {species}: ENA {read_mode} download failed: {exc}\n"
+                    )
+                    continue
+                query_rows.append({
+                    "query_asm": asm_name,
+                    "query_mode": read_mode,
+                    "path": str(local_path),
+                    "scenario": sel.get("scenario", "."),
+                    "lifestyle": sel.get("lifestyle", "."),
+                    "architecture": sel.get("architecture", "."),
+                    "benchmark_ref_asm": default_benchmark.get("benchmark_ref_asm", "."),
+                    "benchmark_ref_fasta": default_benchmark.get("benchmark_ref_fasta", "."),
+                    "phylum": ".", "class": ".", "order": ".", "family": ".",
+                    "genus": species.split()[0] if species else ".",
+                    "species": species,
+                    "source": f"ena_{read_mode.replace('-', '_')}",
+                    "instrument_platform": meta_rows[0].get("instrument_platform", "."),
+                    "library_layout": meta_rows[0].get("library_layout", "."),
+                    "run_accession": meta_rows[0].get("run_accession", "."),
+                })
+                query_list_paths.append(str(local_path))
+                benchmark_map_rows.append({
+                    "query_asm": asm_name,
+                    "benchmark_ref_asm": default_benchmark.get("benchmark_ref_asm", "."),
+                    "benchmark_ref_fasta": default_benchmark.get("benchmark_ref_fasta", "."),
+                    "species": species,
+                })
+                for meta in meta_rows:
+                    source_link_rows.append({
+                        "query_asm": asm_name,
+                        "role": "query",
+                        "query_mode": read_mode,
+                        "source_type": "ena_read_run",
+                        "source_accession": meta.get("run_accession", "."),
+                        "source_url": meta.get("source_url", "."),
+                        "local_path": str(local_path),
+                        "species": meta.get("scientific_name", species),
+                    })
+
     if not query_rows:
         if not args.allow_no_queries:
             raise ValueError(
@@ -1537,7 +1649,15 @@ def estimate_prepared_genome_size_hint(prepared_dir: Path) -> int:
     return 0
 
 
-def run_mycosv(prepared_dir: Path, out_dir: Path, binary_path: Path, mode: str, extra_args: list[str]) -> dict[str, str]:
+def run_mycosv(
+    prepared_dir: Path,
+    out_dir: Path,
+    binary_path: Path,
+    mode: str,
+    extra_args: list[str],
+    *,
+    query_list_override: Path | None = None,
+) -> dict[str, str]:
     mycosv_dir = out_dir / "mycosv"
     mycosv_dir.mkdir(parents=True, exist_ok=True)
     out_prefix = mycosv_dir / "calls"
@@ -1550,10 +1670,12 @@ def run_mycosv(prepared_dir: Path, out_dir: Path, binary_path: Path, mode: str, 
         genome_size_hint = estimate_prepared_genome_size_hint(prepared_dir)
         if genome_size_hint > 0:
             caller_args.extend(["--genome-size-hint", str(genome_size_hint)])
+    query_list_path = (query_list_override.resolve() if query_list_override
+                       else (prepared_dir / "query_list.txt").resolve())
     cmd = [
         str(binary_path.resolve()),
         "--ref-list", str((prepared_dir / "ref_list.txt").resolve()),
-        "--query-list", str((prepared_dir / "query_list.txt").resolve()),
+        "--query-list", str(query_list_path),
         "--out-prefix", str(out_prefix.resolve()),
         "--query-mode", mode,
         *caller_args,
@@ -2281,12 +2403,50 @@ def benchmark_real_data(args: argparse.Namespace) -> int:
     prepared_dir = args.prepared_dir.resolve()
     out_dir = args.out_dir.resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
-    query_manifest = load_query_manifest(prepared_dir / "query_manifest.tsv")
-    if not query_manifest:
+    full_manifest = load_query_manifest(prepared_dir / "query_manifest.tsv")
+    if not full_manifest:
         raise ValueError("Prepared directory does not contain query_manifest.tsv entries")
 
+    # Filter to rows whose query_mode matches the requested benchmark mode.
+    # Without this, running `--mode long-reads` on a prepared dir that only
+    # contains assembly queries would feed FASTA paths to MycoSV as if they
+    # were reads and silently produce empty VCFs — which is exactly what made
+    # benchmark_long-reads/ appear empty for NCBI panels.
+    if args.mode in {"assembly", "short-reads", "long-reads"}:
+        query_manifest = [row for row in full_manifest if (row.get("query_mode") or "assembly") == args.mode]
+    else:
+        query_manifest = list(full_manifest)
+
+    if not query_manifest:
+        status_path = out_dir / "NO_QUERIES_FOR_MODE.txt"
+        available = sorted({(row.get("query_mode") or "assembly") for row in full_manifest})
+        status_path.write_text(
+            f"Prepared directory {prepared_dir} has no query rows with query_mode={args.mode!r}.\n"
+            f"Available modes in this manifest: {available}.\n"
+            f"\n"
+            f"To generate reads-mode queries for an NCBI panel, re-run `prepare` with:\n"
+            f"  --query-mode mixed --read-accessions-per-species 2\n",
+            encoding="utf-8",
+        )
+        print(
+            f"benchmark_skipped\tmode={args.mode}\tavailable_modes={','.join(available)}"
+            f"\tstatus_file={status_path}"
+        )
+        return 0
+
+    # Write a mode-filtered query_list.txt that the binary consumes, so reads
+    # modes get FASTQ paths and assembly mode gets FASTA paths.
+    mode_query_list = out_dir / "query_list.filtered.txt"
+    mode_query_list.write_text(
+        "\n".join(row["path"] for row in query_manifest) + "\n",
+        encoding="utf-8",
+    )
+
     compile_binary_if_needed(args.binary_path.resolve(), force=args.force_rebuild)
-    mycosv_paths = run_mycosv(prepared_dir, out_dir, args.binary_path.resolve(), args.mode, args.mycosv_arg)
+    mycosv_paths = run_mycosv(
+        prepared_dir, out_dir, args.binary_path.resolve(), args.mode, args.mycosv_arg,
+        query_list_override=mode_query_list,
+    )
 
     mycosv_calls_by_query: dict[str, dict[str, list[NormalizedCall]]] = {}
     for row in query_manifest:
@@ -2523,6 +2683,162 @@ def benchmark_real_data(args: argparse.Namespace) -> int:
     return 0
 
 
+def prepare_million_real(args: argparse.Namespace) -> int:
+    """Download real fungal assemblies from NCBI, build a real MycoSV routing
+    index over them, and (optionally) pad it with synthetic decoys up to a
+    target centroid count.
+
+    This is the bridge between the real-data workflow (which currently only
+    downloads a few dozen assemblies per panel) and the million-scale
+    workflow (which was previously all synthetic). With this subcommand,
+    the million-scale index can be backed by real NCBI fungal genomes.
+    """
+    out_dir = args.out_dir.resolve()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    refs_dir = out_dir / "refs"
+    refs_dir.mkdir(parents=True, exist_ok=True)
+    index_dir = out_dir / "index"
+    registry_dir = out_dir / "registry"
+    index_dir.mkdir(parents=True, exist_ok=True)
+    registry_dir.mkdir(parents=True, exist_ok=True)
+
+    # Step 1: pull the NCBI assembly summary and select up to --max-assemblies
+    # fungal rows. We reuse select_all_public_rows so the quality/sorting
+    # behavior matches the `prepare --all-public-assemblies` path.
+    summary_url = NCBI_ASSEMBLY_SUMMARY[args.source]
+    print(f"[1/4] Fetching NCBI assembly summary: {summary_url}")
+    all_rows = parse_assembly_summary(http_get_text(summary_url))
+    print(f"      parsed {len(all_rows)} rows from {args.source}")
+
+    selected = select_all_public_rows(
+        all_rows,
+        min_assembly_level=args.min_assembly_level,
+        latest_only=args.latest_only,
+        max_total=args.max_assemblies,
+    )
+    if not selected:
+        raise ValueError(f"No fungal assemblies matched the selection filters in {args.source}")
+    print(f"      selected {len(selected)} assemblies for real-data indexing")
+
+    # Step 2: resolve taxonomy lineages for all selected rows.
+    print("[2/4] Resolving NCBI taxonomy lineages...")
+    taxids = sorted({row.get("taxid", "") for row in selected if row.get("taxid")})
+    taxonomy_cache = fetch_taxonomy_lineages(taxids, cache_path=out_dir / "taxonomy_cache.json")
+
+    # Step 3: download each assembly FASTA (or re-use existing on disk) and
+    # build the hierarchy manifest the MycoSV binary consumes.
+    print(f"[3/4] Downloading up to {len(selected)} assemblies -> {refs_dir}")
+    ref_manifest_rows: list[dict[str, str]] = []
+    ref_list_paths: list[str] = []
+    source_link_rows: list[dict[str, str]] = []
+    download_count = 0
+    for row in selected:
+        asm_name = row.get("assembly_accession", "").replace(".", "_")
+        if not asm_name:
+            continue
+        lineage = taxonomy_cache.get(row.get("taxid", ""), {})
+        fasta_path: Path | None = None
+        for url, filename in ncbi_download_targets(row, include_gff=False):
+            if not filename.endswith("_genomic.fna.gz"):
+                continue
+            dest = refs_dir / filename
+            try:
+                fasta_path = materialize_entry(url, dest, keep_gz=True)
+            except Exception as exc:
+                sys.stderr.write(f"[warn] download failed for {asm_name}: {exc}\n")
+                fasta_path = None
+            break
+        if fasta_path is None or not fasta_path.exists():
+            continue
+        download_count += 1
+        species = lineage.get("species") or row.get("organism_name", ".") or "."
+        ref_manifest_rows.append({
+            "asm_name": asm_name,
+            "phylum": lineage.get("phylum", "."),
+            "class": lineage.get("class", "."),
+            "order": lineage.get("order", "."),
+            "family": lineage.get("family", "."),
+            "genus": lineage.get("genus", species.split()[0] if species not in {".", ""} else "."),
+            "clade_name": species,
+            "clade_rank": "species",
+            "fasta_path": str(fasta_path),
+        })
+        ref_list_paths.append(str(fasta_path))
+        source_link_rows.append({
+            "query_asm": asm_name,
+            "role": "ref",
+            "query_mode": "assembly",
+            "source_type": "ncbi_assembly",
+            "source_accession": row.get("assembly_accession", "."),
+            "source_url": row.get("ftp_path", "."),
+            "local_path": str(fasta_path),
+            "species": species,
+        })
+        if download_count % 100 == 0:
+            print(f"      ... downloaded {download_count}/{len(selected)}")
+
+    if not ref_manifest_rows:
+        raise RuntimeError("No assemblies were successfully downloaded — aborting indexing.")
+    print(f"      downloaded {download_count} assemblies")
+
+    hierarchy_manifest = out_dir / "hierarchy_manifest.tsv"
+    write_tsv(
+        hierarchy_manifest,
+        ref_manifest_rows,
+        ["asm_name", "phylum", "class", "order", "family", "genus", "clade_name", "clade_rank", "fasta_path"],
+    )
+    (out_dir / "ref_list.txt").write_text("\n".join(ref_list_paths) + "\n", encoding="utf-8")
+    write_tsv(
+        out_dir / "source_links.tsv",
+        source_link_rows,
+        ["query_asm", "role", "query_mode", "source_type", "source_accession", "source_url", "local_path", "species"],
+    )
+
+    # Step 4: build the real routing index by invoking the MycoSV binary, then
+    # pad with synthetic decoys up to --target-centroids if requested.
+    print(f"[4/4] Building real routing index via MycoSV binary -> {index_dir}")
+    compile_binary_if_needed(args.binary_path.resolve(), force=args.force_rebuild)
+    build_cmd = [
+        str(args.binary_path.resolve()),
+        "--tol-hierarchical",
+        "--tol-build-index", str(hierarchy_manifest.resolve()),
+        "--tol-index-dir", str(index_dir.resolve()),
+        "--tol-registry-dir", str(registry_dir.resolve()),
+        "--tol-multi-rank",
+        "--tol-base-graph-build",
+        "--tol-max-clade-genomes", str(args.max_clade_genomes),
+        "--tol-index-threads", str(args.threads),
+    ]
+    run_mycosv_command(build_cmd, cwd=ROOT)
+
+    info = {"real_centroids": len(ref_manifest_rows), "decoy_centroids": 0,
+            "total_centroids": len(ref_manifest_rows), "hashes_per_centroid": 0}
+    if args.target_centroids and args.target_centroids > len(ref_manifest_rows):
+        print(f"      padding routing store: real={len(ref_manifest_rows)} -> target={args.target_centroids}")
+        info = augment_routing_store(index_dir, args.target_centroids, args.seed)
+
+    summary = {
+        "out_dir": str(out_dir),
+        "source": args.source,
+        "max_assemblies_requested": args.max_assemblies,
+        "assemblies_downloaded": download_count,
+        "target_centroids": args.target_centroids,
+        "seed": args.seed,
+        "hierarchy_manifest": str(hierarchy_manifest),
+        "index_dir": str(index_dir),
+        "registry_dir": str(registry_dir),
+        **info,
+    }
+    summary_path = out_dir / "prepare_million_real_summary.json"
+    summary_path.write_text(json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")
+
+    print(
+        f"million_real_ready\tassemblies={download_count}\tcentroids_real={info['real_centroids']}"
+        f"\tcentroids_total={info['total_centroids']}\tindex_dir={index_dir}\tsummary={summary_path}"
+    )
+    return 0
+
+
 def augment_routing_catalog(args: argparse.Namespace) -> int:
     index_dir = args.index_dir.resolve()
     if not (index_dir / "routing_manifest.tsv").exists():
@@ -2561,6 +2877,22 @@ def build_parser() -> argparse.ArgumentParser:
     sa.add_argument("--seed", type=int, default=1)
     sa.add_argument("--summary-json", type=Path)
 
+    smr = sub.add_parser(
+        "prepare-million-real",
+        help="Download up to N real fungal assemblies from NCBI, build a real MycoSV routing index over them, and pad with synthetic decoys up to --target-centroids.",
+    )
+    smr.add_argument("--out-dir", type=Path, required=True)
+    smr.add_argument("--source", choices=sorted(NCBI_ASSEMBLY_SUMMARY), default="ncbi-refseq")
+    smr.add_argument("--max-assemblies", type=int, default=1000, help="Cap on real fungal assemblies to download. Use 0 for unlimited (not recommended for first runs).")
+    smr.add_argument("--min-assembly-level", default="scaffold", choices=["contig", "scaffold", "chromosome", "complete genome"])
+    smr.add_argument("--latest-only", action="store_true", help="Only keep version_status=latest rows.")
+    smr.add_argument("--target-centroids", type=int, default=1_000_000, help="Total centroids in the routing store after padding with synthetic decoys; set to 0 to skip padding.")
+    smr.add_argument("--seed", type=int, default=1)
+    smr.add_argument("--threads", type=int, default=4)
+    smr.add_argument("--max-clade-genomes", type=int, default=32)
+    smr.add_argument("--binary-path", type=Path, default=DEFAULT_BIN)
+    smr.add_argument("--force-rebuild", action="store_true")
+
     spp = sub.add_parser("prepare", help="Download a real fungal panel and write MycoSV-ready manifests.")
     spp.add_argument("--out-dir", type=Path, required=True)
     spp.add_argument("--source", choices=sorted(NCBI_ASSEMBLY_SUMMARY), default="ncbi-refseq")
@@ -2583,6 +2915,9 @@ def build_parser() -> argparse.ArgumentParser:
     spp.add_argument("--public-query-manifest", type=Path, help="Optional TSV of public query datasets to append. Supports assembly URLs plus public ENA/SRA read accessions or FASTQ URLs.")
     spp.add_argument("--public-query-max-runs", type=int, default=2, help="Maximum ENA runs to download per public query row when using study/sample accessions.")
     spp.add_argument("--custom-url-manifest", type=Path, help="TSV manifest for MycoCosm/JGI/Ensembl/other URLs. For assembly rows use fasta_url/path/url. For read rows use query_mode plus fastq_url(_1/_2) / read_url(s) or ena_accession/sra_accession/read_accession.")
+    spp.add_argument("--query-mode", default="assembly", choices=["assembly", "short-reads", "long-reads", "mixed"], help="Which query modes to prepare. 'mixed' produces assembly + short-reads + long-reads queries for each panel species. Read-mode queries come from ENA filereport lookups.")
+    spp.add_argument("--read-accessions-per-species", type=int, default=0, help="For each panel species and each requested reads mode, download up to this many public ENA read runs. Set to 0 to disable reads-mode query generation.")
+    spp.add_argument("--ena-max-rows-per-species", type=int, default=200, help="Maximum read_run rows to pull from ENA per species before filtering by platform.")
 
     sb = sub.add_parser("benchmark", help="Run MycoSV on a prepared real-data panel and compare to exact normalized truth/query-aware callsets.")
     sb.add_argument("--prepared-dir", type=Path, required=True)
@@ -2628,6 +2963,8 @@ def main() -> int:
         return 0
     if args.cmd == "augment-routing":
         return augment_routing_catalog(args)
+    if args.cmd == "prepare-million-real":
+        return prepare_million_real(args)
     if args.cmd == "prepare":
         if args.custom_url_manifest:
             return prepare_from_custom_manifest(args)

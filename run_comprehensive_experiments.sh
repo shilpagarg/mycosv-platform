@@ -74,6 +74,45 @@ else
   echo "      (Summary file not found)"
 fi
 
+# ----------------------------------------------------------------------------
+# [1b/3] Real million-scale fungal routing index
+# ----------------------------------------------------------------------------
+# Downloads up to MILLION_REAL_MAX_ASSEMBLIES real NCBI RefSeq assemblies,
+# builds a MycoSV routing index over them, and pads to MILLION_REAL_TARGET_CENTROIDS
+# with synthetic decoys. This is the real-data counterpart to the simulated
+# million-scale index above. Skip with SKIP_MILLION_REAL=1 if you just want
+# the panel benchmarks.
+# ----------------------------------------------------------------------------
+MILLION_REAL_MAX_ASSEMBLIES="${MILLION_REAL_MAX_ASSEMBLIES:-1000}"
+MILLION_REAL_TARGET_CENTROIDS="${MILLION_REAL_TARGET_CENTROIDS:-1000000}"
+MILLION_REAL_OUT="${OUT_DIR}/million_real_${TIMESTAMP}"
+
+if [[ "${SKIP_MILLION_REAL:-0}" != "1" ]]; then
+  echo ""
+  echo "[1b/3] Building real million-scale fungal routing index..."
+  echo "       Downloading up to ${MILLION_REAL_MAX_ASSEMBLIES} NCBI RefSeq assemblies"
+  echo "       Target centroids: ${MILLION_REAL_TARGET_CENTROIDS}"
+  echo "       Output: ${MILLION_REAL_OUT}"
+  mkdir -p "${MILLION_REAL_OUT}"
+  if python3 run_real_fungal_benchmark.py prepare-million-real \
+      --out-dir "${MILLION_REAL_OUT}" \
+      --source ncbi-refseq \
+      --max-assemblies "${MILLION_REAL_MAX_ASSEMBLIES}" \
+      --target-centroids "${MILLION_REAL_TARGET_CENTROIDS}" \
+      --min-assembly-level scaffold \
+      --latest-only \
+      --threads 4 \
+      --seed 42 \
+      2>&1 | tee "${MILLION_REAL_OUT}/prepare_million_real.log"; then
+    mark_success "million_real"
+  else
+    mark_failure "million_real"
+  fi
+else
+  echo ""
+  echo "[1b/3] Skipping real million-scale index build (SKIP_MILLION_REAL=1)"
+fi
+
 echo ""
 echo "[2/3] Running real fungal data benchmarks..."
 echo "      Panels: compact_yeast, amf_large, cross_phylum_hgt, te_rich_pathogen, two_speed_pathogen"
@@ -92,7 +131,9 @@ for PANEL in "${PANELS[@]}"; do
   mkdir -p "${PANEL_OUT}"
 
   # Prepare real data. Note the CLI flag is --panel (singular, repeatable).
-  echo "    - Preparing real data..."
+  # --query-mode mixed also pulls public ENA read runs so benchmark_short-reads/
+  # and benchmark_long-reads/ actually produce VCFs instead of sitting empty.
+  echo "    - Preparing real data (mixed: assembly + short-reads + long-reads)..."
   if python3 run_real_fungal_benchmark.py prepare \
       --out-dir "${PANEL_OUT}/prepared" \
       --panel "${PANEL}" \
@@ -100,6 +141,8 @@ for PANEL in "${PANELS[@]}"; do
       --querys-per-species 5 \
       --max-ref-downloads 20 \
       --max-query-downloads 10 \
+      --query-mode mixed \
+      --read-accessions-per-species 2 \
       --allow-no-queries \
       2>&1 | tee "${PANEL_OUT}/prepare_${PANEL}.log"; then
     mark_success "prepare.${PANEL}"
