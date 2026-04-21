@@ -91,9 +91,16 @@ def main() -> int:
     ap.add_argument("--skip-build", action="store_true")
     ap.add_argument("--modes", default="assembly,short-reads,long-reads")
     ap.add_argument("--phylum", default="Ascomycota")
-    ap.add_argument("--scenario-set", default="compact_yeast,pathogenic,te_rich_pathogen,cross_phylum_hgt")
-    ap.add_argument("--n-genomes", type=int, default=4)
-    ap.add_argument("--n-reps", type=int, default=2)
+    ap.add_argument("--scenario-set", default="compact_yeast,pathogenic,arbuscular_mf,cross_phylum_hgt_stress")
+    ap.add_argument("--seed", type=int, default=1)
+    ap.add_argument("--n-genomes", type=int, default=4,
+                    help="Number of simulated genomes per run (legacy alias: --n-refs).")
+    ap.add_argument("--n-reps", type=int, default=2,
+                    help="Number of simulated replicates / queries per run (legacy alias: --n-queries).")
+    ap.add_argument("--n-refs", dest="n_genomes", type=int,
+                    help="Backward-compatible alias for --n-genomes.")
+    ap.add_argument("--n-queries", dest="n_reps", type=int,
+                    help="Backward-compatible alias for --n-reps.")
     ap.add_argument("--total-len", type=int, default=12000)
     ap.add_argument("--n-contigs", type=int, default=2)
     ap.add_argument("--divergence", type=float, default=0.01)
@@ -143,6 +150,7 @@ def main() -> int:
             "--write-extended-manifest",
             "--query-mode", mode,
             "--divergence", str(args.divergence),
+            "--seed", str(args.seed),
         ]
         sim_run = run(sim_cmd, cwd=ROOT)
 

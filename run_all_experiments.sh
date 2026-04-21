@@ -26,12 +26,17 @@ WORK_DIR="/mnt/bmh01-rds/Shilpa_Group/2024/projects/fungi/AMF/scale"
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 EXPERIMENT_TYPE="${1:-all}"  # all, small, large, real, million-real
 
+# Shared download cache: FASTA files downloaded here are reused across runs.
+# Override with DATA_CACHE_DIR=/your/path if you want a different location.
+DATA_CACHE_DIR="${DATA_CACHE_DIR:-${WORK_DIR}/data_cache}"
+mkdir -p "${DATA_CACHE_DIR}"
+
 # Strip leading dashes for convenience: --small and small are both accepted.
 EXPERIMENT_TYPE="${EXPERIMENT_TYPE#--}"
 
 # How many real NCBI fungal assemblies to download when building the real
 # million-scale routing index. Override with env var when needed.
-MILLION_REAL_MAX_ASSEMBLIES="${MILLION_REAL_MAX_ASSEMBLIES:-1000}"
+MILLION_REAL_MAX_ASSEMBLIES="${MILLION_REAL_MAX_ASSEMBLIES:-10000}"
 MILLION_REAL_TARGET_CENTROIDS="${MILLION_REAL_TARGET_CENTROIDS:-1000000}"
 
 # Create experiment directories
@@ -69,10 +74,11 @@ echo "Experiment type: ${EXPERIMENT_TYPE}"
 echo ""
 
 # Scenario sets that guarantee all 5 SV types (INS, DEL, DUP, INV, TRA).
-# compact_yeast alone only generates DEL+INS, so we always include at least
-# one of {te_rich_pathogen, cross_phylum_hgt} where all five types are emitted.
-SMALL_SCENARIO_SET="compact_yeast,te_rich_pathogen,cross_phylum_hgt"
-LARGE_SCENARIO_SET="te_rich_pathogen,cross_phylum_hgt"
+# compact_yeast:              DEL + INS
+# two_speed_pathogen_extreme: INV + TRA + INS
+# arbuscular_mf:              DUP + INS
+SMALL_SCENARIO_SET="compact_yeast,two_speed_pathogen_extreme,arbuscular_mf"
+LARGE_SCENARIO_SET="compact_yeast,two_speed_pathogen_extreme,arbuscular_mf"
 
 # ============================================================================
 # 1. SMALL-SCALE SIMULATED DATA TESTS
@@ -201,8 +207,8 @@ if [[ "$EXPERIMENT_TYPE" == "all" || "$EXPERIMENT_TYPE" == "large" ]]; then
         --modes "${mode}" \
         --out-dir "${LARGE_DIR}/mode_pr_benchmark/${mode}" \
         --scenario-set "${LARGE_SCENARIO_SET}" \
-        --n-refs 500 \
-        --n-queries 20 \
+        --n-genomes 500 \
+        --n-reps 20 \
         --seed 42 \
         2>&1 | tee "${LARGE_DIR}/mode_pr_benchmark/${mode}/benchmark.log"; then
       mark_success "large.mode_pr.${mode}"
@@ -229,19 +235,19 @@ fi
 
 if [[ "$EXPERIMENT_TYPE" == "all" || "$EXPERIMENT_TYPE" == "million-real" ]]; then
   echo -e "${YELLOW}[4b] Building real million-scale fungal routing index...${NC}"
-  echo "      Downloading up to ${MILLION_REAL_MAX_ASSEMBLIES} NCBI RefSeq assemblies"
+  echo "      Downloading up to ${MILLION_REAL_MAX_ASSEMBLIES} NCBI GenBank assemblies (contig level or better)"
   echo "      Target centroids (real+decoys): ${MILLION_REAL_TARGET_CENTROIDS}"
   echo "      Output: ${MILLION_REAL_DIR}"
 
   if python3 run_real_fungal_benchmark.py prepare-million-real \
       --out-dir "${MILLION_REAL_DIR}" \
-      --source ncbi-refseq \
+      --source ncbi-genbank \
       --max-assemblies "${MILLION_REAL_MAX_ASSEMBLIES}" \
       --target-centroids "${MILLION_REAL_TARGET_CENTROIDS}" \
-      --min-assembly-level scaffold \
-      --latest-only \
+      --min-assembly-level contig \
       --threads 4 \
       --seed 42 \
+      --data-cache-dir "${DATA_CACHE_DIR}" \
       2>&1 | tee "${MILLION_REAL_DIR}/prepare_million_real.log"; then
     mark_success "million_real.index_build"
     echo -e "${GREEN}✓ Real million-scale index ready${NC}"
@@ -288,13 +294,14 @@ if [[ "$EXPERIMENT_TYPE" == "all" || "$EXPERIMENT_TYPE" == "real" ]]; then
     if python3 run_real_fungal_benchmark.py prepare \
         --out-dir "${PANEL_DIR}/prepared" \
         --panel "${panel}" \
-        --max-assemblies-per-species 8 \
+        --max-assemblies-per-species 20 \
         --querys-per-species 5 \
         --max-ref-downloads 20 \
         --max-query-downloads 10 \
         --query-mode mixed \
         --read-accessions-per-species 2 \
         --allow-no-queries \
+        --data-cache-dir "${DATA_CACHE_DIR}" \
         2>&1 | tee "${PANEL_DIR}/prepare.log"; then
       mark_success "real.${panel}.prepare"
     else
@@ -313,6 +320,12 @@ if [[ "$EXPERIMENT_TYPE" == "all" || "$EXPERIMENT_TYPE" == "real" ]]; then
     if [[ ! -f "${PANEL_DIR}/prepared/query_manifest.tsv" ]]; then
       echo "    - Skipping benchmarks for ${panel} (no query manifest produced)"
       mark_failure "real.${panel}.no_queries"
+      continue
+    fi
+    # Check if query manifest has actual data rows (more than header)
+    if [[ $(wc -l < "${PANEL_DIR}/prepared/query_manifest.tsv") -le 1 ]]; then
+      echo "    - Skipping benchmarks for ${panel} (query manifest is empty)"
+      mark_failure "real.${panel}.empty_queries"
       continue
     fi
 

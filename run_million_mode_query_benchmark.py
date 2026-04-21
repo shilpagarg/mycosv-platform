@@ -187,7 +187,7 @@ def main() -> int:
     ap.add_argument("--n-centroids", type=int, default=1_000_000)
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--phylum", default="Ascomycota")
-    ap.add_argument("--scenario-set", default="te_rich_pathogen")
+    ap.add_argument("--scenario-set", default="compact_yeast,two_speed_pathogen_extreme,arbuscular_mf")
     ap.add_argument("--n-genomes", type=int, default=4)
     ap.add_argument("--n-reps", type=int, default=2)
     ap.add_argument("--total-len", type=int, default=8000)

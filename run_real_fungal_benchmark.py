@@ -288,6 +288,8 @@ def http_get_text(url: str) -> str:
 
 def http_download(url: str, dest: Path) -> Path:
     dest.parent.mkdir(parents=True, exist_ok=True)
+    if dest.exists():
+        return dest
     req = urllib.request.Request(url, headers={"User-Agent": "MycoSV-real-benchmark/1.0"})
     with urllib.request.urlopen(req) as resp, dest.open("wb") as out:
         shutil.copyfileobj(resp, out)
@@ -935,9 +937,11 @@ def prepare_from_ncbi(args: argparse.Namespace) -> int:
         cache_path=out_dir / "taxonomy_cache.json",
     )
 
-    downloads_dir = out_dir / "downloads"
-    refs_dir = downloads_dir / "refs"
-    queries_dir = downloads_dir / "queries"
+    cache_base = args.data_cache_dir.resolve() if args.data_cache_dir else (out_dir / "downloads")
+    refs_dir = cache_base / "refs"
+    queries_dir = cache_base / "queries"
+    refs_dir.mkdir(parents=True, exist_ok=True)
+    queries_dir.mkdir(parents=True, exist_ok=True)
     ref_manifest_rows: list[dict[str, str]] = []
     query_rows: list[dict[str, str]] = []
     ref_list_paths: list[str] = []
@@ -2695,7 +2699,8 @@ def prepare_million_real(args: argparse.Namespace) -> int:
     """
     out_dir = args.out_dir.resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
-    refs_dir = out_dir / "refs"
+    cache_dir = args.data_cache_dir.resolve() if args.data_cache_dir else out_dir
+    refs_dir = cache_dir / "refs"
     refs_dir.mkdir(parents=True, exist_ok=True)
     index_dir = out_dir / "index"
     registry_dir = out_dir / "registry"
@@ -2892,6 +2897,7 @@ def build_parser() -> argparse.ArgumentParser:
     smr.add_argument("--max-clade-genomes", type=int, default=32)
     smr.add_argument("--binary-path", type=Path, default=DEFAULT_BIN)
     smr.add_argument("--force-rebuild", action="store_true")
+    smr.add_argument("--data-cache-dir", type=Path, default=None, help="Shared directory for downloaded FASTA files; reused across runs to avoid re-downloading.")
 
     spp = sub.add_parser("prepare", help="Download a real fungal panel and write MycoSV-ready manifests.")
     spp.add_argument("--out-dir", type=Path, required=True)
@@ -2918,6 +2924,7 @@ def build_parser() -> argparse.ArgumentParser:
     spp.add_argument("--query-mode", default="assembly", choices=["assembly", "short-reads", "long-reads", "mixed"], help="Which query modes to prepare. 'mixed' produces assembly + short-reads + long-reads queries for each panel species. Read-mode queries come from ENA filereport lookups.")
     spp.add_argument("--read-accessions-per-species", type=int, default=0, help="For each panel species and each requested reads mode, download up to this many public ENA read runs. Set to 0 to disable reads-mode query generation.")
     spp.add_argument("--ena-max-rows-per-species", type=int, default=200, help="Maximum read_run rows to pull from ENA per species before filtering by platform.")
+    spp.add_argument("--data-cache-dir", type=Path, default=None, help="Shared directory for downloaded FASTA files; reused across runs to avoid re-downloading.")
 
     sb = sub.add_parser("benchmark", help="Run MycoSV on a prepared real-data panel and compare to exact normalized truth/query-aware callsets.")
     sb.add_argument("--prepared-dir", type=Path, required=True)

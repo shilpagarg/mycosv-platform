@@ -2,7 +2,7 @@
 # Designed for Linux
 """test_amf.py — Fungal SV simulator for the TOL pipeline.
 
-Domain corrections applied (vs previous version — 23 issues fixed)
+Domain corrections applied (vs previous version — 21 issues fixed)
 ====================================================================
 TAXONOMY (2 fixes)
   - Laccaria: family Hydnangiaceae (NOT Amanitaceae). Matheny et al. 2006.
@@ -612,6 +612,8 @@ def main() -> None:  # noqa: C901
     ap.add_argument("--starship-rate", type=float, default=0.01)
     ap.add_argument("--hgt-rate",    type=float, default=0.005)
     ap.add_argument("--divergence",  type=float, default=0.01)
+    ap.add_argument("--seed",        type=int,   default=1,
+                    help="Compatibility seed for external wrappers; current simulator output is already deterministic.")
     ap.add_argument("--class-name",              default="")
     ap.add_argument("--order-name",              default="")
     ap.add_argument("--family-name",             default="")

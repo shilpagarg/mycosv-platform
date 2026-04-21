@@ -49,11 +49,11 @@ echo ""
 echo "[2/2] Running million-scale benchmarks (all 5 SV types)..."
 mkdir -p "${TEST_DIR}/million_all_types"
 
-# Test with te_rich_pathogen scenario (generates all 5 SV types)
+# compact_yeast+two_speed_pathogen_extreme+arbuscular_mf covers all 5 SV types
 python3 run_million_mode_query_benchmark.py \
   --out-dir "${TEST_DIR}/million_all_types" \
   --modes assembly \
-  --scenario-set "te_rich_pathogen" \
+  --scenario-set "compact_yeast,two_speed_pathogen_extreme,arbuscular_mf" \
   --n-centroids 100000 \
   --n-genomes 4 \
   --n-reps 2 \

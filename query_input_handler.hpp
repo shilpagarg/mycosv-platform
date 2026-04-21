@@ -55,6 +55,12 @@
 #include <utility>
 #include <vector>
 
+#ifndef __declspec
+#  ifndef _WIN32
+#    define __declspec(x) __attribute__((visibility("default")))
+#  endif
+#endif
+
 namespace fs = std::filesystem;
 
 namespace query_input {
@@ -362,7 +368,9 @@ inline size_t median_read_length(const std::vector<RawRead>& sample) {
 inline QueryMode sanity_check_mode_override(const std::string& path,
                                             QueryMode requested,
                                             const std::vector<RawRead>& sample,
-                                            bool quiet) {
+                                            bool quiet,
+                                            bool explicitRequest = true) {
+    if (!explicitRequest) return requested;
     if (sample.empty()) return requested;
     const size_t med = median_read_length(sample);
     if (requested == QueryMode::LONG_READS && is_fastq(path) && med > 0 && med < 400) {
@@ -1135,7 +1143,7 @@ prepare_query(const std::string& path,
         const size_t sz = std::min(rawReads.size(), static_cast<size_t>(200));
         std::vector<detail::RawRead> sample(
             rawReads.begin(), rawReads.begin() + static_cast<ptrdiff_t>(sz));
-        modeHint = detail::sanity_check_mode_override(path, modeHint, sample, quiet);
+        modeHint = detail::sanity_check_mode_override(path, modeHint, sample, quiet, !autoDetect);
     }
 
     size_t dropped = 0;

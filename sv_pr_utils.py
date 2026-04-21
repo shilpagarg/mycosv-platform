@@ -170,7 +170,7 @@ def compatible(truth: dict[str, Any], pred: dict[str, Any]) -> bool:
     if truth.get("qasm") and pred.get("qasm") and truth["qasm"] != pred["qasm"]:
         return False
 
-    del_group = {"DEL", "INS", "DUP", "TDEL", "TANDEM_DUP", "OFF_REF"}
+    del_group = {"DEL", "INS", "DUP", "TDEL", "TANDEM_DUP"}
     inv_group = {"INV", "TRA", "TRA_INTER", "TRA_INTRA"}
     if truth["type"] != pred["type"]:
         if not ((truth["type"] in del_group and pred["type"] in del_group) or

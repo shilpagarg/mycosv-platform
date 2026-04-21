@@ -16,6 +16,10 @@ WORK_DIR="/mnt/bmh01-rds/Shilpa_Group/2024/projects/fungi/AMF/scale"
 OUT_DIR="${WORK_DIR}/comprehensive_experiments"
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 
+# Shared download cache: FASTA files downloaded here are reused across runs.
+DATA_CACHE_DIR="${DATA_CACHE_DIR:-${WORK_DIR}/data_cache}"
+mkdir -p "${DATA_CACHE_DIR}"
+
 # Create output directories for organizing intermediate files
 mkdir -p "${OUT_DIR}"
 mkdir -p "${WORK_DIR}/experiments/small_tests/${TIMESTAMP}"
@@ -23,7 +27,8 @@ mkdir -p "${WORK_DIR}/experiments/large_scale/${TIMESTAMP}"
 cd "${WORK_DIR}"
 
 # Scenarios covering all 5 SV types (INS/DEL/DUP/INV/TRA).
-LARGE_SCENARIO_SET="te_rich_pathogen,cross_phylum_hgt"
+# compact_yeast: DEL+INS  two_speed_pathogen_extreme: INV+TRA+INS  arbuscular_mf: DUP+INS
+LARGE_SCENARIO_SET="compact_yeast,two_speed_pathogen_extreme,arbuscular_mf"
 
 echo "========================================"
 echo "Fungal Genome Comprehensive Experiments"
@@ -103,6 +108,7 @@ if [[ "${SKIP_MILLION_REAL:-0}" != "1" ]]; then
       --latest-only \
       --threads 4 \
       --seed 42 \
+      --data-cache-dir "${DATA_CACHE_DIR}" \
       2>&1 | tee "${MILLION_REAL_OUT}/prepare_million_real.log"; then
     mark_success "million_real"
   else
@@ -144,6 +150,7 @@ for PANEL in "${PANELS[@]}"; do
       --query-mode mixed \
       --read-accessions-per-species 2 \
       --allow-no-queries \
+      --data-cache-dir "${DATA_CACHE_DIR}" \
       2>&1 | tee "${PANEL_OUT}/prepare_${PANEL}.log"; then
     mark_success "prepare.${PANEL}"
   else

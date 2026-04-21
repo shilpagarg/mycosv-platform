@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 # Designed for Linux
 
-"""test_all_use_cases.py — Integration tests across all 13 ecological scenarios.
+"""test_all_use_cases.py — Integration tests across all 16 ecological scenarios.
 
 Tests that the AMF simulator produces correct outputs for every scenario in
 SCENARIOS and that each output contains the expected truth records.
 
 Coverage:
-  • All 13 ecological scenarios: compact_yeast → giant_amf → rust/smut → two-speed pathogen
+  • All 16 ecological scenarios: compact_yeast → giant_amf → rust/smut → two-speed pathogen
   • OFF_REF entries present for every query genome
   • On-reference SV entries present (INS/DEL/DUP/INV/TRA)
   • TRA breakpoints encoded in truth VCF (CHR2 + POS2)
