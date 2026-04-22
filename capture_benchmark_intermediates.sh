@@ -9,7 +9,7 @@ WORK_DIR="/mnt/bmh01-rds/Shilpa_Group/2024/projects/fungi/AMF/scale"
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 QUERY_MODE="${1:-all}"
 
-CAPTURE_DIR="${WORK_DIR}/experiments/large_scale/${TIMESTAMP}"
+CAPTURE_DIR="${WORK_DIR}/experiments/simulated/${TIMESTAMP}"
 mkdir -p "${CAPTURE_DIR}"
 
 echo "========================================"

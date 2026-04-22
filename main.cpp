@@ -118,6 +118,8 @@ struct Options {
     int    targetGenomeSizeMB   = 0;
     int    queryWindowSize      = 250000;
     int    queryWindowOverlap   = 20000;
+    int    saMaxContigMB        = 100;   // --sa-max-contig-mb: skip SA build above this threshold
+    int    maxRefMemoryMB       = 8192;  // --max-ref-memory-mb: cap total ref seq loaded
 
     // TOL three-layer
     bool        useTolHierarchical = false;
@@ -270,6 +272,8 @@ static void usage(const char* argv0) {
 "  --query-window-size INT  (default 250000)\n"
 "  --query-window-overlap INT (default 20000)\n"
 "  --threads INT            Parallel worker threads (default 1)\n"
+"  --sa-max-contig-mb INT   Skip SA build for ref contigs larger than N MB (default 100)\n"
+"  --max-ref-memory-mb INT  Cap total reference sequence memory in MB (default 8192)\n"
 "\n"
 "TOL three-layer hierarchical:\n"
 "  --tol-hierarchical       Enable the three-layer TOL pipeline\n"
@@ -417,6 +421,8 @@ static Options parse_args(int argc, char** argv) {
         else if (x == "--ancestral-backbone")          o.ancestralBackbone = true;
         else if (x == "--max-representatives")         o.maxRepresentatives= std::stoi(need(x.c_str(),i));
         else if (x == "--target-genome-size-mb")       o.targetGenomeSizeMB= std::stoi(need(x.c_str(),i));
+        else if (x == "--sa-max-contig-mb")            o.saMaxContigMB     = std::stoi(need(x.c_str(),i));
+        else if (x == "--max-ref-memory-mb")           o.maxRefMemoryMB    = std::stoi(need(x.c_str(),i));
         else if (x == "--query-window-size")           o.queryWindowSize   = std::stoi(need(x.c_str(),i));
         else if (x == "--query-window-overlap")        o.queryWindowOverlap= std::stoi(need(x.c_str(),i));
         else if (x == "--threads")                     o.threads           = std::stoi(need(x.c_str(),i));
@@ -745,6 +751,8 @@ struct SingleRefMemIndex {
 
 class SingleRefMemCache {
 public:
+    explicit SingleRefMemCache(size_t saMaxBytes = 0) : saMaxBytes_(saMaxBytes) {}
+
     SingleRefMemIndex& get(const RefContigInfo* info) {
         auto it = cache_.find(info);
         if (it != cache_.end()) return it->second;
@@ -757,13 +765,19 @@ public:
         idx.ref.clade = info->asmName;
         idx.ref.cladeGc = 0.45;
         idx.ref.cladeRank = "species";
-        idx.sa.build({{info->contigName, info->sequence}});
+        if (saMaxBytes_ == 0 || info->sequence.size() <= saMaxBytes_) {
+            idx.sa.build({{info->contigName, info->sequence}});
+        }
+        // If sequence exceeds saMaxBytes_, SA is left empty.  Callers that rely
+        // on find_mems() will receive no hits and fall through to alternative
+        // paths (multi-ref chain or fallback callers).
 
         auto [inserted, _] = cache_.emplace(info, std::move(idx));
         return inserted->second;
     }
 
 private:
+    size_t saMaxBytes_ = 0;
     std::unordered_map<const RefContigInfo*, SingleRefMemIndex> cache_;
 };
 
@@ -784,12 +798,26 @@ static SimpleRefIndex load_simple_ref_index(const Options& o) {
     const auto& paths = !reps.empty() ? reps : refs;
     idx.reserve(paths.size() * 4 + 1);
 
+    const size_t maxRefBytes = static_cast<size_t>(std::max(0, o.maxRefMemoryMB)) * 1024 * 1024;
+    size_t totalRefBytes = 0;
+    bool refCapWarned = false;
+
     auto add_fasta = [&](const std::string& fasta_path) {
         if (fasta_path.empty() || !fs::exists(fasta_path)) return;
+        if (maxRefBytes > 0 && totalRefBytes >= maxRefBytes) return;
         std::string asmName = fs::path(fasta_path).stem().string();
         try {
             auto contigs = read_fasta(fasta_path);
             for (const auto& kv : contigs) {
+                if (maxRefBytes > 0 && totalRefBytes + kv.second.size() > maxRefBytes) {
+                    if (!refCapWarned) {
+                        std::cerr << "[warn] --max-ref-memory-mb cap (" << o.maxRefMemoryMB
+                                  << " MB) reached; skipping remaining reference contigs\n";
+                        refCapWarned = true;
+                    }
+                    return;
+                }
+                totalRefBytes += kv.second.size();
                 // Reject reference contigs whose names carry simulator hint
                 // suffixes.  If a reference FASTA has __sv_ in a contig name
                 // it means a simulator-generated assembly was accidentally
@@ -1979,7 +2007,7 @@ static tol::FederatedOptions make_fed_opts(const Options& o) {
     sec.stride          = static_cast<size_t>(std::max(1, o.secondarySeedStride));
     sec.useIntervalHash = false;
 
-    return tol::make_federated_opts(
+    tol::FederatedOptions fo = tol::make_federated_opts(
         sp,
         fb,
         sec,
@@ -2004,6 +2032,10 @@ static tol::FederatedOptions make_fed_opts(const Options& o) {
         o.tolAncestralRecomb,
         o.tolRecombMinSegBp,
         o.tolRecombMaxBp);
+    // Multi-ref SA cap = 2× single-ref limit; each of the up to 8 shortlisted
+    // refs can be up to saMaxContigMB, so the total text cap is twice that.
+    fo.saMaxTextMB = static_cast<size_t>(std::max(0, o.saMaxContigMB)) * 2;
+    return fo;
 }
 
 static int normalized_svlen_for_output(const VariantCallBridge& v) {
@@ -2324,7 +2356,10 @@ process_query(const std::string& qAsmPath,
     std::optional<RefSearchCache> refCache;
     std::optional<SingleRefMemCache> singleRefMemCache;
     if (refIdx != nullptr) refCache.emplace(*refIdx);
-    if (refIdx != nullptr) singleRefMemCache.emplace();
+    if (refIdx != nullptr) {
+        const size_t saMaxBytes = static_cast<size_t>(std::max(0, o.saMaxContigMB)) * 1024 * 1024;
+        singleRefMemCache.emplace(saMaxBytes);
+    }
     auto add_candidates = [&](std::vector<VariantCallBridge>&& calls) {
         for (auto& c : calls) {
             c.queryMode = modeLabel;

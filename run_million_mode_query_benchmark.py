@@ -7,6 +7,7 @@ import argparse
 import csv
 import json
 import os
+import shutil
 import struct
 import subprocess
 import sys
@@ -52,6 +53,24 @@ def mode_specific_caller_args(mode: str, genome_size_hint: int) -> list[str]:
     return args
 
 
+
+
+def ensure_sv_volume(n_genomes: int, n_reps: int, n_contigs: int, total_len: int,
+                     scenario_set: str, target_svs_per_scenario: int,
+                     min_contig_bp: int) -> tuple[int, int, int]:
+    scenarios = [s.strip() for s in scenario_set.split(",") if s.strip()]
+    n_scen = max(1, len(scenarios))
+    n_reps = max(n_reps, n_scen)
+    query_genomes = max(0, n_genomes - n_reps)
+    per_query = max(1, n_contigs)
+    current = max(0, (query_genomes // n_scen) * per_query)
+    if current < target_svs_per_scenario:
+        needed_queries_per_scenario = (target_svs_per_scenario + per_query - 1) // per_query
+        n_genomes = max(n_genomes, n_reps + needed_queries_per_scenario * n_scen)
+    per_contig_bp = max(1, total_len // max(1, n_contigs))
+    if per_contig_bp < min_contig_bp:
+        total_len = min_contig_bp * max(1, n_contigs)
+    return n_genomes, n_reps, total_len
 def splitmix64(x: int) -> int:
     x = (x + 0x9E3779B97F4A7C15) & 0xFFFFFFFFFFFFFFFF
     z = x
@@ -196,11 +215,23 @@ def main() -> int:
     ap.add_argument("--routing-top-n", type=int, default=4)
     ap.add_argument("--min-svlen", type=int, default=40)
     ap.add_argument("--window-bp", type=int, default=2_000_000)
+    ap.add_argument("--target-svs-per-scenario", type=int, default=3000)
+    ap.add_argument("--min-contig-bp", type=int, default=12000)
     args = ap.parse_args()
 
     modes = parse_modes(args.modes)
     out_dir = args.out_dir.resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    args.n_genomes, args.n_reps, args.total_len = ensure_sv_volume(
+        args.n_genomes,
+        args.n_reps,
+        args.n_contigs,
+        args.total_len,
+        args.scenario_set,
+        args.target_svs_per_scenario,
+        args.min_contig_bp,
+    )
 
     if not args.skip_build or not args.binary_path.exists():
         compile_binary(args.main_cpp.resolve(), args.binary_path.resolve())
@@ -216,6 +247,8 @@ def main() -> int:
             "total_len": args.total_len,
             "n_contigs": args.n_contigs,
             "divergence": args.divergence,
+            "target_svs_per_scenario": args.target_svs_per_scenario,
+            "min_contig_bp": args.min_contig_bp,
         },
         "modes": {},
     }

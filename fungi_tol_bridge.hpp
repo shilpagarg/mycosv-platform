@@ -125,6 +125,9 @@ struct FederatedOptions {
     bool    enableAncestralRecomb = false;
     size_t  recombMinSegBp        = 5000;
     size_t  recombMaxBreakpoints  = 32;
+    // Cap total concatenated ref text fed to a single SuffixArray build.
+    // 0 = no cap.  Default 200 MB avoids > 2.4 GB peak SA allocation.
+    size_t  saMaxTextMB           = 200;
 };
 
 inline FederatedOptions make_federated_opts(
@@ -1665,8 +1668,12 @@ static bool try_mem_chain_call(
     std::vector<const TolGlobal::RefSeq*> saRefs;
     refContigs.reserve(refCandidates.size());
     saRefs.reserve(refCandidates.size());
+    const size_t saTextCap = fo.saMaxTextMB > 0 ? fo.saMaxTextMB * 1024 * 1024 : SIZE_MAX;
+    size_t saTextAccum = 0;
     for (const auto* r : refCandidates) {
         if (!r->has_seq()) continue;
+        if (saTextAccum + r->seq().size() > saTextCap) continue;
+        saTextAccum += r->seq().size();
         refContigs.push_back({ r->contig, r->seq() });
         saRefs.push_back(r);
     }

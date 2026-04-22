@@ -1,35 +1,16 @@
 #!/usr/bin/env bash
 # preserve_test_intermediates.sh
 # Wrapper to preserve VCF, TSV, FASTA, FASTQ intermediates from test runs
-# Usage: bash preserve_test_intermediates.sh [small|large|all]
+# Usage: bash preserve_test_intermediates.sh
 
 set -e
 
 WORK_DIR="/mnt/bmh01-rds/Shilpa_Group/2024/projects/fungi/AMF/scale"
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-TEST_TYPE="${1:-small}"  # small, large, or all
 
-case "$TEST_TYPE" in
-  small)
-    TARGET_DIR="${WORK_DIR}/experiments/small_tests/${TIMESTAMP}"
-    echo "Running small-scale tests with intermediate preservation..."
-    echo "Output: ${TARGET_DIR}"
-    ;;
-  large)
-    TARGET_DIR="${WORK_DIR}/experiments/large_scale/${TIMESTAMP}"
-    echo "Running large-scale tests with intermediate preservation..."
-    echo "Output: ${TARGET_DIR}"
-    ;;
-  all)
-    TARGET_DIR="${WORK_DIR}/experiments/all_tests/${TIMESTAMP}"
-    echo "Running all-scale tests with intermediate preservation..."
-    echo "Output: ${TARGET_DIR}"
-    ;;
-  *)
-    echo "Usage: $0 [small|large|all]"
-    exit 1
-    ;;
-esac
+TARGET_DIR="${WORK_DIR}/experiments/simulated/${TIMESTAMP}"
+echo "Running tests with intermediate preservation..."
+echo "Output: ${TARGET_DIR}"
 
 mkdir -p "${TARGET_DIR}"
 

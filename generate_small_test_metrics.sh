@@ -1,44 +1,37 @@
 #!/usr/bin/env bash
-# generate_small_test_metrics.sh
-# Post-process small test results to generate precision/recall TSVs.
+# generate_sim_metrics.sh
+# Post-process simulated benchmark results to generate precision/recall TSVs.
 #
 # Usage:
-#   bash generate_small_test_metrics.sh               # latest timestamp
-#   bash generate_small_test_metrics.sh TIMESTAMP     # explicit timestamp
-#
-# This walks every pytest basetemp under experiments/small_tests/<TIMESTAMP>/,
-# pairs up (truth VCF, prediction VCF) from each test directory, and runs
-# sv_pr_utils.score_pr / write_pr_artifacts so each pytest scenario produces
-# the same pr_metrics.tsv / pr_metrics.json that the million-scale driver
-# writes. Without this step, small_tests/ only contains raw VCFs — no
-# precision/recall numbers — which is what the user was seeing.
+#   bash generate_sim_metrics.sh               # latest timestamp
+#   bash generate_sim_metrics.sh TIMESTAMP     # explicit timestamp
 
 set -u
 set -o pipefail
 
 WORK_DIR="/mnt/bmh01-rds/Shilpa_Group/2024/projects/fungi/AMF/scale"
 
-# Resolve timestamp: explicit arg, else the most recent small_tests subdir.
+# Resolve timestamp: explicit arg, else the most recent simulated subdir.
 TIMESTAMP="${1:-}"
 if [[ -z "${TIMESTAMP}" ]]; then
-  if [[ -d "${WORK_DIR}/experiments/small_tests" ]]; then
-    TIMESTAMP="$(ls -1d "${WORK_DIR}/experiments/small_tests"/20* 2>/dev/null | sort | tail -1 | xargs -r basename)"
+  if [[ -d "${WORK_DIR}/experiments/simulated" ]]; then
+    TIMESTAMP="$(ls -1d "${WORK_DIR}/experiments/simulated"/20* 2>/dev/null | sort | tail -1 | xargs -r basename)"
   fi
 fi
 if [[ -z "${TIMESTAMP}" ]]; then
-  echo "ERROR: no TIMESTAMP provided and no experiments/small_tests/20* directory found."
-  echo "Usage: bash generate_small_test_metrics.sh [TIMESTAMP]"
+  echo "ERROR: no TIMESTAMP provided and no experiments/simulated/20* directory found."
+  echo "Usage: bash generate_sim_metrics.sh [TIMESTAMP]"
   exit 2
 fi
 
 cd "${WORK_DIR}"
 
-SMALL_DIR="experiments/small_tests/${TIMESTAMP}"
+SMALL_DIR="experiments/simulated/${TIMESTAMP}"
 OUTPUT_DIR="${SMALL_DIR}/metrics"
 mkdir -p "${OUTPUT_DIR}"
 
 echo "========================================="
-echo "Generating Small Test Metrics"
+echo "Generating Simulated Benchmark Metrics"
 echo "========================================="
 echo "Timestamp:    ${TIMESTAMP}"
 echo "Input root:   ${SMALL_DIR}"
@@ -46,14 +39,13 @@ echo "Output root:  ${OUTPUT_DIR}"
 echo ""
 
 if [[ ! -d "${SMALL_DIR}" ]]; then
-  echo "ERROR: ${SMALL_DIR} does not exist. Run the pytest stage first."
+  echo "ERROR: ${SMALL_DIR} does not exist. Run the simulated benchmark stage first."
   exit 2
 fi
 
 python3 - "${SMALL_DIR}" "${OUTPUT_DIR}" <<'PYTHON_SCRIPT'
 """
-Collect metrics from the small-scale benchmarks and create summary TSVs
-compatible with the large-scale output format.
+Collect metrics from the simulated benchmarks and create summary TSVs.
 """
 from __future__ import annotations
 
@@ -108,7 +100,7 @@ for mode in modes:
 
 # Write summary TSV
 if summary_rows:
-    with (OUT_DIR / "pr_metrics_small_tests_summary.tsv").open("w", newline="") as fh:
+    with (OUT_DIR / "pr_metrics_simulated_summary.tsv").open("w", newline="") as fh:
         if summary_rows:
             fieldnames = ["scenario", "mode"] + [k for k in summary_rows[0].keys() if k not in ["scenario", "mode"]]
             writer = csv.DictWriter(fh, fieldnames=fieldnames, delimiter="\t")
@@ -117,7 +109,7 @@ if summary_rows:
 
 # Write SV type TSV  
 if svtype_rows:
-    with (OUT_DIR / "pr_metrics_small_tests_by_svtype.tsv").open("w", newline="") as fh:
+    with (OUT_DIR / "pr_metrics_simulated_by_svtype.tsv").open("w", newline="") as fh:
         if svtype_rows:
             fieldnames = ["scenario", "mode", "svtype", "tp", "fp", "fn", "precision", "recall", "f1"]
             writer = csv.DictWriter(fh, fieldnames=fieldnames, delimiter="\t")

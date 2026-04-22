@@ -1,12 +1,10 @@
 #!/usr/bin/env bash
 # run_all_experiments.sh
-# Master script to run all experiments (small-scale, million-scale, and real fungal data)
-# with complete intermediate file preservation.
+# Master script to run all experiments (simulated benchmark and real fungal data).
 #
 # Usage:
 #   bash run_all_experiments.sh                    # Run all experiments
-#   bash run_all_experiments.sh --small            # Small-scale only
-#   bash run_all_experiments.sh --large            # Large-scale/million-scale only
+#   bash run_all_experiments.sh --simulated        # Simulated benchmark only
 #   bash run_all_experiments.sh --real             # Real panels only (per-species NCBI + ENA)
 #   bash run_all_experiments.sh --million-real     # Only the real million-scale NCBI index build
 #
@@ -24,14 +22,13 @@ set -o pipefail
 
 WORK_DIR="/mnt/bmh01-rds/Shilpa_Group/2024/projects/fungi/AMF/scale"
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-EXPERIMENT_TYPE="${1:-all}"  # all, small, large, real, million-real
+EXPERIMENT_TYPE="${1:-all}"  # all, simulated, real, million-real
 
 # Shared download cache: FASTA files downloaded here are reused across runs.
-# Override with DATA_CACHE_DIR=/your/path if you want a different location.
 DATA_CACHE_DIR="${DATA_CACHE_DIR:-${WORK_DIR}/data_cache}"
 mkdir -p "${DATA_CACHE_DIR}"
 
-# Strip leading dashes for convenience: --small and small are both accepted.
+# Strip leading dashes for convenience: --simulated and simulated are both accepted.
 EXPERIMENT_TYPE="${EXPERIMENT_TYPE#--}"
 
 # How many real NCBI fungal assemblies to download when building the real
@@ -40,12 +37,11 @@ MILLION_REAL_MAX_ASSEMBLIES="${MILLION_REAL_MAX_ASSEMBLIES:-10000}"
 MILLION_REAL_TARGET_CENTROIDS="${MILLION_REAL_TARGET_CENTROIDS:-1000000}"
 
 # Create experiment directories
-SMALL_DIR="${WORK_DIR}/experiments/small_tests/${TIMESTAMP}"
-LARGE_DIR="${WORK_DIR}/experiments/large_scale/${TIMESTAMP}"
+SIM_DIR="${WORK_DIR}/experiments/simulated/${TIMESTAMP}"
 REAL_DIR="${WORK_DIR}/experiments/real_data/${TIMESTAMP}"
 MILLION_REAL_DIR="${WORK_DIR}/experiments/million_real/${TIMESTAMP}"
 
-mkdir -p "${SMALL_DIR}" "${LARGE_DIR}" "${REAL_DIR}" "${MILLION_REAL_DIR}" "${MILLION_REAL_DIR}"
+mkdir -p "${SIM_DIR}" "${REAL_DIR}" "${MILLION_REAL_DIR}"
 
 cd "${WORK_DIR}"
 
@@ -77,77 +73,51 @@ echo ""
 # compact_yeast:              DEL + INS
 # two_speed_pathogen_extreme: INV + TRA + INS
 # arbuscular_mf:              DUP + INS
-SMALL_SCENARIO_SET="compact_yeast,two_speed_pathogen_extreme,arbuscular_mf"
-LARGE_SCENARIO_SET="compact_yeast,two_speed_pathogen_extreme,arbuscular_mf"
+SIM_SCENARIO_SET="compact_yeast,two_speed_pathogen_extreme,arbuscular_mf"
 
 # ============================================================================
-# 1. SMALL-SCALE BENCHMARK (precision/recall across all modes)
-# ============================================================================
-
-if [[ "$EXPERIMENT_TYPE" == "all" || "$EXPERIMENT_TYPE" == "small" ]]; then
-  echo -e "${YELLOW}[1/4] Generating small-scale precision/recall metrics...${NC}"
-  echo "      Output: ${SMALL_DIR}/benchmarks"
-  mkdir -p "${SMALL_DIR}/benchmarks"
-
-  if python3 run_million_mode_query_benchmark.py \
-      --out-dir "${SMALL_DIR}/benchmarks" \
-      --modes assembly,short-reads,long-reads \
-      --scenario-set "${SMALL_SCENARIO_SET}" \
-      --n-centroids 10000 \
-      --n-genomes 4 \
-      --n-reps 2 \
-      --seed 42 \
-      2>&1 | tee "${SMALL_DIR}/benchmarks/benchmark.log"; then
-    mark_success "small.pr_metrics_benchmark"
-    echo -e "${GREEN}✓ Small-scale benchmark metrics complete${NC}"
-  else
-    mark_failure "small.pr_metrics_benchmark"
-  fi
-  echo ""
-fi
-
-# ============================================================================
-# 3. MILLION-SCALE SIMULATED DATA BENCHMARK (all 5 SV types)
-# ============================================================================
-
-if [[ "$EXPERIMENT_TYPE" == "all" || "$EXPERIMENT_TYPE" == "large" ]]; then
-  echo -e "${YELLOW}[2/4] Running million-scale simulated data benchmark...${NC}"
-  echo "      Modes: assembly, short-reads, long-reads"
-  echo "      Scenarios: ${LARGE_SCENARIO_SET} (covers INS/DEL/DUP/INV/TRA)"
-  echo "      Output: ${LARGE_DIR}/million_scale_simulated"
-  mkdir -p "${LARGE_DIR}/million_scale_simulated"
-
-  if python3 run_million_mode_query_benchmark.py \
-      --out-dir "${LARGE_DIR}/million_scale_simulated" \
-      --modes assembly,short-reads,long-reads \
-      --scenario-set "${LARGE_SCENARIO_SET}" \
-      --n-centroids 1000000 \
-      --n-genomes 8 \
-      --n-reps 3 \
-      --seed 42 \
-      2>&1 | tee "${LARGE_DIR}/million_scale_simulated/benchmark.log"; then
-    mark_success "large.million_scale"
-    echo -e "${GREEN}✓ Million-scale simulated benchmark complete${NC}"
-  else
-    mark_failure "large.million_scale"
-  fi
-  echo ""
-fi
-
-# ============================================================================
-# 4b. MILLION-SCALE *REAL* FUNGAL INDEX (downloads NCBI assemblies)
-# ============================================================================
+# 1. SIMULATED BENCHMARK (precision/recall at million scale, hundreds of SVs)
 #
-# This stage downloads up to N real fungal assemblies from NCBI RefSeq, builds
-# a real MycoSV routing index over them, then pads the routing store with
-# synthetic decoys up to --target-centroids. This is the bridge between the
-# small per-panel real-data downloads and the previously-all-synthetic
-# million-scale benchmark. Disk/bandwidth heavy — opt-in via `million-real`
-# or `all`.
+# Parameters chosen to produce ≥270 truth SVs:
+#   n_genomes=30, n_reps=3, n_contigs=10, total_len=200000
+#   → (30-3)=27 query genomes × 10 contigs = 270 SVs across 3 scenarios
+# ============================================================================
+
+if [[ "$EXPERIMENT_TYPE" == "all" || "$EXPERIMENT_TYPE" == "simulated" ]]; then
+  echo -e "${YELLOW}[1/4] Running simulated benchmark (million-scale routing, 270 SVs)...${NC}"
+  echo "      Modes: assembly, short-reads, long-reads"
+  echo "      Scenarios: ${SIM_SCENARIO_SET} (covers INS/DEL/DUP/INV/TRA)"
+  echo "      Genomes: 30 total (3 refs + 27 queries), 10 contigs each"
+  echo "      Output: ${SIM_DIR}/benchmarks"
+  mkdir -p "${SIM_DIR}/benchmarks"
+
+  if python3 run_million_mode_query_benchmark.py \
+      --out-dir "${SIM_DIR}/benchmarks" \
+      --modes assembly,short-reads,long-reads \
+      --scenario-set "${SIM_SCENARIO_SET}" \
+      --n-centroids 1000000 \
+      --n-genomes 30 \
+      --n-reps 3 \
+      --n-contigs 10 \
+      --total-len 200000 \
+      --seed 42 \
+      --target-svs-per-scenario 3000 \
+      --min-contig-bp 12000 \
+      2>&1 | tee "${SIM_DIR}/benchmarks/benchmark.log"; then
+    mark_success "simulated.pr_metrics_benchmark"
+    echo -e "${GREEN}✓ Simulated benchmark complete${NC}"
+  else
+    mark_failure "simulated.pr_metrics_benchmark"
+  fi
+  echo ""
+fi
+
+# ============================================================================
+# 2. MILLION-SCALE *REAL* FUNGAL INDEX (downloads NCBI assemblies)
 # ============================================================================
 
 if [[ "$EXPERIMENT_TYPE" == "all" || "$EXPERIMENT_TYPE" == "million-real" ]]; then
-  echo -e "${YELLOW}[3/4] Building real million-scale fungal routing index...${NC}"
+  echo -e "${YELLOW}[2/4] Building real million-scale fungal routing index...${NC}"
   echo "      Downloading up to ${MILLION_REAL_MAX_ASSEMBLIES} NCBI GenBank assemblies (contig level or better)"
   echo "      Target centroids (real+decoys): ${MILLION_REAL_TARGET_CENTROIDS}"
   echo "      Output: ${MILLION_REAL_DIR}"
@@ -171,7 +141,7 @@ if [[ "$EXPERIMENT_TYPE" == "all" || "$EXPERIMENT_TYPE" == "million-real" ]]; th
 fi
 
 # ============================================================================
-# 5. REAL FUNGAL DATA BENCHMARKS
+# 3. REAL FUNGAL DATA BENCHMARKS
 # ============================================================================
 #
 # Each panel is fully isolated: a failure in one panel (download error,
@@ -185,7 +155,7 @@ fi
 # ============================================================================
 
 if [[ "$EXPERIMENT_TYPE" == "all" || "$EXPERIMENT_TYPE" == "real" ]]; then
-  echo -e "${YELLOW}[4/4] Running real fungal data benchmarks...${NC}"
+  echo -e "${YELLOW}[3/4] Running real fungal data benchmarks...${NC}"
   echo "      Panels: compact_yeast, amf_large, cross_phylum_hgt, te_rich_pathogen, two_speed_pathogen"
   echo "      Output: ${REAL_DIR}"
 
@@ -197,12 +167,6 @@ if [[ "$EXPERIMENT_TYPE" == "all" || "$EXPERIMENT_TYPE" == "real" ]]; then
     PANEL_DIR="${REAL_DIR}/${panel}"
     mkdir -p "${PANEL_DIR}"
 
-    # Prepare real data — guarded so one panel's failure does not abort the rest.
-    # --query-mode mixed asks the preparer to also pull public ENA read runs
-    # for each panel species (short-reads + long-reads), which is what makes
-    # benchmark_short-reads/ and benchmark_long-reads/ produce actual results.
-    # Previously those folders were silently empty because the NCBI panel
-    # preparer only wrote assembly-mode query rows.
     echo "    - Preparing real data (mixed: assembly + short-reads + long-reads)..."
     if python3 run_real_fungal_benchmark.py prepare \
         --out-dir "${PANEL_DIR}/prepared" \
@@ -224,7 +188,6 @@ if [[ "$EXPERIMENT_TYPE" == "all" || "$EXPERIMENT_TYPE" == "real" ]]; then
       continue
     fi
 
-    # Must have at least one manifest + queries produced by prepare.
     if [[ ! -f "${PANEL_DIR}/prepared/selected_catalog.tsv" \
        && ! -f "${PANEL_DIR}/prepared/reference_catalog.tsv" ]]; then
       echo "    - Skipping benchmarks for ${panel} (no catalog produced)"
@@ -236,7 +199,6 @@ if [[ "$EXPERIMENT_TYPE" == "all" || "$EXPERIMENT_TYPE" == "real" ]]; then
       mark_failure "real.${panel}.no_queries"
       continue
     fi
-    # Check if query manifest has actual data rows (more than header)
     if [[ $(wc -l < "${PANEL_DIR}/prepared/query_manifest.tsv") -le 1 ]]; then
       echo "    - Skipping benchmarks for ${panel} (query manifest is empty)"
       mark_failure "real.${panel}.empty_queries"
@@ -247,15 +209,9 @@ if [[ "$EXPERIMENT_TYPE" == "all" || "$EXPERIMENT_TYPE" == "real" ]]; then
       echo "    - Benchmarking mode: ${mode}..."
       mkdir -p "${PANEL_DIR}/benchmark_${mode}"
 
-      # Mode-specific SOTA comparator flags.
       comparator_flags=()
       case "${mode}" in
         assembly)
-          # Assembly-to-assembly and pangenome-graph comparators:
-          #   SyRI + minigraph + PGGB are the original trio;
-          #   Minigraph-Cactus (cactus-pangenome), SVIM-asm, and AnchorWave
-          #   are fungi-oriented / pangenome-oriented additions that run
-          #   whenever the binary is on $PATH (each adapter no-ops if not).
           comparator_flags+=(--run-syri --run-minigraph --run-pggb)
           comparator_flags+=(--run-cactus --run-svim-asm --run-anchorwave)
           ;;
@@ -286,6 +242,96 @@ if [[ "$EXPERIMENT_TYPE" == "all" || "$EXPERIMENT_TYPE" == "real" ]]; then
   echo ""
 fi
 
+
+# ============================================================================
+# 4. VISUALIZATION REPORT
+# ============================================================================
+#
+# Builds an integrated HTML report across simulated benchmarks, real-data SV
+# results, and biological findings when available. Missing inputs are handled
+# gracefully so this stage never blocks the rest of the experiment matrix.
+# ============================================================================
+
+REPORT_DIR="${WORK_DIR}/experiments/reports/${TIMESTAMP}"
+mkdir -p "${REPORT_DIR}"
+
+if [[ "$EXPERIMENT_TYPE" == "all" || "$EXPERIMENT_TYPE" == "simulated" || "$EXPERIMENT_TYPE" == "real" ]]; then
+  echo -e "${YELLOW}[4/4] Generating visualization report...${NC}"
+  echo "      Output: ${REPORT_DIR}"
+
+  SIM_RESULTS=""
+  if [[ -f "${SIM_DIR}/benchmarks/million_mode_summary.tsv" ]]; then
+    SIM_RESULTS="${SIM_DIR}/benchmarks/million_mode_summary.tsv"
+  elif [[ -f "${SIM_DIR}/benchmarks/pr_metrics_simulated_summary.tsv" ]]; then
+    SIM_RESULTS="${SIM_DIR}/benchmarks/pr_metrics_simulated_summary.tsv"
+  fi
+
+  REAL_RESULTS="${REPORT_DIR}/real_merged.tsv"
+  BIO_RESULTS="${REPORT_DIR}/biology_merged.tsv"
+  : > "${REAL_RESULTS}"
+  : > "${BIO_RESULTS}"
+
+  merge_tsv_group() {
+    local out_file="$1"
+    shift
+    local first_written=0
+    local f
+    for f in "$@"; do
+      [[ -f "$f" ]] || continue
+      if [[ $first_written -eq 0 ]]; then
+        cat "$f" >> "$out_file"
+        first_written=1
+      else
+        tail -n +2 "$f" >> "$out_file"
+      fi
+    done
+    return 0
+  }
+
+  mapfile -t REAL_TSVS < <(find "${REAL_DIR}" -type f \( \
+      -name "*summary*.tsv" -o \
+      -name "*pr_metrics*.tsv" -o \
+      -name "*normalized_calls*.tsv" -o \
+      -name "*score*.tsv" \
+    \) 2>/dev/null | sort)
+
+  mapfile -t BIO_TSVS < <(find "${REAL_DIR}" -type f \( \
+      -name "*biology*.tsv" -o \
+      -name "*candidate*.tsv" -o \
+      -name "*annotation*.tsv" -o \
+      -name "*pathway*.tsv" \
+    \) 2>/dev/null | sort)
+
+  if [[ ${#REAL_TSVS[@]} -gt 0 ]]; then
+    merge_tsv_group "${REAL_RESULTS}" "${REAL_TSVS[@]}"
+  fi
+  if [[ ${#BIO_TSVS[@]} -gt 0 ]]; then
+    merge_tsv_group "${BIO_RESULTS}" "${BIO_TSVS[@]}"
+  fi
+
+  report_cmd=(python3 sv_visualization_report.py --outdir "${REPORT_DIR}" --title "MycoSV comprehensive report (${TIMESTAMP})")
+  [[ -n "${SIM_RESULTS}" ]] && report_cmd+=(--simulated "${SIM_RESULTS}")
+  [[ -s "${REAL_RESULTS}" ]] && report_cmd+=(--real "${REAL_RESULTS}")
+  [[ -s "${BIO_RESULTS}" ]] && report_cmd+=(--biology "${BIO_RESULTS}")
+
+  if [[ -f "${WORK_DIR}/sv_visualization_report.py" ]]; then
+    if "${report_cmd[@]}" 2>&1 | tee "${REPORT_DIR}/report.log"; then
+      if [[ -f "${REPORT_DIR}/sv_visualization_report.html" ]]; then
+        mark_success "report.visualization"
+        echo -e "${GREEN}✓ Visualization report generated${NC}"
+      else
+        mark_failure "report.visualization_missing_output"
+      fi
+    else
+      mark_failure "report.visualization"
+    fi
+  else
+    echo "      Report script not found: ${WORK_DIR}/sv_visualization_report.py"
+    mark_failure "report.script_missing"
+  fi
+  echo ""
+fi
+
 # ============================================================================
 # SUMMARY REPORT
 # ============================================================================
@@ -295,10 +341,10 @@ echo "Experiment Summary"
 echo "========================================${NC}"
 echo ""
 echo "All experiment outputs saved to:"
-echo "  Small-scale:   ${SMALL_DIR}"
-echo "  Large-scale:   ${LARGE_DIR}"
+echo "  Simulated:     ${SIM_DIR}"
 echo "  Real data:     ${REAL_DIR}"
 echo "  Million-real:  ${MILLION_REAL_DIR}"
+echo "  Report:        ${REPORT_DIR}"
 echo ""
 echo "Stage outcomes:"
 echo "  Succeeded: ${#SUCCESS_STAGES[@]}"
@@ -309,26 +355,23 @@ if [[ ${#FAILED_STAGES[@]} -gt 0 ]]; then
 fi
 echo ""
 echo "Intermediate files preserved:"
-find "${SMALL_DIR}" "${LARGE_DIR}" "${REAL_DIR}" "${MILLION_REAL_DIR}" -type f \
-  \( -name "*.vcf" -o -name "*.vcf.gz" -o -name "*.tsv" -o -name "*.fasta" -o -name "*.fastq" \) \
+find "${SIM_DIR}" "${REAL_DIR}" "${MILLION_REAL_DIR}" "${REPORT_DIR}" -type f \
+  \( -name "*.vcf" -o -name "*.vcf.gz" -o -name "*.tsv" -o -name "*.fasta" -o -name "*.fastq" -o -name "*.html" -o -name "*.png" \) \
   2>/dev/null | wc -l | xargs echo "  Total:"
 echo ""
 echo "Disk usage:"
-du -sh "${SMALL_DIR}" "${LARGE_DIR}" "${REAL_DIR}" "${MILLION_REAL_DIR}" 2>/dev/null | awk '{print "  " $0}'
+du -sh "${SIM_DIR}" "${REAL_DIR}" "${MILLION_REAL_DIR}" "${REPORT_DIR}" 2>/dev/null | awk '{print "  " $0}'
 echo ""
 echo "Log files:"
-find "${SMALL_DIR}" "${LARGE_DIR}" "${REAL_DIR}" "${MILLION_REAL_DIR}" -name "*.log" 2>/dev/null | wc -l | xargs echo "  Total:"
+find "${SIM_DIR}" "${REAL_DIR}" "${MILLION_REAL_DIR}" "${REPORT_DIR}" -name "*.log" 2>/dev/null | wc -l | xargs echo "  Total:"
 echo ""
 echo -e "${GREEN}✓ All experiments complete! End time: $(date)${NC}"
 echo ""
 echo "Next steps:"
-echo "  1. Review logs for errors: grep -r 'ERROR' ${SMALL_DIR} ${LARGE_DIR} ${REAL_DIR} ${MILLION_REAL_DIR}"
-echo "  2. Analyze results: python3 analyze_results.py --input-dir ${LARGE_DIR}"
-echo "  3. Generate report: bash run_comprehensive_experiments.sh"
+echo "  1. Review logs for errors: grep -r 'ERROR' ${SIM_DIR} ${REAL_DIR} ${MILLION_REAL_DIR} ${REPORT_DIR}"
+echo "  2. Open report: ${REPORT_DIR}/sv_visualization_report.html"
 echo ""
 
-# Exit non-zero only if *everything* in a requested stage failed, so callers
-# (CI, cron) can distinguish "some panels flaky" from "nothing ran".
 if [[ ${#SUCCESS_STAGES[@]} -eq 0 ]]; then
   exit 1
 fi

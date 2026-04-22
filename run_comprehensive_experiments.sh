@@ -22,13 +22,11 @@ mkdir -p "${DATA_CACHE_DIR}"
 
 # Create output directories for organizing intermediate files
 mkdir -p "${OUT_DIR}"
-mkdir -p "${WORK_DIR}/experiments/small_tests/${TIMESTAMP}"
-mkdir -p "${WORK_DIR}/experiments/large_scale/${TIMESTAMP}"
 cd "${WORK_DIR}"
 
 # Scenarios covering all 5 SV types (INS/DEL/DUP/INV/TRA).
 # compact_yeast: DEL+INS  two_speed_pathogen_extreme: INV+TRA+INS  arbuscular_mf: DUP+INS
-LARGE_SCENARIO_SET="compact_yeast,two_speed_pathogen_extreme,arbuscular_mf"
+SIM_SCENARIO_SET="compact_yeast,two_speed_pathogen_extreme,arbuscular_mf"
 
 echo "========================================"
 echo "Fungal Genome Comprehensive Experiments"
@@ -44,37 +42,45 @@ mark_success() { SUCCESS_STAGES+=("$1"); }
 mark_failure() { FAILED_STAGES+=("$1"); echo "  ✗ Stage failed: $1"; }
 
 # ============================================================================
-# 1. Million-scale simulated data experiments
+# 1. Simulated benchmark (million-scale routing, hundreds of SVs)
+#
+# Parameters chosen to produce ≥270 truth SVs:
+#   n_genomes=30, n_reps=3, n_contigs=10, total_len=200000
+#   → (30-3)=27 query genomes × 10 contigs = 270 SVs across 3 scenarios
 # ============================================================================
 
-echo "[1/3] Running million-scale simulated data benchmarks..."
+echo "[1/3] Running simulated benchmark (million-scale routing, 270 SVs)..."
 echo "      Modes: assembly, short-reads, long-reads"
-echo "      Scenarios: ${LARGE_SCENARIO_SET} (all 5 SV types)"
-echo "      Genomes: 1M centroids with 8 query genomes, 3 replicates"
+echo "      Scenarios: ${SIM_SCENARIO_SET} (all 5 SV types)"
+echo "      Genomes: 30 total (3 refs + 27 queries), 10 contigs each"
 
-MILLION_OUT="${OUT_DIR}/million_scale_expanded_${TIMESTAMP}"
-MILLION_LOG="${OUT_DIR}/million_scale_expanded_${TIMESTAMP}.log"
+SIM_OUT="${OUT_DIR}/simulated_${TIMESTAMP}"
+SIM_LOG="${OUT_DIR}/simulated_${TIMESTAMP}.log"
+mkdir -p "${SIM_OUT}"
 
 if python3 run_million_mode_query_benchmark.py \
-    --out-dir "${MILLION_OUT}" \
+    --out-dir "${SIM_OUT}" \
     --modes assembly,short-reads,long-reads \
-    --scenario-set "${LARGE_SCENARIO_SET}" \
+    --scenario-set "${SIM_SCENARIO_SET}" \
     --n-centroids 1000000 \
-    --n-genomes 8 \
+    --n-genomes 30 \
     --n-reps 3 \
+    --n-contigs 10 \
+    --total-len 200000 \
     --seed 42 \
-    2>&1 | tee "${MILLION_LOG}"; then
-  mark_success "million_scale"
+      --target-svs-per-scenario 3000 \
+      --min-contig-bp 12000 \
+    2>&1 | tee "${SIM_LOG}"; then
+  mark_success "simulated"
 else
-  mark_failure "million_scale"
+  mark_failure "simulated"
 fi
 
-# Collect million-scale results
 echo ""
-echo "[1/3] Million-scale benchmarks complete. Results:"
-MILLION_SUMMARY="${MILLION_OUT}/million_mode_summary.tsv"
-if [ -f "${MILLION_SUMMARY}" ]; then
-  echo "      $(cat "${MILLION_SUMMARY}")"
+echo "[1/3] Simulated benchmark complete. Results:"
+SIM_SUMMARY="${SIM_OUT}/million_mode_summary.tsv"
+if [ -f "${SIM_SUMMARY}" ]; then
+  echo "      $(cat "${SIM_SUMMARY}")"
 else
   echo "      (Summary file not found)"
 fi
@@ -213,7 +219,7 @@ cat > "${REPORT}" << 'EOF'
 ## Executive Summary
 
 This report compiles accuracy and efficiency metrics for MycoSV across:
-- **Simulated data**: 1M-centroid catalog with expanded query samples
+- **Simulated data**: 1M-centroid catalog, 270 SVs across 3 scenarios, all modes
 - **Real data**: Multiple fungal panels with diverse evolutionary scenarios
 - **Comparators**: SyRI, minigraph, PGGB, Minigraph-Cactus, SVIM-asm,
   AnchorWave (assembly); Delly, Manta (short-reads);
@@ -221,24 +227,24 @@ This report compiles accuracy and efficiency metrics for MycoSV across:
 
 ## Simulated Data Results
 
-### Million-Scale Configuration
+### Configuration
 - Catalog size: 1,000,000 fungal genomes (centroids)
-- Query samples: 8 test genomes, 3 replicates each
+- Query genomes: 27 (30 total − 3 refs), 10 contigs each → 270 truth SVs
 - Seed: 42 (reproducible)
-- Scenarios: te_rich_pathogen + cross_phylum_hgt (all 5 SV types)
+- Scenarios: compact_yeast + two_speed_pathogen_extreme + arbuscular_mf (all 5 SV types)
 
 ### Query Accuracy & Efficiency by Mode
 
 EOF
 
-# Append million-scale summary
-if [ -f "${MILLION_SUMMARY}" ]; then
-  echo "#### Table: Million-Scale Results" >> "${REPORT}"
+# Append simulated summary
+if [ -f "${SIM_SUMMARY}" ]; then
+  echo "#### Table: Simulated Benchmark Results" >> "${REPORT}"
   echo '```' >> "${REPORT}"
-  cat "${MILLION_SUMMARY}" >> "${REPORT}"
+  cat "${SIM_SUMMARY}" >> "${REPORT}"
   echo '```' >> "${REPORT}"
 else
-  echo "(Results not available — see ${MILLION_LOG})" >> "${REPORT}"
+  echo "(Results not available — see ${SIM_LOG})" >> "${REPORT}"
 fi
 
 # Add real data summary
