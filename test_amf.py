@@ -650,6 +650,12 @@ def main() -> None:  # noqa: C901
 
     scenarios  = scenario_names(args.scenario_set)
     n_genomes, n_reps = ensure_split(args.n_genomes, args.n_reps)
+    # With the round-robin assignment scen=scenarios[i%N], query genomes start
+    # at index n_reps.  If n_genomes-n_reps < len(scenarios) some scenarios
+    # only ever become references and produce zero truth SVs.  Bump n_genomes
+    # so every scenario gets at least one query slot.
+    if n_genomes - n_reps < len(scenarios):
+        n_genomes = n_reps + len(scenarios)
     seq_len    = max(2000, int(args.total_len) // max(1, int(args.n_contigs)))
     query_emit_mode = "assembly" if args.query_mode == "auto" else args.query_mode
 

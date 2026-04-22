@@ -1,5 +1,6 @@
 # 🔹 Data folders (common in research)
 data/
+data_cache/
 datasets/
 results/
 outputs/
