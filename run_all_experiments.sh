@@ -36,6 +36,22 @@ EXPERIMENT_TYPE="${EXPERIMENT_TYPE#--}"
 MILLION_REAL_MAX_ASSEMBLIES="${MILLION_REAL_MAX_ASSEMBLIES:-10000}"
 MILLION_REAL_TARGET_CENTROIDS="${MILLION_REAL_TARGET_CENTROIDS:-1000000}"
 
+# Worker threads passed to every tool that accepts a thread count:
+#   MycoSV binary (--threads / --tol-index-threads), minimap2 (-t),
+#   samtools sort (-@), sniffles2 (--threads), cuteSV (--threads),
+#   Delly (OMP_NUM_THREADS), Manta (-j), minigraph (-t), pggb (-t).
+THREADS="${THREADS:-32}"
+
+# Long-read platform used for both simulated and real experiments.
+#   hifi    PacBio HiFi CCS (Revio / Sequel IIe) — 15 kb reads, ≥Q20 accuracy.
+#           minimap2 map-hifi → sniffles2 / cuteSV (HiFi params) / SVIM.
+#   ont-r10 ONT R10.4.1 standard simplex — 10 kb, ~Q20 on PromethION/GridION.
+#           minimap2 map-ont → sniffles2 --long-read-model ont_r10_q20 (v2.2+).
+#           WhatsHap phase+haplotag: applicable for dikaryotic fungi such as
+#           Puccinia spp., Leptosphaeria maculans, Zymoseptoria tritici.
+#   ont-r9  ONT R9.4.1 legacy — 8 kb, ~Q15.  Still prevalent in public ENA data.
+LONG_READ_PLATFORM="${LONG_READ_PLATFORM:-ont-r10}"
+
 # Create experiment directories
 SIM_DIR="${WORK_DIR}/experiments/simulated/${TIMESTAMP}"
 REAL_DIR="${WORK_DIR}/experiments/real_data/${TIMESTAMP}"
@@ -103,6 +119,8 @@ if [[ "$EXPERIMENT_TYPE" == "all" || "$EXPERIMENT_TYPE" == "simulated" ]]; then
       --seed 42 \
       --target-svs-per-scenario 3000 \
       --min-contig-bp 12000 \
+      --long-read-platform "${LONG_READ_PLATFORM}" \
+      --threads "${THREADS}" \
       2>&1 | tee "${SIM_DIR}/benchmarks/benchmark.log"; then
     mark_success "simulated.pr_metrics_benchmark"
     echo -e "${GREEN}✓ Simulated benchmark complete${NC}"
@@ -128,7 +146,7 @@ if [[ "$EXPERIMENT_TYPE" == "all" || "$EXPERIMENT_TYPE" == "million-real" ]]; th
       --max-assemblies "${MILLION_REAL_MAX_ASSEMBLIES}" \
       --target-centroids "${MILLION_REAL_TARGET_CENTROIDS}" \
       --min-assembly-level contig \
-      --threads 4 \
+      --threads "${THREADS}" \
       --seed 42 \
       --data-cache-dir "${DATA_CACHE_DIR}" \
       2>&1 | tee "${MILLION_REAL_DIR}/prepare_million_real.log"; then
@@ -227,7 +245,7 @@ if [[ "$EXPERIMENT_TYPE" == "all" || "$EXPERIMENT_TYPE" == "real" ]]; then
           --prepared-dir "${PANEL_DIR}/prepared" \
           --mode "${mode}" \
           --out-dir "${PANEL_DIR}/benchmark_${mode}" \
-          --threads 4 \
+          --threads "${THREADS}" \
           "${comparator_flags[@]}" \
           2>&1 | tee "${PANEL_DIR}/benchmark_${mode}.log"; then
         mark_success "real.${panel}.${mode}"

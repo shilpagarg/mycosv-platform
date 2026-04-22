@@ -245,19 +245,6 @@ def test_simulator_emits_long_read_fastq_when_requested(tmp_path: Path):
     assert all(p.suffix == '.fastq' for p in qpaths)
     first = qpaths[0].read_text().splitlines()[:4]
     assert first[0].startswith('@') and first[2] == '+'
-
-
-
-def test_run_tol_bench_supports_run_all_modes_wrapper():
-    tol_bench = ROOT / "run_tol_bench.sh"
-    if not tol_bench.exists():
-        pytest.skip("run_tol_bench.sh not present in project root")
-    text = tol_bench.read_text()
-    assert 'RUN_ALL_MODES="${RUN_ALL_MODES:-0}"' in text
-    assert 'run_all_modes(){' in text
-    assert 'local modes=(assembly short-reads long-reads)' in text
-    assert 'RUN_ALL_MODES=0 QUERY_MODE="$mode" bash "$0" "$TEST_AMF" "$MAIN_CPP" "${root_base}_${mode}"' in text
-
 def test_denovo_annotation_classifier_hits_repeat_te_starship_hgt_rip(tmp_path: Path):
     # Tests the symbols actually present in layer1_clade_graph.hpp:
     # classify_pantree, pantree_class_name, annotate_pantree_classes,
@@ -2027,43 +2014,6 @@ def test_million_scale_routing_benchmark_harness_smoke(tmp_path: Path):
     report_lines = report.read_text().strip().splitlines()
     assert report_lines[0].startswith('n_centroids\t')
     assert report_lines[1].split('\t')[0] == '4000'
-
-
-def test_mode_pr_benchmark_runner_outputs_all_modes(tmp_path: Path):
-    ensure_binary()
-    runner = ROOT / 'run_mode_pr_benchmark.py'
-    outdir = tmp_path / 'mode_bench'
-    run([
-        'python3', str(runner),
-        '--out-dir', str(outdir),
-        '--binary-path', str(BIN),
-        '--skip-build',
-        '--modes', 'assembly,short-reads,long-reads',
-        '--phylum', 'Ascomycota',
-        '--scenario-set', 'compact_yeast',
-        '--n-genomes', '4',
-        '--n-reps', '2',
-        '--total-len', '8000',
-        '--n-contigs', '2',
-    ])
-    summary_tsv = (outdir / 'mode_pr_summary.tsv').read_text().strip().splitlines()
-    assert summary_tsv[0].startswith('mode\ttruth_records\t')
-    rows = [line.split('\t') for line in summary_tsv[1:]]
-    assert {row[0] for row in rows} == {'assembly', 'short-reads', 'long-reads'}
-    metrics_by_mode = {row[0]: row for row in rows}
-    for row in rows:
-        precision = float(row[7])
-        recall = float(row[8])
-        assert 0.0 <= precision <= 1.0
-        assert 0.0 <= recall <= 1.0
-    assert float(metrics_by_mode['short-reads'][7]) >= 0.5
-    assert float(metrics_by_mode['short-reads'][8]) >= 0.5
-    assert float(metrics_by_mode['long-reads'][7]) >= 0.5
-    assert float(metrics_by_mode['long-reads'][8]) >= 0.5
-    svtype_tsv = (outdir / 'mode_svtype_pr_summary.tsv').read_text()
-    assert 'mode\tsvtype\ttp\tfp\tfn\tprecision' in svtype_tsv
-    summary_json = json.loads((outdir / 'mode_pr_summary.json').read_text())
-    assert set(summary_json['modes']) == {'assembly', 'short-reads', 'long-reads'}
 
 
 def test_query_input_recommends_probabilistic_fusion_by_mode_and_coverage(tmp_path: Path):

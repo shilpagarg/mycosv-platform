@@ -554,6 +554,37 @@ def embed_element_by_class(seq: str, ec: str, clade_gc: float = 0.45,
     return seq  # NONE
 
 
+# ── Long-read platform presets ────────────────────────────────────────────
+# Applied when --long-read-platform is set; override individual --long-read-*
+# flags so simulated reads match each platform's actual characteristics.
+#
+# PacBio HiFi CCS (Revio / Sequel IIe):
+#   ≥Q20 per-read accuracy (error rate ≈ 0.1 %).  Reads 10–25 kb.
+#   Downstream: minimap2 map-hifi → samtools sort+index → sniffles2 / cuteSV
+#   (HiFi cluster params) / SVIM.
+#
+# ONT R10.4.1 standard simplex (PromethION / GridION / MinION Mk1C):
+#   ~Q20 median accuracy (error rate ≈ 1 %).  Reads 10–30 kb, median ~15 kb.
+#   Downstream: minimap2 map-ont → sniffles2 --long-read-model ont_r10_q20
+#   (Sniffles2 ≥v2.2) / cuteSV / SVIM.
+#   WhatsHap phase + haplotag is applicable for diploid / dikaryotic fungi
+#   (Puccinia, Leptosphaeria, Zymoseptoria tritici) once SNP calls are made
+#   via bcftools mpileup | bcftools call or Clair3 from the same BAM.
+#
+# ONT R9.4.1 (legacy):
+#   ~Q15 median accuracy (error rate ≈ 5 %).  Still common in public ENA data.
+#   Same minimap2 map-ont preset as R10.4.1; lower SV recall in repeat-rich
+#   regions (relevant for AMF / two-speed pathogen scenarios).
+#
+# generic: use explicit --long-read-len / --long-read-error-rate / etc. flags.
+
+_LR_PLATFORM_PRESETS: dict[str, dict[str, int | float]] = {
+    "hifi":    {"len": 15000, "step": 5000, "cov": 15, "err": 0.001},
+    "ont-r10": {"len": 10000, "step": 3000, "cov": 20, "err": 0.010},
+    "ont-r9":  {"len":  8000, "step": 2500, "cov": 20, "err": 0.050},
+}
+
+
 def write_truth_vcf(path: Path, rows: list[list[str]]) -> None:
     """Write VCF4.3 truth file from truth TSV rows (15 fields each)."""
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -631,7 +662,7 @@ def main() -> None:  # noqa: C901
                     help="Number of on-reference SVs to embed per query contig (currently fixed at 1).")
     ap.add_argument("--tol-query-window-bp", type=int, default=2000000,
                     help="Streaming window size in bp (passed through for provenance only).")
-    ap.add_argument("--threads", type=int, default=0)
+    ap.add_argument("--threads", type=int, default=32)
     ap.add_argument("--query-mode", default="assembly",
                     choices=["assembly", "short-reads", "long-reads", "auto"],
                     help="Type of query artifact to emit in query_list.txt.")
@@ -642,7 +673,22 @@ def main() -> None:  # noqa: C901
     ap.add_argument("--long-read-step", type=int, default=300)
     ap.add_argument("--long-read-coverage", type=int, default=2)
     ap.add_argument("--long-read-error-rate", type=float, default=0.03)
+    ap.add_argument("--long-read-platform", default="ont-r10",
+                    choices=["hifi", "ont-r10", "ont-r9", "generic"],
+                    help="Long-read sequencing platform preset.  Overrides individual "
+                         "--long-read-* flags: hifi=PacBio HiFi CCS (≥Q20, 15 kb), "
+                         "ont-r10=ONT R10.4.1 simplex (~Q20, 10 kb), "
+                         "ont-r9=ONT R9.4.1 (~Q15, 8 kb), "
+                         "generic=use explicit --long-read-* values.")
     args = ap.parse_args()
+
+    # Apply platform preset before anything reads the long-read parameters.
+    if args.long_read_platform != "generic":
+        p = _LR_PLATFORM_PRESETS[args.long_read_platform]
+        args.long_read_len        = int(p["len"])
+        args.long_read_step       = int(p["step"])
+        args.long_read_coverage   = int(p["cov"])
+        args.long_read_error_rate = float(p["err"])
 
     out = Path(args.out_dir)
     out.mkdir(parents=True, exist_ok=True)
@@ -855,9 +901,12 @@ def main() -> None:  # noqa: C901
               unique_stress)
     write_tsv(out / "simulation_params.tsv",
               ["n_genomes","n_reps","n_queries","scenario_count",
-               "divergence","n_svs_per_contig","window_bp","write_hint_contigs","query_mode"],
+               "divergence","n_svs_per_contig","window_bp","write_hint_contigs","query_mode",
+               "lr_platform","lr_read_len","lr_error_rate","lr_coverage"],
               [[str(n_genomes), str(n_reps), str(len(queries)), str(len(scenarios)),
-                str(args.divergence), "1", str(seq_len), str(int(args.write_hint_contigs)), query_emit_mode]])
+                str(args.divergence), "1", str(seq_len), str(int(args.write_hint_contigs)), query_emit_mode,
+                args.long_read_platform, str(args.long_read_len),
+                str(args.long_read_error_rate), str(args.long_read_coverage)]])
 
     write_tsv(out / "query_truth.tsv",
               ["query_asm","query_contig","svtype","pos","svlen","scenario",

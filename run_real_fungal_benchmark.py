@@ -138,6 +138,28 @@ TYPE_CANON = {
     "OFF_REF": "OFF_REF",
 }
 
+# ── Long-read platform detection ───────────────────────────────────────────
+# PacBio HiFi (CCS): Revio, Sequel IIe/II CCS — ≥99 % accuracy, 10–25 kb.
+#   minimap2 preset:  map-hifi
+#   SV callers:       sniffles2, cuteSV (HiFi-tuned cluster params), SVIM
+# PacBio CLR (Sequel I, RS II): lower per-read accuracy.
+#   minimap2 preset:  map-pb
+# ONT R10.4.1 simplex: ~Q20 accuracy on PromethION / GridION / MinION Mk1C.
+#   minimap2 preset:  map-ont  (same as R9.4.1; Sniffles2 --long-read-model
+#                               ont_r10_q20 optional for v2.2+)
+#   WhatsHap phasing: applicable for dikaryotic / diploid fungi (e.g. Puccinia,
+#                     Leptosphaeria, Zymoseptoria) once SNP calls are available.
+#
+# Short reads (Illumina NovaSeq / HiSeq):
+#   bwa-mem2 (or minimap2 -ax sr) → samtools sort+index → Delly / Manta.
+#   bwa-mem2 is the gold standard for Delly/Manta BAM inputs; minimap2 sr is
+#   used here for a single-tool dependency.
+
+# Instrument model keywords indicating HiFi CCS output.
+_HIFI_MODEL_KW: frozenset[str] = frozenset({"revio", "sequel iie", "sequel 2e"})
+# ENA library_strategy values that directly assert CCS / HiFi processing.
+_HIFI_STRATEGY_KW: frozenset[str] = frozenset({"hifi", "ccs", "hi-fi"})
+
 
 @dataclass
 class NormalizedCall:
@@ -584,12 +606,66 @@ def preferred_platforms_for_mode(query_mode: str) -> set[str]:
     return set()
 
 
+def _is_pacbio_hifi(row: dict[str, str]) -> bool:
+    """Return True when an ENA run row represents PacBio HiFi (CCS) reads.
+
+    Detection order:
+    1. library_strategy contains a known HiFi keyword ("CCS", "HiFi", "Hi-Fi").
+    2. instrument_model matches Revio or Sequel IIe — both are HiFi-only.
+    3. Sequel II with WGS strategy defaults to HiFi; Sequel II CLR runs
+       typically carry "CLR" in library_strategy.
+    """
+    platform = (row.get("instrument_platform") or "").upper()
+    if "PACBIO" not in platform and "SMRT" not in platform:
+        return False
+    strategy = (row.get("library_strategy") or "").lower()
+    if any(kw in strategy for kw in _HIFI_STRATEGY_KW):
+        return True
+    model = (row.get("instrument_model") or "").lower()
+    if any(kw in model for kw in _HIFI_MODEL_KW):
+        return True
+    # Sequel II without an explicit CLR flag → assume modern HiFi workflow.
+    if ("sequel ii" in model or "sequel 2" in model) and "clr" not in strategy:
+        return True
+    return False
+
+
+def _long_read_platform_score(row: dict[str, str]) -> int:
+    """Rank ENA long-read runs for selection priority (higher = preferred).
+
+    3 — PacBio HiFi (Revio / Sequel IIe / Sequel II CCS)
+          Highest per-read accuracy; minimap2 map-hifi + sniffles2 / cuteSV.
+    2 — ONT PromethION or GridION
+          High-depth, likely R10.4.1 simplex in recent submissions (~Q20).
+    1 — ONT MinION / Mk1C
+          Valid long-read data; recent kits may carry R10.4.1 chemistry.
+    0 — PacBio CLR (RS II, Sequel I)
+          Lower base accuracy; minimap2 map-pb still produces usable BAMs.
+   -1 — Any other platform that passed the long-reads filter.
+    """
+    if _is_pacbio_hifi(row):
+        return 3
+    platform = (row.get("instrument_platform") or "").upper()
+    model = (row.get("instrument_model") or "").lower()
+    if "OXFORD_NANOPORE" in platform:
+        if "promethion" in model or "gridion" in model:
+            return 2
+        return 1  # MinION, Mk1C, or unspecified ONT model
+    if "PACBIO" in platform or "SMRT" in platform:
+        return 0  # CLR fallback
+    return -1
+
+
 def filter_ena_rows_for_mode(rows: list[dict[str, str]], query_mode: str) -> list[dict[str, str]]:
     preferred = preferred_platforms_for_mode(query_mode)
     if not preferred:
         return rows
     matched = [row for row in rows if (row.get("instrument_platform") or "").upper() in preferred]
-    return matched or rows
+    result = matched or rows
+    # For long reads, rank so PacBio HiFi > ONT PromethION > ONT MinION > PacBio CLR.
+    if query_mode == "long-reads":
+        result = sorted(result, key=_long_read_platform_score, reverse=True)
+    return result
 
 
 def direct_read_sources_from_row(row: dict[str, str]) -> list[str]:
@@ -1852,14 +1928,22 @@ def _minimap2_align_reads(
     *,
     preset: str,
 ) -> tuple[Path, Path] | None:
-    """
-    Align a read-mode query (FASTQ/FASTA) to its benchmark reference with
-    minimap2 and produce a sorted+indexed BAM. Returns (bam_path, ref_path)
-    or None if the prerequisites aren't met.
+    """Align reads to the benchmark reference with minimap2 → sorted+indexed BAM.
 
-    We use a single input file (manifest's `path`). For paired short reads the
-    project's manifests store either an interleaved FASTQ or R1 only; minimap2
-    handles both with the `sr` preset.
+    Preset routing (set by _long_read_preset / callers):
+      map-hifi  PacBio HiFi CCS (Revio, Sequel IIe, Sequel II CCS)
+      map-pb    PacBio CLR (RS II, Sequel I)
+      map-ont   ONT — R10.4.1 simplex and R9.4.1 both use this preset
+      sr        Illumina short reads (bwa-mem2 is an alternative for
+                Delly / Manta pipelines that mandate BWA-formatted RG headers)
+
+    The resulting BAM can feed:
+      • sniffles2 / SVIM / cuteSV  for long-read SV calling
+      • Delly / Manta              for short-read SV calling
+      • WhatsHap phase + haplotag  for haplotype-phased variant calling in
+        dikaryotic or diploid fungi (Puccinia, Leptosphaeria, Zymoseptoria)
+
+    Returns (bam_path, ref_path) or None if prerequisites are not met.
     """
     if not tool_path("minimap2") or not tool_path("samtools"):
         return None
@@ -1906,11 +1990,20 @@ def _minimap2_align_reads(
 
 
 def _long_read_preset(query_row: dict[str, str]) -> str:
-    """Pick a minimap2 long-read preset from the manifest platform hint."""
+    """Return the minimap2 long-read alignment preset for this query.
+
+    map-hifi  PacBio HiFi CCS (Revio, Sequel IIe, Sequel II CCS).
+              Tuned for ≥99 % accuracy reads; incompatible with CLR data.
+    map-pb    PacBio CLR (RS II, Sequel I, Sequel II in CLR mode).
+    map-ont   Oxford Nanopore — covers R9.4.1 and R10.4.1 simplex.
+              R10.4.1 on PromethION/GridION yields ~Q20 average; the same
+              minimap2 preset applies, though Sniffles2 ≥v2.2 accepts
+              --long-read-model ont_r10_q20 for a marginal recall boost.
+    """
     platform = (query_row.get("instrument_platform") or "").strip().upper()
-    if "PACBIO" in platform or "PB" in platform:
-        return "map-pb"
-    # Default to Nanopore: most public long-read fungal data is ONT.
+    if "PACBIO" in platform or "SMRT" in platform:
+        return "map-hifi" if _is_pacbio_hifi(query_row) else "map-pb"
+    # Default: Oxford Nanopore (R9.4.1, R10.4.1, or unspecified chemistry).
     return "map-ont"
 
 
@@ -1945,63 +2038,89 @@ def run_svim_for_query(query_row: dict[str, str], out_dir: Path, threads: int) -
 
 
 def run_sniffles_for_query(query_row: dict[str, str], out_dir: Path, threads: int) -> dict[str, str] | None:
-    """Sniffles2: long-read SV caller. Emits a reference-coordinate VCF."""
+    """Sniffles2: long-read SV caller. Emits a reference-coordinate VCF.
+
+    For ONT R10.4.1 simplex reads, Sniffles2 ≥v2.2 accepts
+    --long-read-model ont_r10_q20, which improves recall on ~Q20 data.
+    We try the model flag first and fall back silently if unsupported.
+    PacBio HiFi reads work with Sniffles2 defaults (the map-hifi BAM RG
+    header is sufficient for Sniffles2 to auto-detect the platform).
+    """
     if not tool_path("sniffles"):
         return None
     query_asm = query_row["query_asm"]
+    preset = _long_read_preset(query_row)
     work_dir = out_dir / "comparators" / "sniffles" / query_asm
-    aligned = _minimap2_align_reads(
-        query_row, work_dir, threads, preset=_long_read_preset(query_row)
-    )
+    aligned = _minimap2_align_reads(query_row, work_dir, threads, preset=preset)
     if aligned is None:
         return None
     bam_sorted, ref_fa = aligned
     vcf_path = work_dir / "sniffles.vcf"
+    base_cmd = [
+        "sniffles", "--input", str(bam_sorted),
+        "--reference", str(ref_fa),
+        "--vcf", str(vcf_path),
+        "--threads", str(threads),
+    ]
+    # ONT R10.4.1 simplex: request the Q20-tuned internal model when available.
+    platform = (query_row.get("instrument_platform") or "").upper()
+    ont_model_cmd = (
+        base_cmd + ["--long-read-model", "ont_r10_q20"]
+        if "OXFORD_NANOPORE" in platform else base_cmd
+    )
     try:
-        run(
-            ["sniffles", "--input", str(bam_sorted),
-             "--reference", str(ref_fa),
-             "--vcf", str(vcf_path),
-             "--threads", str(threads)],
-            cwd=ROOT,
-        )
+        run(ont_model_cmd, cwd=ROOT)
     except subprocess.CalledProcessError:
-        return None
+        if ont_model_cmd is not base_cmd:
+            try:
+                run(base_cmd, cwd=ROOT)
+            except subprocess.CalledProcessError:
+                return None
+        else:
+            return None
     if not vcf_path.exists():
         return None
     return {"label": "sniffles", "vcf": str(vcf_path)}
 
 
 def run_cutesv_for_query(query_row: dict[str, str], out_dir: Path, threads: int) -> dict[str, str] | None:
-    """cuteSV: long-read SV caller. Needs a writable working dir alongside the BAM."""
+    """cuteSV: long-read SV caller. Needs a writable working dir alongside the BAM.
+
+    Cluster parameters differ by platform (from the cuteSV README):
+      PacBio HiFi  max_cluster_bias 1000 / diff_ratio_merging 0.9 (INS) 0.5 (DEL)
+                   High accuracy and long reads justify wider merging windows.
+      ONT R10.4.1  max_cluster_bias 100  / diff_ratio_merging 0.3
+      ONT R9.4.1   same conservative ONT defaults as R10.4.1
+    """
     if not tool_path("cuteSV") and not tool_path("cutesv"):
         return None
     bin_name = "cuteSV" if tool_path("cuteSV") else "cutesv"
     query_asm = query_row["query_asm"]
+    preset = _long_read_preset(query_row)
     work_dir = out_dir / "comparators" / "cutesv" / query_asm
-    aligned = _minimap2_align_reads(
-        query_row, work_dir, threads, preset=_long_read_preset(query_row)
-    )
+    aligned = _minimap2_align_reads(query_row, work_dir, threads, preset=preset)
     if aligned is None:
         return None
     bam_sorted, ref_fa = aligned
     vcf_path = work_dir / "cutesv.vcf"
     tmp_dir = work_dir / "cutesv_tmp"
     tmp_dir.mkdir(parents=True, exist_ok=True)
-    # Default parameters follow the cuteSV README recommendations for ONT;
-    # they're conservative enough for fungal genomes and robust when the
-    # platform is mis-reported.
+    # PacBio HiFi: tighter cluster merging exploits the higher per-read accuracy.
+    # ONT (R10.4.1 simplex or R9.4.1): conservative defaults from the cuteSV README.
+    if preset == "map-hifi":
+        bias_ins, ratio_ins = "1000", "0.9"
+        bias_del, ratio_del = "1000", "0.5"
+    else:
+        bias_ins, ratio_ins = "100",  "0.3"
+        bias_del, ratio_del = "100",  "0.3"
     cmd = [
         bin_name,
-        str(bam_sorted),
-        str(ref_fa),
-        str(vcf_path),
-        str(tmp_dir),
+        str(bam_sorted), str(ref_fa), str(vcf_path), str(tmp_dir),
         "--threads", str(threads),
-        "--max_cluster_bias_INS", "100",
-        "--diff_ratio_merging_INS", "0.3",
-        "--max_cluster_bias_DEL", "100",
-        "--diff_ratio_merging_DEL", "0.3",
+        "--max_cluster_bias_INS", bias_ins,
+        "--diff_ratio_merging_INS", ratio_ins,
+        "--max_cluster_bias_DEL", bias_del,
+        "--diff_ratio_merging_DEL", ratio_del,
         "--min_support", "3",
         "--sample", query_asm,
     ]
@@ -2355,8 +2474,8 @@ def maybe_run_candidate_analysis(
         sys.executable, str(DEFAULT_ANALYZE),
         "--phylum", phylum,
         "--vcf", mycosv_paths["vcf"],
-        "--hits-tsv", mycosv_paths["hits"],
-        "--query-meta-tsv", str((prepared_dir / "query_manifest.tsv").resolve()),
+        "--hits", mycosv_paths["hits"],
+        "--query-metadata", str((prepared_dir / "query_manifest.tsv").resolve()),
         "--out-tsv", str(candidates_tsv.resolve()),
         "--summary-json", str(summary_json.resolve()),
         "--top-n", "200",
@@ -2364,9 +2483,9 @@ def maybe_run_candidate_analysis(
     if expression_tsv:
         cmd.extend(["--expression-tsv", str(expression_tsv.resolve())])
     if gene_annotations_tsv:
-        cmd.extend(["--gene-annotations-tsv", str(gene_annotations_tsv.resolve())])
+        cmd.extend(["--gene-annotations", str(gene_annotations_tsv.resolve())])
     if ancestral_tsv:
-        cmd.extend(["--ancestral-tsv", str(ancestral_tsv.resolve())])
+        cmd.extend(["--ancestral", str(ancestral_tsv.resolve())])
     try:
         run(cmd, cwd=ROOT)
         return candidates_tsv, summary_json
@@ -2981,7 +3100,7 @@ def build_parser() -> argparse.ArgumentParser:
     smr.add_argument("--latest-only", action="store_true", help="Only keep version_status=latest rows.")
     smr.add_argument("--target-centroids", type=int, default=1_000_000, help="Total centroids in the routing store after padding with synthetic decoys; set to 0 to skip padding.")
     smr.add_argument("--seed", type=int, default=1)
-    smr.add_argument("--threads", type=int, default=4)
+    smr.add_argument("--threads", type=int, default=32)
     smr.add_argument("--max-clade-genomes", type=int, default=32)
     smr.add_argument("--binary-path", type=Path, default=DEFAULT_BIN)
     smr.add_argument("--force-rebuild", action="store_true")
@@ -3020,7 +3139,7 @@ def build_parser() -> argparse.ArgumentParser:
     sb.add_argument("--binary-path", type=Path, default=DEFAULT_BIN)
     sb.add_argument("--force-rebuild", action="store_true")
     sb.add_argument("--mode", default="assembly", choices=["assembly", "short-reads", "long-reads", "auto"])
-    sb.add_argument("--threads", type=int, default=4)
+    sb.add_argument("--threads", type=int, default=32)
     sb.add_argument("--run-syri", action="store_true", help="For assembly-mode queries, run SyRI and use query-coordinate TSV output as proxy truth.")
     sb.add_argument("--run-minigraph", action="store_true", help="For assembly-mode queries, run a pairwise minigraph + gfatools bubble baseline (reference-space, strongest for INS/DEL/INV).")
     sb.add_argument("--run-pggb", action="store_true", help="For assembly-mode queries, run a pairwise pggb build and parse its reference-space VCF output.")

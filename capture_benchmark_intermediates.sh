@@ -31,11 +31,9 @@ run_benchmark_with_capture() {
   echo "[$(date +%H:%M:%S)] Running ${mode} mode benchmark..."
   
   # Run benchmark and capture VCF/TSV outputs
-  python3 run_mode_pr_benchmark.py \
+  python3 run_million_mode_query_benchmark.py \
     --modes "${mode}" \
     --out-dir "${mode_dir}/output" \
-    --n-refs 500 \
-    --n-queries 20 \
     --seed 42 \
     2>&1 | tee "${mode_dir}/benchmark_${mode}.log"
   

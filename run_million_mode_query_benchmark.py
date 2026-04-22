@@ -6,8 +6,6 @@ from __future__ import annotations
 import argparse
 import csv
 import json
-import os
-import shutil
 import struct
 import subprocess
 import sys
@@ -22,6 +20,7 @@ ROOT = Path(__file__).resolve().parent
 DEFAULT_SIM = ROOT / "test_amf.py"
 DEFAULT_MAIN = ROOT / "main.cpp"
 DEFAULT_BIN = ROOT / "fungi_graphsv_tol_bin"
+DEFAULT_ANALYZE = ROOT / "analyze_new_biology_candidates.py"
 
 
 def run(cmd: list[str], cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
@@ -217,11 +216,41 @@ def main() -> int:
     ap.add_argument("--window-bp", type=int, default=2_000_000)
     ap.add_argument("--target-svs-per-scenario", type=int, default=3000)
     ap.add_argument("--min-contig-bp", type=int, default=12000)
+    ap.add_argument("--threads", type=int, default=32,
+                    help="Parallel worker threads passed to the MycoSV binary (--threads) "
+                         "and index build (--tol-index-threads). Default: 32.")
+    ap.add_argument("--long-read-platform", default="hifi,ont-r10",
+                    help="Comma-separated list of long-read platform presets to run. "
+                         "Each generates a separate long-reads_<platform>/ output directory. "
+                         "hifi=PacBio HiFi CCS (15 kb, ≥Q20), "
+                         "ont-r10=ONT R10.4.1 simplex (10 kb, ~Q20), "
+                         "ont-r9=ONT R9.4.1 (8 kb, ~Q15), "
+                         "generic=simulator defaults. "
+                         "Default: hifi,ont-r10 (both platforms).")
     args = ap.parse_args()
 
     modes = parse_modes(args.modes)
     out_dir = args.out_dir.resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    # Validate long-read platforms.
+    _valid_lr_platforms = {"hifi", "ont-r10", "ont-r9", "generic"}
+    lr_platforms = [p.strip() for p in args.long_read_platform.split(",") if p.strip()]
+    for p in lr_platforms:
+        if p not in _valid_lr_platforms:
+            raise ValueError(f"Unknown long-read platform {p!r}; valid: {sorted(_valid_lr_platforms)}")
+
+    # Expand modes: long-reads → one iteration per platform; others run once.
+    # label      = output directory name and summary key (e.g. "long-reads_hifi")
+    # actual_mode = query-mode flag passed to simulator/binary ("long-reads")
+    # lr_plat    = platform preset forwarded to the simulator (empty for non-lr)
+    run_tasks: list[tuple[str, str, str]] = []
+    for mode in modes:
+        if mode == "long-reads":
+            for plat in lr_platforms:
+                run_tasks.append((f"long-reads_{plat}", "long-reads", plat))
+        else:
+            run_tasks.append((mode, mode, ""))
 
     args.n_genomes, args.n_reps, args.total_len = ensure_sv_volume(
         args.n_genomes,
@@ -249,12 +278,13 @@ def main() -> int:
             "divergence": args.divergence,
             "target_svs_per_scenario": args.target_svs_per_scenario,
             "min_contig_bp": args.min_contig_bp,
+            "long_read_platforms": lr_platforms,
         },
         "modes": {},
     }
 
-    for mode in modes:
-        mode_dir = out_dir / mode
+    for label, actual_mode, lr_plat in run_tasks:
+        mode_dir = out_dir / label
         sim_dir = mode_dir / "sim"
         idx_dir = mode_dir / "idx"
         reg_dir = mode_dir / "reg"
@@ -272,8 +302,15 @@ def main() -> int:
             "--out-dir", str(sim_dir),
             "--scenario-set", args.scenario_set,
             "--write-extended-manifest",
-            "--query-mode", mode,
+            "--query-mode", actual_mode,
             "--divergence", str(args.divergence),
+            # Platform preset for long-reads: controls read length, error rate,
+            # and coverage in the simulator (see _LR_PLATFORM_PRESETS in test_amf.py).
+            # hifi    → 15 kb, ≥Q20 — minimap2 map-hifi downstream
+            # ont-r10 → 10 kb, ~Q20 — minimap2 map-ont; WhatsHap applicable for
+            #           dikaryotic fungi (Puccinia, Leptosphaeria, Zymoseptoria)
+            # ont-r9  → 8 kb, ~Q15
+            *( ["--long-read-platform", lr_plat] if lr_plat else [] ),
         ]
         sim_run = run(sim_cmd, cwd=ROOT)
 
@@ -286,7 +323,7 @@ def main() -> int:
             "--tol-multi-rank",
             "--tol-base-graph-build",
             "--tol-max-clade-genomes", "32",
-            "--tol-index-threads", "4",
+            "--tol-index-threads", str(args.threads),
         ]
         build_run = run_mycosv_command(build_cmd, cwd=ROOT)
         store_info = augment_routing_store(idx_dir, args.n_centroids, args.seed)
@@ -300,10 +337,11 @@ def main() -> int:
             "--ref-list", str(sim_dir / "ref_list.txt"),
             "--query-list", str(sim_dir / "query_list.txt"),
             "--out-prefix", str(out_prefix),
-            "--query-mode", mode,
+            "--query-mode", actual_mode,
             "--routing-top-n", str(args.routing_top_n),
             "--min-svlen", str(args.min_svlen),
-            *mode_specific_caller_args(mode, args.total_len),
+            "--threads", str(args.threads),
+            *mode_specific_caller_args(actual_mode, args.total_len),
         ]
         q_start = time.perf_counter()
         query_run = run_mycosv_command(query_cmd, cwd=ROOT)
@@ -319,11 +357,30 @@ def main() -> int:
         write_pr_artifacts(summary, mode_dir / "pr_metrics.tsv", mode_dir / "pr_metrics.json")
         overall = summary["overall"]
 
+        # Biology candidate analysis — classifies TE-linked / novel SVs and
+        # produces biology_candidates.tsv picked up by sv_visualization_report.py.
+        if DEFAULT_ANALYZE.exists():
+            bio_dir = mode_dir / "biology"
+            bio_dir.mkdir(parents=True, exist_ok=True)
+            try:
+                run([
+                    sys.executable, str(DEFAULT_ANALYZE),
+                    "--vcf",            str(out_prefix.with_suffix(".vcf")),
+                    "--hits",           str(out_prefix.with_suffix(".hits.tsv")),
+                    "--query-metadata", str(sim_dir / "query_metadata.tsv"),
+                    "--phylum",         args.phylum,
+                    "--out-tsv",        str(bio_dir / "biology_candidates.tsv"),
+                    "--summary-json",   str(bio_dir / "biology_candidates.json"),
+                    "--top-n",          "200",
+                ], cwd=ROOT)
+            except subprocess.CalledProcessError:
+                pass  # biology analysis is non-fatal
+
         store_path = idx_dir / "routing_centroids.bin"
         skip_path = Path(str(store_path) + ".skip")
         summary_rows.append(
             {
-                "mode": mode,
+                "mode": label,
                 "n_centroids": store_info["total_centroids"],
                 "truth_records": summary["truth_records"],
                 "pred_records_algo": summary["pred_records_algo"],
@@ -338,7 +395,7 @@ def main() -> int:
                 "store_bytes": store_path.stat().st_size if store_path.exists() else 0,
             }
         )
-        summary_json["modes"][mode] = {
+        summary_json["modes"][label] = {
             "simulation_stdout": sim_run.stdout,
             "build_stdout": build_run.stdout,
             "query_stdout": query_run.stdout,
