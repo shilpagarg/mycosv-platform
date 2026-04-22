@@ -2403,6 +2403,90 @@ def join_biology_findings(
     write_tsv(out_path, rows, fieldnames)
 
 
+def _report_comparator_status(args: argparse.Namespace, out_dir: Path) -> None:
+    """Check which requested SOTA comparators are on PATH; warn clearly for missing ones."""
+
+    # Map (flag_attr, tool_binary, conda_install_hint)
+    _TOOL_HINTS: dict[str, tuple[list[str], str]] = {
+        # assembly
+        "run_syri":       (["minimap2", "syri"],
+                           "conda install -c bioconda minimap2 syri"),
+        "run_minigraph":  (["minigraph", "gfatools"],
+                           "conda install -c bioconda minigraph gfatools"),
+        "run_pggb":       (["pggb"],
+                           "conda install -c bioconda pggb"),
+        "run_cactus":     (["cactus-pangenome"],
+                           "conda install -c bioconda cactus  (or download binary from GitHub)"),
+        "run_svim_asm":   (["svim-asm", "minimap2", "samtools"],
+                           "conda install -c bioconda svim-asm minimap2 samtools"),
+        "run_anchorwave": (["anchorwave", "minimap2", "samtools"],
+                           "conda install -c bioconda anchorwave minimap2 samtools"),
+        # short-reads
+        "run_delly":      (["delly", "bcftools"],
+                           "conda install -c bioconda delly bcftools"),
+        "run_manta":      (["configManta.py", "samtools"],
+                           "conda install -c bioconda manta samtools"),
+        # long-reads
+        "run_svim":       (["svim"],
+                           "conda install -c bioconda svim"),
+        "run_sniffles":   (["sniffles"],
+                           "conda install -c bioconda sniffles"),
+        "run_cutesv":     (["cuteSV", "samtools"],
+                           "conda install -c bioconda cutesv samtools"),
+    }
+
+    available: list[str] = []
+    missing: list[tuple[str, list[str], str]] = []  # (flag, binaries, hint)
+
+    for flag, (binaries, hint) in _TOOL_HINTS.items():
+        if not getattr(args, flag, False):
+            continue
+        absent = [b for b in binaries if not tool_path(b)]
+        if absent:
+            missing.append((flag, absent, hint))
+        else:
+            available.append(flag.replace("run_", ""))
+
+    lines: list[str] = []
+    lines.append("=== Comparator Pre-flight Check ===\n")
+    if available:
+        lines.append("AVAILABLE (will run):\n")
+        for name in available:
+            lines.append(f"  ✓ {name}\n")
+        lines.append("\n")
+
+    if missing:
+        lines.append("MISSING (will be silently skipped):\n")
+        for flag, absent, hint in missing:
+            tool_name = flag.replace("run_", "")
+            lines.append(f"  ✗ {tool_name}: {', '.join(absent)} not found on PATH\n")
+            lines.append(f"    Install: {hint}\n")
+        lines.append("\n")
+        lines.append("To install all missing tools at once:\n")
+        lines.append(f"  bash {Path(__file__).parent / 'install_tools.sh'}\n")
+        lines.append("  # or: bash install_tools.sh --check  (to see what is missing)\n")
+
+    status_text = "".join(lines)
+    status_file = out_dir / "COMPARATORS_STATUS.txt"
+    status_file.write_text(status_text, encoding="utf-8")
+
+    if missing:
+        sys.stderr.write("\n[warn] The following requested comparators are missing and will "
+                         "be skipped (no results will appear for them):\n")
+        for flag, absent, hint in missing:
+            tool_name = flag.replace("run_", "")
+            sys.stderr.write(f"  ✗ {tool_name}: missing binaries {', '.join(absent)}\n")
+            sys.stderr.write(f"    Install: {hint}\n")
+        sys.stderr.write(f"\nFull status written to: {status_file}\n")
+        sys.stderr.write(f"Install all tools: bash {Path(__file__).parent / 'install_tools.sh'}\n\n")
+    elif available:
+        sys.stderr.write(f"[info] All requested comparators available: "
+                         f"{', '.join(available)}\n")
+    else:
+        sys.stderr.write("[info] No SOTA comparators requested (pass --run-syri etc. to enable)\n")
+        sys.stderr.write(f"       Install script: bash {Path(__file__).parent / 'install_tools.sh'}\n")
+
+
 def benchmark_real_data(args: argparse.Namespace) -> int:
     prepared_dir = args.prepared_dir.resolve()
     out_dir = args.out_dir.resolve()
@@ -2437,6 +2521,10 @@ def benchmark_real_data(args: argparse.Namespace) -> int:
             f"\tstatus_file={status_path}"
         )
         return 0
+
+    # Pre-flight: report which comparators are available / missing and write a
+    # COMPARATORS_STATUS.txt so the user does not need to grep through logs.
+    _report_comparator_status(args, out_dir)
 
     # Write a mode-filtered query_list.txt that the binary consumes, so reads
     # modes get FASTQ paths and assembly mode gets FASTA paths.

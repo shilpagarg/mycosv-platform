@@ -348,6 +348,86 @@ callset.log             # Execution log
 
 ---
 
+## TE Classification Quick Reference
+
+### Method
+k-mer nearest-centroid via VPTree (same infrastructure as Layer 3 routing).
+- **Sketch**: canonical k-mer FracMin (k=21, p=0.05 → ~5% of k-mers kept)
+- **Distance**: Jaccard (1 − |A∩B|/|A∪B|)
+- **Taxonomy**: class / order / superfamily (PanTEon/RepBase label format)
+
+### Label format
+```
+>ID#Class/Order/Superfamily     e.g.  >TE001#LTR/Gypsy/Chromovirus
+>ID#Class/Superfamily           e.g.  >TE002#LTR/Copia
+```
+
+### Commands
+```bash
+# Build index from labeled training FASTA
+echo train.fasta > train.lst
+./fungi_graphsv_tol --te-train --query-list train.lst \
+    --te-index-prefix models/te_clf
+
+# Classify unknown sequences
+echo unknown.fasta > test.lst
+./fungi_graphsv_tol --te-classify --query-list test.lst \
+    --te-index-prefix models/te_clf --out-prefix results/te
+# → results/te.te_predictions.tsv
+
+# Benchmark vs PanTEon SOTA tools
+python3 run_te_benchmark.py \
+    --train-fasta repbase_fungi_train.fa \
+    --test-fasta  repbase_fungi_test.fa \
+    --out-dir     te_benchmark/
+
+# Demo (no data download needed)
+python3 run_te_benchmark.py --download-fungi-demo --out-dir te_demo/
+
+# Install SOTA TE tools (NeuralTE, DeepTE, TERL, Terrier, ClassifyTE, CREATE, TEClass2)
+bash install_tools.sh --te-only
+```
+
+### Parameters
+| Flag | Default | Notes |
+|------|---------|-------|
+| `--te-k` | 21 | k-mer length |
+| `--te-fracmin-p` | 0.05 | Sketch density (0–1) |
+| `--te-max-hashes` | 4096 | Max hashes per centroid |
+| `--te-index-prefix` | — | Path stem for .vptree/.meta files |
+
+### PanTEon benchmark reference (fungi, NeuralTE best)
+| Level | F1 (best paper) |
+|-------|----------------|
+| Class | 0.88 |
+| Order | 0.79 |
+| Superfamily | 0.72 |
+
+---
+
+## Tool Installation
+
+Install all SV callers and TE classifiers into the `mycosv` conda environment:
+
+```bash
+# Full install (SV tools + TE tools + build MycoSV binary)
+bash install_tools.sh
+
+# Check what is already available
+bash install_tools.sh --check
+
+# SV tools only (SyRI, minigraph, PGGB, Delly, Manta, SVIM, Sniffles, cuteSV)
+bash install_tools.sh --sv-only
+
+# TE tools only (NeuralTE, DeepTE, TERL, Terrier, ClassifyTE, CREATE, TEClass2)
+bash install_tools.sh --te-only
+
+# Build MycoSV binary only (assumes conda env already active)
+bash install_tools.sh --mycosv-only
+```
+
+---
+
 ## References
 
 - Hong, C., et al. (2016). "Optimizing seed size yields improved sensitivity in read mapping"

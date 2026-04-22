@@ -41,6 +41,7 @@
 // TOL headers (adjust -I path or copy alongside this file)
 #include "fungi_tol_bridge.hpp"
 #include "query_input_handler.hpp"
+#include "te_classifier.hpp"
 
 namespace fs = std::filesystem;
 
@@ -182,6 +183,14 @@ struct Options {
     // Set false via --no-mode-param-override to keep user-supplied calling params
     // unchanged even when the query mode would normally tune them.
     bool   applyModeParamOverride = true;    // --no-mode-param-override
+
+    // TE classification mode
+    bool        teTrainMode    = false;   // --te-train
+    bool        teClassifyMode = false;   // --te-classify
+    std::string teIndexPrefix;            // --te-index-prefix  (save/load path stem)
+    int         teK            = 21;      // --te-k
+    double      teFracminP     = 0.05;    // --te-fracmin-p
+    size_t      teMaxHashes    = 4096;    // --te-max-hashes
 };
 
 // ============================================================
@@ -322,7 +331,15 @@ static void usage(const char* argv0) {
 "                           (--k, --chain-gap-band, --min-anchors-per-block, etc.)\n"
 "                           that would otherwise be adjusted for the detected mode\n"
 "\n"
-"  -h / --help              Print this message\n";
+"  -h / --help              Print this message\n"
+"\n"
+"TE classification:\n"
+"  --te-train               Train TE classifier from labeled FASTA (--query-list)\n"
+"  --te-classify            Classify TE sequences from FASTA (--query-list)\n"
+"  --te-index-prefix PATH   Prefix for TE index files (.vptree / .meta)\n"
+"  --te-k INT               k-mer length for TE classification (default 21)\n"
+"  --te-fracmin-p FLOAT     FracMin sketch density 0..1 (default 0.05)\n"
+"  --te-max-hashes INT      Max hashes per centroid (default 4096)\n";
 }
 
 // ============================================================
@@ -447,6 +464,13 @@ static Options parse_args(int argc, char** argv) {
         else if (x == "--genome-size-hint")            o.genomeSizeHint       = std::stoull(need(x.c_str(),i));
         else if (x == "--max-reads")                   o.maxReadsPerFile      = std::stoull(need(x.c_str(),i));
         else if (x == "--no-mode-param-override")      o.applyModeParamOverride = false;
+        // TE classification
+        else if (x == "--te-train")                    o.teTrainMode          = true;
+        else if (x == "--te-classify")                 o.teClassifyMode       = true;
+        else if (x == "--te-index-prefix")             o.teIndexPrefix        = need(x.c_str(),i);
+        else if (x == "--te-k")                        o.teK                  = std::stoi(need(x.c_str(),i));
+        else if (x == "--te-fracmin-p")                o.teFracminP           = std::stod(need(x.c_str(),i));
+        else if (x == "--te-max-hashes")               o.teMaxHashes          = std::stoull(need(x.c_str(),i));
         else {
             std::cerr << "[warn] unknown argument: " << x << '\n';
         }
@@ -1438,22 +1462,33 @@ reads_mode_sv_calls(const std::string& qAsm,
             is_reads_mode_fragment(seq.size(), prefilterBestRefLen, prefilterBestOverlap, o, mode)) {
             continue;
         }
+        // Pass 1a: single-ref MEM chain (fast path; good for INS/DEL).
         VariantCallBridge cachedChainCall;
+        bool singleRefOk = false;
         if (prefilterBestRef != nullptr &&
             prefilterBestOverlap >= 0.01 &&
             try_mem_chain_call_single_ref_cached(
                 qAsm, contigName, seq, prefilterBestRef, memCache, eff_fo, cachedChainCall)) {
-            out.push_back(std::move(cachedChainCall));
-            continue;
+            out.push_back(cachedChainCall);
+            singleRefOk = true;
+            // TRA/INV/DUP already confirmed from a single reference — no need for
+            // the more expensive multi-ref chain.
+            if (cachedChainCall.type != "INS" && cachedChainCall.type != "DEL") {
+                continue;
+            }
         }
 
+        // Pass 1b: multi-ref MEM chain (detects TRA/INV/DUP across contig boundaries).
+        // Runs even when Pass 1a succeeded with an indel so that a cross-contig TRA
+        // gets added as a competing candidate and arbitration can pick the better call.
         const auto shortlist = select_mem_chain_refs(contigName, seq, refIdx, cache, mode, 12u);
         const auto refBundle = make_refseq_bundle(shortlist);
         VariantCallBridge chainCall;
-        if (false && tol::try_mem_chain_call_public(qAsm, contigName, seq, refBundle.ptrs, eff_fo, chainCall)) {
+        if (tol::try_mem_chain_call_public(qAsm, contigName, seq, refBundle.ptrs, eff_fo, chainCall)) {
             out.push_back(std::move(chainCall));
             continue;
         }
+        if (singleRefOk) continue;
 
         // ── Pass 2: k-mer overlap + length delta (INS/DEL) ────────────
         double    bestOverlap = 0.0;
@@ -1779,6 +1814,9 @@ static double candidate_priority_score(const VariantCallBridge& call,
         // favor indels that still show real sequence overlap and penalize
         // large rearrangements whose assigned reference has essentially none.
         if (indel && overlap >= 0.04) score += 110.0;
+        // TRA confirmed across two reference contigs (mateContig set, primary overlap
+        // high) is treated on equal footing with a high-confidence indel.
+        if (call.type == "TRA" && !call.mateContig.empty() && overlap >= 0.30) score += 115.0;
         if (largeRearr && overlap < 0.02) score -= 180.0;
         if (largeRearr && overlap < 0.05) score -= 70.0;
         if (call.type == "TRA" && overlap < 0.05 && call.mateContig.empty()) score -= 120.0;
@@ -2580,6 +2618,77 @@ int main(int argc, char** argv) {
     } catch (const std::exception& e) {
         std::cerr << "[error] " << e.what() << '\n';
         return 1;
+    }
+
+    // ---- TE train mode -----------------------------------------------
+    if (o.teTrainMode) {
+        if (o.queryList.empty()) {
+            std::cerr << "[error] --te-train requires --query-list (labeled FASTA)\n";
+            return 1;
+        }
+        if (o.teIndexPrefix.empty() && !o.outPrefix.empty()) {
+            // fall back to --out-prefix as index prefix
+            const_cast<std::string&>(o.teIndexPrefix) = o.outPrefix;
+        }
+        if (o.teIndexPrefix.empty()) {
+            std::cerr << "[error] --te-train requires --te-index-prefix or --out-prefix\n";
+            return 1;
+        }
+        te::TEClassifier::Params p;
+        p.k          = o.teK;
+        p.fracmin_p  = o.teFracminP;
+        p.max_hashes = o.teMaxHashes;
+        te::TEClassifier clf(p);
+        try {
+            auto ql = read_list(o.queryList);
+            for (const auto& fa : ql) {
+                std::cerr << "[te-train] loading " << fa << '\n';
+                clf.train(fa, !o.quiet);
+            }
+            if (auto pd = fs::path(o.teIndexPrefix).parent_path(); !pd.empty())
+                fs::create_directories(pd);
+            clf.save(o.teIndexPrefix);
+            std::cerr << "[te-train] saved " << clf.num_centroids()
+                      << " centroids to " << o.teIndexPrefix << ".{vptree,meta}\n";
+        } catch (const std::exception& e) {
+            std::cerr << "[error] te-train: " << e.what() << '\n';
+            return 1;
+        }
+        return 0;
+    }
+
+    // ---- TE classify mode --------------------------------------------
+    if (o.teClassifyMode) {
+        if (o.queryList.empty()) {
+            std::cerr << "[error] --te-classify requires --query-list (FASTA to classify)\n";
+            return 1;
+        }
+        const std::string idx = o.teIndexPrefix.empty() ? o.outPrefix : o.teIndexPrefix;
+        if (idx.empty()) {
+            std::cerr << "[error] --te-classify requires --te-index-prefix or --out-prefix\n";
+            return 1;
+        }
+        te::TEClassifier::Params p;
+        p.k          = o.teK;
+        p.fracmin_p  = o.teFracminP;
+        p.max_hashes = o.teMaxHashes;
+        te::TEClassifier clf(p);
+        try {
+            clf.load(idx);
+            std::cerr << "[te-classify] loaded " << clf.num_centroids() << " centroids\n";
+            const std::string out_tsv = o.outPrefix.empty() ? "te_predictions.tsv"
+                                                             : o.outPrefix + ".te_predictions.tsv";
+            auto ql = read_list(o.queryList);
+            for (const auto& fa : ql) {
+                std::cerr << "[te-classify] classifying " << fa << '\n';
+                clf.classify_fasta(fa, out_tsv);
+            }
+            std::cerr << "[te-classify] predictions written to " << out_tsv << '\n';
+        } catch (const std::exception& e) {
+            std::cerr << "[error] te-classify: " << e.what() << '\n';
+            return 1;
+        }
+        return 0;
     }
 
     // ---- TOL validation mode -----------------------------------------

@@ -81,56 +81,11 @@ SMALL_SCENARIO_SET="compact_yeast,two_speed_pathogen_extreme,arbuscular_mf"
 LARGE_SCENARIO_SET="compact_yeast,two_speed_pathogen_extreme,arbuscular_mf"
 
 # ============================================================================
-# 1. SMALL-SCALE SIMULATED DATA TESTS
+# 1. SMALL-SCALE BENCHMARK (precision/recall across all modes)
 # ============================================================================
 
 if [[ "$EXPERIMENT_TYPE" == "all" || "$EXPERIMENT_TYPE" == "small" ]]; then
-  echo -e "${YELLOW}[1/5] Running small-scale simulated data tests...${NC}"
-  echo "      Output: ${SMALL_DIR}/simulated"
-  mkdir -p "${SMALL_DIR}/simulated"
-
-  if python3 -m pytest \
-      test_pipeline_features.py \
-      test_amf.py \
-      test_all_use_cases.py \
-      -v \
-      --tb=short \
-      --basetemp="${SMALL_DIR}/simulated/.pytest_tmp" \
-      2>&1 | tee "${SMALL_DIR}/simulated/pytest_output.log"; then
-    mark_success "small.simulated_pytest"
-    echo -e "${GREEN}✓ Small-scale simulated tests complete${NC}"
-  else
-    mark_failure "small.simulated_pytest"
-  fi
-  echo ""
-fi
-
-# ============================================================================
-# 2. SMALL-SCALE REAL FUNGAL DATA TESTS + PR METRICS
-# ============================================================================
-
-if [[ "$EXPERIMENT_TYPE" == "all" || "$EXPERIMENT_TYPE" == "small" ]]; then
-  echo -e "${YELLOW}[2/5] Running small-scale real fungal data tests...${NC}"
-  echo "      Output: ${SMALL_DIR}/real_data"
-  mkdir -p "${SMALL_DIR}/real_data"
-
-  if python3 -m pytest \
-      test_real_fungal_benchmark.py \
-      test_new_biology_candidates.py \
-      -v \
-      --tb=short \
-      --basetemp="${SMALL_DIR}/real_data/.pytest_tmp" \
-      2>&1 | tee "${SMALL_DIR}/real_data/pytest_output.log"; then
-    mark_success "small.real_pytest"
-    echo -e "${GREEN}✓ Small-scale real data tests complete${NC}"
-  else
-    mark_failure "small.real_pytest"
-  fi
-  echo ""
-
-  # Run small-scale benchmark to actually produce precision/recall TSVs.
-  # Pytest alone leaves only VCFs; the benchmark driver produces pr_metrics.*.
-  echo -e "${YELLOW}[2b/5] Generating small-scale precision/recall metrics...${NC}"
+  echo -e "${YELLOW}[1/4] Generating small-scale precision/recall metrics...${NC}"
   echo "      Output: ${SMALL_DIR}/benchmarks"
   mkdir -p "${SMALL_DIR}/benchmarks"
 
@@ -148,17 +103,6 @@ if [[ "$EXPERIMENT_TYPE" == "all" || "$EXPERIMENT_TYPE" == "small" ]]; then
   else
     mark_failure "small.pr_metrics_benchmark"
   fi
-
-  # Post-process pytest VCFs -> precision/recall TSVs so small_tests/*/metrics
-  # has the same shape as the large-scale output regardless of whether the
-  # million-mode driver succeeded above.
-  echo "      Post-processing pytest VCFs into PR TSVs..."
-  if bash generate_small_test_metrics.sh "${TIMESTAMP}" \
-      2>&1 | tee "${SMALL_DIR}/metrics_postprocess.log"; then
-    mark_success "small.pr_metrics_postprocess"
-  else
-    mark_failure "small.pr_metrics_postprocess"
-  fi
   echo ""
 fi
 
@@ -167,7 +111,7 @@ fi
 # ============================================================================
 
 if [[ "$EXPERIMENT_TYPE" == "all" || "$EXPERIMENT_TYPE" == "large" ]]; then
-  echo -e "${YELLOW}[3/5] Running million-scale simulated data benchmark...${NC}"
+  echo -e "${YELLOW}[2/4] Running million-scale simulated data benchmark...${NC}"
   echo "      Modes: assembly, short-reads, long-reads"
   echo "      Scenarios: ${LARGE_SCENARIO_SET} (covers INS/DEL/DUP/INV/TRA)"
   echo "      Output: ${LARGE_DIR}/million_scale_simulated"
@@ -191,37 +135,6 @@ if [[ "$EXPERIMENT_TYPE" == "all" || "$EXPERIMENT_TYPE" == "large" ]]; then
 fi
 
 # ============================================================================
-# 4. MILLION-SCALE MODE PRECISION-RECALL BENCHMARK
-# ============================================================================
-
-if [[ "$EXPERIMENT_TYPE" == "all" || "$EXPERIMENT_TYPE" == "large" ]]; then
-  echo -e "${YELLOW}[4/5] Running mode precision-recall benchmarks...${NC}"
-  echo "      Output: ${LARGE_DIR}/mode_pr_benchmark"
-  mkdir -p "${LARGE_DIR}/mode_pr_benchmark"
-
-  for mode in assembly short-reads long-reads; do
-    echo "  - Benchmarking mode: ${mode}"
-    mkdir -p "${LARGE_DIR}/mode_pr_benchmark/${mode}"
-
-    if python3 run_mode_pr_benchmark.py \
-        --modes "${mode}" \
-        --out-dir "${LARGE_DIR}/mode_pr_benchmark/${mode}" \
-        --scenario-set "${LARGE_SCENARIO_SET}" \
-        --n-genomes 500 \
-        --n-reps 20 \
-        --seed 42 \
-        2>&1 | tee "${LARGE_DIR}/mode_pr_benchmark/${mode}/benchmark.log"; then
-      mark_success "large.mode_pr.${mode}"
-    else
-      mark_failure "large.mode_pr.${mode}"
-    fi
-  done
-
-  echo -e "${GREEN}✓ Mode precision-recall benchmarks complete${NC}"
-  echo ""
-fi
-
-# ============================================================================
 # 4b. MILLION-SCALE *REAL* FUNGAL INDEX (downloads NCBI assemblies)
 # ============================================================================
 #
@@ -234,7 +147,7 @@ fi
 # ============================================================================
 
 if [[ "$EXPERIMENT_TYPE" == "all" || "$EXPERIMENT_TYPE" == "million-real" ]]; then
-  echo -e "${YELLOW}[4b] Building real million-scale fungal routing index...${NC}"
+  echo -e "${YELLOW}[3/4] Building real million-scale fungal routing index...${NC}"
   echo "      Downloading up to ${MILLION_REAL_MAX_ASSEMBLIES} NCBI GenBank assemblies (contig level or better)"
   echo "      Target centroids (real+decoys): ${MILLION_REAL_TARGET_CENTROIDS}"
   echo "      Output: ${MILLION_REAL_DIR}"
@@ -272,7 +185,7 @@ fi
 # ============================================================================
 
 if [[ "$EXPERIMENT_TYPE" == "all" || "$EXPERIMENT_TYPE" == "real" ]]; then
-  echo -e "${YELLOW}[5/5] Running real fungal data benchmarks...${NC}"
+  echo -e "${YELLOW}[4/4] Running real fungal data benchmarks...${NC}"
   echo "      Panels: compact_yeast, amf_large, cross_phylum_hgt, te_rich_pathogen, two_speed_pathogen"
   echo "      Output: ${REAL_DIR}"
 
@@ -294,6 +207,7 @@ if [[ "$EXPERIMENT_TYPE" == "all" || "$EXPERIMENT_TYPE" == "real" ]]; then
     if python3 run_real_fungal_benchmark.py prepare \
         --out-dir "${PANEL_DIR}/prepared" \
         --panel "${panel}" \
+        --source ncbi-genbank \
         --max-assemblies-per-species 20 \
         --querys-per-species 5 \
         --max-ref-downloads 20 \

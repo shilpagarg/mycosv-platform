@@ -18,6 +18,7 @@
 - Seeding & alignment algorithms (syncmers, chain-and-refine)
 - SV classification (5 types × triallelic topology)
 - Repeat & TE annotation (8 detectors)
+- **TE classification** (k-mer nearest-centroid classifier; PanTEon benchmark)
 - Precision & recall benchmarks (Wilson CI)
 - Real fungal data benchmarks
 - Usage examples & output formats
@@ -51,6 +52,7 @@
 
 | File | Purpose | Status |
 |------|---------|--------|
+| `install_tools.sh` | Install all MycoSV + SOTA comparator tools into conda env | ✅ Active |
 | `preserve_test_intermediates.sh` | Capture small-scale test VCF/TSV/FASTA/FASTQ | ✅ Active |
 | `capture_benchmark_intermediates.sh` | Capture mode-specific benchmark outputs | ✅ Active |
 | `run_updated_tests.sh` | Full test suite (C++/Python) | ✅ Active |
@@ -85,6 +87,7 @@
 | `run_mode_pr_benchmark.py` | Precision/recall per mode | Medium | ✅ Active |
 | `run_real_fungal_benchmark.py` | Real NCBI/ENA data | Real | ✅ Active |
 | `run_million_mode_query_benchmark.py` | Million-scale simulation | 1M refs | ✅ Active |
+| `run_te_benchmark.py` | TE classification vs PanTEon SOTA | Real | ✅ Active |
 
 ### Core C++ Headers
 
@@ -97,6 +100,7 @@
 | `layer3_routing_index.hpp` | VP-tree routing | DS-4 to DS-6, DS-19 | 600+ |
 | `fungi_tol_bridge.hpp` | Integration layer | All | 400+ |
 | `taxonomy_ranks.hpp` | Taxonomic ranks | — | 100+ |
+| `te_classifier.hpp` | k-mer nearest-centroid TE classifier | DS-4 reuse | 300+ |
 
 ---
 
@@ -169,6 +173,14 @@
 6. **STARSHIP** — AT-rich hull + genic cargo (Ascomycetes)
 7. **HGT** — GC deviation > ±0.08 / ≥500 bp
 8. **RIP** — C/G ratio > 2.5 in 500 bp window
+
+### TE Classification (Nearest-Centroid, `te_classifier.hpp`)
+
+- **Method**: FracMin sketch (k=21, p=0.05) + VPTree nearest-centroid
+- **Levels**: Class → Order → Superfamily
+- **Input format**: `>ID#Class/Order/Superfamily` (PanTEon/RepBase)
+- **CLI**: `--te-train` (build index) / `--te-classify` (predict)
+- **Benchmark**: `python3 run_te_benchmark.py` vs NeuralTE, DeepTE, TERL, etc.
 
 ---
 
@@ -259,7 +271,10 @@ bash run_updated_tests.sh
 | **Three-layer architecture** | MYCOSV_ALGORITHM.md → Algorithm Architecture |
 | **Query mode conversion** | MYCOSV_ALGORITHM.md → Query Input Modes |
 | **SV classification** | MYCOSV_ALGORITHM.md → SV Classification |
-| **TE annotation** | MYCOSV_ALGORITHM.md → Repeat & TE Annotation |
+| **TE annotation (rule-based)** | MYCOSV_ALGORITHM.md → Repeat & TE Annotation |
+| **TE classification (ML nearest-centroid)** | MYCOSV_ALGORITHM.md → TE Classification |
+| **TE benchmark vs PanTEon** | run_te_benchmark.py; MYCOSV_ALGORITHM.md → TE Classification |
+| **Installing SOTA tools** | install_tools.sh; run `bash install_tools.sh --check` |
 | **Parameters for tuning** | MYCOSV_QUICK_REFERENCE.md → Key Parameters |
 | **Complexity analysis** | MYCOSV_QUICK_REFERENCE.md → Complexity Analysis |
 | **Troubleshooting** | MYCOSV_QUICK_REFERENCE.md → Common Issues |

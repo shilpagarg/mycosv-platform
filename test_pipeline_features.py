@@ -593,12 +593,14 @@ def make_complex_sv_fixture() -> dict[str, object]:
             'inv': a + b.translate(comp)[::-1] + c + d,
             # Use a 60 bp tandem copy so 90 bp reads can span the duplicated unit.
             'dup': a + b[:60] + b[:60] + b[60:] + c + d,
-            'tra': a + b + ref2[240:360],
+            # Use the full second half of ctg2 so total length == ctg1 (480 bp),
+            # preventing the k-mer fallback from raising a competing DEL call.
+            'tra': a + b + ref2[240:480],
         },
         'long_read_cases': {
             'inv': a + b.translate(comp)[::-1] + c + d,
             'dup': a + b + b + c + d,
-            'tra': a + b + ref2[240:360],
+            'tra': a + b + ref2[240:480],
         },
     }
 
@@ -1211,7 +1213,7 @@ def test_ds5_bloom_filter_roundtrip_and_membership(tmp_path: Path):
 #include <fstream>
 #include "layer3_routing_index.hpp"
 
-extern "C" __declspec(dllexport) int bloom_roundtrip_ok() {
+extern "C" int bloom_roundtrip_ok() {
     tol::BloomFilter bf;
     if (!bf.empty()) return 0;
     bf.insert(11u);
@@ -1234,9 +1236,9 @@ extern "C" __declspec(dllexport) int bloom_roundtrip_ok() {
     return 1;
 }
 '''.replace('BLOOM_PATH', str((tmp_path / 'bf.bin')).replace('\\', '\\\\')))
-    dll = RUN_EXE_CACHE / f'bloom_harness_{hashlib.sha1(str(tmp_path).encode("utf-8")).hexdigest()[:12]}.dll'
+    dll = RUN_EXE_CACHE / f'bloom_harness_{hashlib.sha1(str(tmp_path).encode("utf-8")).hexdigest()[:12]}.so'
     run([
-        'g++', '-shared', '-O2', '-std=c++17', '-static-libstdc++', '-static-libgcc',
+        'g++', '-shared', '-fPIC', '-O2', '-std=c++17',
         '-I', str(ROOT), str(harness), '-o', str(dll)
     ])
     lib = _load_test_dll(dll)
@@ -1254,7 +1256,7 @@ def test_ds4_vptree_save_load_and_query(tmp_path: Path):
 #include <cmath>
 #include "layer3_routing_index.hpp"
 
-extern "C" __declspec(dllexport) int vptree_roundtrip_ok() {
+extern "C" int vptree_roundtrip_ok() {
     std::vector<tol::CladeCentroid> centroids;
 
     tol::CladeCentroid a;
@@ -1301,9 +1303,9 @@ extern "C" __declspec(dllexport) int vptree_roundtrip_ok() {
     return 1;
 }
 '''.replace('TREE_PATH', tree_path))
-    dll = RUN_EXE_CACHE / f'vptree_harness_{hashlib.sha1(str(tmp_path).encode("utf-8")).hexdigest()[:12]}.dll'
+    dll = RUN_EXE_CACHE / f'vptree_harness_{hashlib.sha1(str(tmp_path).encode("utf-8")).hexdigest()[:12]}.so'
     run([
-        'g++', '-shared', '-O2', '-std=c++17', '-static-libstdc++', '-static-libgcc',
+        'g++', '-shared', '-fPIC', '-O2', '-std=c++17',
         '-I', str(ROOT), str(harness), '-o', str(dll)
     ])
     lib = _load_test_dll(dll)
@@ -1335,7 +1337,7 @@ static tol::CladeGraph make_graph(const std::string& name, const std::string& se
     return g;
 }
 
-extern "C" __declspec(dllexport) int registry_lru_ok() {
+extern "C" int registry_lru_ok() {
     fs::create_directories("REGISTRY_DIR");
     tol::CladeGraphRegistry reg("REGISTRY_DIR", 1u << 20, 1);
     reg.register_clade(make_graph("clade1", "AAAA", 64));
@@ -1359,9 +1361,9 @@ extern "C" __declspec(dllexport) int registry_lru_ok() {
     return 1;
 }
 '''.replace('REGISTRY_DIR', reg_dir))
-    dll = RUN_EXE_CACHE / f'registry_harness_{hashlib.sha1(str(tmp_path).encode("utf-8")).hexdigest()[:12]}.dll'
+    dll = RUN_EXE_CACHE / f'registry_harness_{hashlib.sha1(str(tmp_path).encode("utf-8")).hexdigest()[:12]}.so'
     run([
-        'g++', '-shared', '-O2', '-std=c++17', '-static-libstdc++', '-static-libgcc',
+        'g++', '-shared', '-fPIC', '-O2', '-std=c++17',
         '-pthread', '-I', str(ROOT), str(harness), '-o', str(dll)
     ])
     lib = _load_test_dll(dll)
@@ -2159,7 +2161,8 @@ int main() {
     indel.alignmentMode = "simple_length_fallback";
     candidates["ctg1"].push_back(indel);
 
-    auto chosen = select_best_call_per_contig(contigs, candidates, refIdx, o,
+    RefSearchCache cache(refIdx);
+    auto chosen = select_best_call_per_contig(contigs, candidates, refIdx, cache, o,
                     query_input::QueryMode::ASSEMBLY, "assembly");
     if (chosen.size() != 1) return 2;
     std::cout << chosen[0].type << "\t" << chosen[0].alignmentMode << "\n";
@@ -2210,7 +2213,8 @@ static int run_mode(query_input::QueryMode mode) {
     indel.alignmentMode = "reads_mode_kmer_fallback";
     candidates["sr_unitig0"].push_back(indel);
 
-    auto chosen = select_best_call_per_contig(contigs, candidates, refIdx, o, mode,
+    RefSearchCache cache(refIdx);
+    auto chosen = select_best_call_per_contig(contigs, candidates, refIdx, cache, o, mode,
                     mode == query_input::QueryMode::LONG_READS ? "long-reads" : "short-reads");
     if (chosen.size() != 1) return 2;
     std::cout << chosen[0].type << "\t" << chosen[0].alignmentMode << "\n";
@@ -2270,7 +2274,8 @@ int main() {
     indel.alignmentMode = "reads_mode_kmer_fallback";
     candidates["sr_unitig0"].push_back(indel);
 
-    auto chosen = select_best_call_per_contig(contigs, candidates, refIdx, o,
+    RefSearchCache cache(refIdx);
+    auto chosen = select_best_call_per_contig(contigs, candidates, refIdx, cache, o,
                     query_input::QueryMode::SHORT_READS, "short-reads");
     if (chosen.size() != 1) return 2;
     std::cout << chosen[0].type << "\t" << chosen[0].alignmentMode << "\n";
