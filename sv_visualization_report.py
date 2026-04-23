@@ -99,6 +99,9 @@ COLUMN_ALIASES: Dict[str, Sequence[str]] = {
     "start": ["start", "pos", "position", "breakpoint1", "bp1"],
     "end": ["end", "stop", "breakpoint2", "bp2"],
     "sv_len": ["sv_len", "length", "size", "event_size", "span", "ancestral_segment_bp"],
+    "clade": ["clade", "phylum", "clade_rank", "cladeRank", "taxonomy"],
+    "te_class": ["te_class", "element_class", "elementClass", "repeat_class", "te_type"],
+    "novelty_tier": ["novelty_tier", "novelty", "hgt_tier", "annotation_tier"],
     "precision": ["precision", "prec"],
     "recall": ["recall", "sensitivity", "tpr"],
     "f1": ["f1", "f1_score"],
@@ -535,6 +538,147 @@ def build_biology_section(bio_df: Optional[pd.DataFrame], outdir: Path) -> Tuple
 
 
 # -----------------------------
+# New biology plots: clade-SV, TE-architecture, HGT-propagation
+# -----------------------------
+
+
+def plot_clade_sv(df: pd.DataFrame, outdir: Path) -> Optional[FigureRecord]:
+    """SV type counts stratified by fungal clade/phylum."""
+    needed = {"clade", "sv_type"}
+    if not needed.issubset(df.columns):
+        return None
+    counts = df.groupby(["clade", "sv_type"], dropna=False).size().reset_index(name="count")
+    if counts.empty:
+        return None
+    fig, ax = plt.subplots(figsize=(11, 5))
+    pivot = counts.pivot_table(index="clade", columns="sv_type", values="count",
+                               aggfunc="sum", fill_value=0)
+    pivot.plot(kind="bar", stacked=True, ax=ax)
+    ax.set_title("SV burden by clade and type")
+    ax.set_xlabel("Clade / phylum")
+    ax.set_ylabel("SV count")
+    ax.legend(title="SV type", bbox_to_anchor=(1.02, 1), loc="upper left")
+    ax.tick_params(axis="x", rotation=45)
+    fig.tight_layout()
+    fname = "clade_sv_burden.png"
+    encoded = write_figure(fig, outdir / fname)
+    return FigureRecord(
+        title="SV burden by clade",
+        filename=fname,
+        encoded_png=encoded,
+        caption="Stacked SV counts per clade/phylum, coloured by SV class.",
+    )
+
+
+def plot_te_architecture(df: pd.DataFrame, outdir: Path) -> Optional[FigureRecord]:
+    """TE class counts and median size for each TE family."""
+    te_col = "te_class" if "te_class" in df.columns else None
+    if te_col is None:
+        return None
+    te_df = df[df[te_col].notna() & (df[te_col] != "NONE")].copy()
+    if te_df.empty:
+        return None
+    counts = te_df[te_col].value_counts().reset_index()
+    counts.columns = [te_col, "count"]
+    fig, axes = plt.subplots(1, 2, figsize=(13, 5))
+    axes[0].barh(counts[te_col].astype(str), counts["count"])
+    axes[0].set_title("TE class counts")
+    axes[0].set_xlabel("Count")
+    axes[0].set_ylabel("TE class")
+    if "sv_len" in te_df.columns:
+        order = counts[te_col].tolist()
+        data = [te_df.loc[te_df[te_col] == cls, "sv_len"].dropna().values for cls in order]
+        axes[1].boxplot(data, labels=order, showfliers=False, vert=False)
+        axes[1].set_title("TE size distribution (bp)")
+        axes[1].set_xlabel("SV length (bp)")
+    else:
+        axes[1].axis("off")
+    fig.tight_layout()
+    fname = "te_architecture.png"
+    encoded = write_figure(fig, outdir / fname)
+    return FigureRecord(
+        title="TE architecture",
+        filename=fname,
+        encoded_png=encoded,
+        caption="TE class abundance (left) and size distribution by class (right).",
+    )
+
+
+def plot_hgt_propagation(df: pd.DataFrame, outdir: Path) -> Optional[FigureRecord]:
+    """Novelty-tier distribution for HGT candidate loci across clades."""
+    nt_col = "novelty_tier" if "novelty_tier" in df.columns else None
+    if nt_col is None:
+        return None
+    hgt_df = df.copy()
+    if nt_col not in hgt_df.columns:
+        return None
+    fig, axes = plt.subplots(1, 2, figsize=(13, 5))
+    tier_counts = hgt_df[nt_col].fillna("UNKNOWN").value_counts().reset_index()
+    tier_counts.columns = [nt_col, "count"]
+    axes[0].bar(tier_counts[nt_col].astype(str), tier_counts["count"])
+    axes[0].set_title("HGT novelty tier distribution")
+    axes[0].set_xlabel("Novelty tier")
+    axes[0].set_ylabel("Locus count")
+    axes[0].tick_params(axis="x", rotation=30)
+    if "clade" in hgt_df.columns:
+        novel = hgt_df[hgt_df[nt_col] == "NOVEL"]
+        if not novel.empty:
+            clade_counts = novel["clade"].fillna("unknown").value_counts().head(15).reset_index()
+            clade_counts.columns = ["clade", "count"]
+            axes[1].barh(clade_counts["clade"].astype(str), clade_counts["count"])
+            axes[1].set_title("NOVEL loci by clade (top 15)")
+            axes[1].set_xlabel("Count")
+        else:
+            axes[1].axis("off")
+    else:
+        axes[1].axis("off")
+    fig.tight_layout()
+    fname = "hgt_propagation.png"
+    encoded = write_figure(fig, outdir / fname)
+    return FigureRecord(
+        title="HGT propagation",
+        filename=fname,
+        encoded_png=encoded,
+        caption="Novelty tier distribution (left) and NOVEL loci per clade (right).",
+    )
+
+
+def build_clade_te_hgt_section(
+    real_df: Optional[pd.DataFrame],
+    bio_df: Optional[pd.DataFrame],
+    outdir: Path,
+) -> Tuple[str, List[FigureRecord], List[pd.DataFrame]]:
+    figs: List[FigureRecord] = []
+    tables: List[pd.DataFrame] = []
+
+    for src_df in [real_df, bio_df]:
+        if src_df is None or src_df.empty:
+            continue
+        df = harmonize_columns(src_df)
+
+        rec = plot_clade_sv(df, outdir)
+        if rec is not None:
+            figs.append(rec)
+
+        rec = plot_te_architecture(df, outdir)
+        if rec is not None:
+            figs.append(rec)
+
+        rec = plot_hgt_propagation(df, outdir)
+        if rec is not None:
+            figs.append(rec)
+
+        if figs:
+            break  # plots generated from first non-empty source
+
+    if not figs:
+        return "<p>No clade/TE/HGT columns found in provided tables.</p>", [], []
+
+    html = "<p>Clade-stratified SV landscape, TE family architecture, and HGT novelty propagation across fungal lineages.</p>"
+    return html, figs, tables
+
+
+# -----------------------------
 # HTML rendering
 # -----------------------------
 
@@ -600,7 +744,11 @@ def build_html_report(
     real_figs: List[FigureRecord],
     bio_html: str,
     bio_figs: List[FigureRecord],
+    clade_html: str = "",
+    clade_figs: Optional[List[FigureRecord]] = None,
 ) -> str:
+    if clade_figs is None:
+        clade_figs = []
     return f"""
 <!doctype html>
 <html lang=\"en\">
@@ -654,6 +802,12 @@ def build_html_report(
       {bio_html}
       <div class=\"grid\">{render_figure_cards(bio_figs)}</div>
     </div>
+
+    <div class=\"section\">
+      <h2>4. Clade-SV landscape, TE architecture &amp; HGT propagation</h2>
+      {clade_html}
+      <div class=\"grid\">{render_figure_cards(clade_figs)}</div>
+    </div>
   </div>
 </body>
 </html>
@@ -690,9 +844,16 @@ def main() -> None:
     sim_html, sim_figs, _ = build_simulated_section(sim_df, outdir)
     real_html, real_figs, _ = build_real_section(real_df, metadata_df, outdir)
     bio_html, bio_figs, _ = build_biology_section(bio_df, outdir)
+    clade_html, clade_figs, _ = build_clade_te_hgt_section(real_df, bio_df, outdir)
 
     stats = summary_stats(sim_df, real_df, bio_df)
-    html = build_html_report(args.title, stats, sim_html, sim_figs, real_html, real_figs, bio_html, bio_figs)
+    html = build_html_report(
+        args.title, stats,
+        sim_html, sim_figs,
+        real_html, real_figs,
+        bio_html, bio_figs,
+        clade_html, clade_figs,
+    )
 
     report_path = outdir / "sv_visualization_report.html"
     report_path.write_text(html, encoding="utf-8")

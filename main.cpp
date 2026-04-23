@@ -489,8 +489,8 @@ static Options parse_args(int argc, char** argv) {
 // ============================================================
 static std::unordered_map<std::string, std::string>
 read_fasta(const std::string& path) {
-    std::ifstream in(path);
-    if (!in) throw std::runtime_error("Cannot open FASTA: " + path);
+    FastaStream fs(path);
+    std::istream& in = fs.get();
     std::unordered_map<std::string, std::string> out;
     std::string name, seq, line;
     while (std::getline(in, line)) {

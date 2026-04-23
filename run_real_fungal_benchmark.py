@@ -177,13 +177,17 @@ class NormalizedCall:
     ref_contig: str = "."
 
 
-def run(cmd: list[str], cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
+_TOOL_TIMEOUT = 7200  # 2-hour hard limit per external tool invocation
+
+
+def run(cmd: list[str], cwd: Path | None = None, timeout: int = _TOOL_TIMEOUT) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         cmd,
         cwd=str(cwd) if cwd else None,
         text=True,
         capture_output=True,
         check=True,
+        timeout=timeout,
     )
 
 
@@ -302,9 +306,12 @@ def normalise_download_url(raw: str) -> str:
     return raw
 
 
+_HTTP_TIMEOUT = 300  # seconds; prevents hanging on slow/unresponsive NCBI
+
+
 def http_get_text(url: str) -> str:
     req = urllib.request.Request(url, headers={"User-Agent": "MycoSV-real-benchmark/1.0"})
-    with urllib.request.urlopen(req) as resp:
+    with urllib.request.urlopen(req, timeout=_HTTP_TIMEOUT) as resp:
         return resp.read().decode("utf-8")
 
 
@@ -313,22 +320,22 @@ def http_download(url: str, dest: Path) -> Path:
     if dest.exists():
         return dest
     req = urllib.request.Request(url, headers={"User-Agent": "MycoSV-real-benchmark/1.0"})
-    with urllib.request.urlopen(req) as resp, dest.open("wb") as out:
-        shutil.copyfileobj(resp, out)
+    tmp = dest.with_suffix(dest.suffix + ".part")
+    try:
+        with urllib.request.urlopen(req, timeout=_HTTP_TIMEOUT) as resp, tmp.open("wb") as out:
+            shutil.copyfileobj(resp, out)
+        tmp.rename(dest)
+    except Exception:
+        if tmp.exists():
+            tmp.unlink()
+        raise
     return dest
 
 
 def maybe_gunzip(path: Path, keep_gz: bool = True) -> Path:
-    if path.suffix != ".gz":
-        return path
-    out = path.with_suffix("")
-    if out.exists():
-        return out
-    with gzip.open(path, "rb") as src, out.open("wb") as dst:
-        shutil.copyfileobj(src, dst)
-    if not keep_gz:
-        path.unlink()
-    return out
+    # Keep .gz in cache; the C++ binary reads gzip natively via popen.
+    # Never write a decompressed copy alongside the archive.
+    return path
 
 
 def open_text_auto(path: Path):
@@ -1819,6 +1826,7 @@ def run_syri_for_query(query_row: dict[str, str], out_dir: Path, threads: int) -
             stderr=subprocess.PIPE,
             text=True,
             check=True,
+            timeout=_TOOL_TIMEOUT,
         )
     run(["syri", "-c", str(sam_path), "-r", str(ref_fa), "-q", str(query_fa), "-k", "-F", "S", "--prefix", prefix], cwd=ROOT)
     syri_tsv = work_dir / "syri_syri.out"
@@ -1851,6 +1859,7 @@ def run_minigraph_for_query(query_row: dict[str, str], out_dir: Path, threads: i
             stderr=subprocess.PIPE,
             text=True,
             check=True,
+            timeout=_TOOL_TIMEOUT,
         )
     with bubble_bed.open("w", encoding="utf-8") as out_fh:
         subprocess.run(
@@ -1859,6 +1868,7 @@ def run_minigraph_for_query(query_row: dict[str, str], out_dir: Path, threads: i
             stderr=subprocess.PIPE,
             text=True,
             check=True,
+            timeout=_TOOL_TIMEOUT,
         )
     with sample_bed.open("w", encoding="utf-8") as out_fh:
         subprocess.run(
@@ -1867,6 +1877,7 @@ def run_minigraph_for_query(query_row: dict[str, str], out_dir: Path, threads: i
             stderr=subprocess.PIPE,
             text=True,
             check=True,
+            timeout=_TOOL_TIMEOUT,
         )
     return {
         "label": "minigraph",
@@ -1965,6 +1976,7 @@ def _minimap2_align_reads(
             ["minimap2", "-ax", preset, "-t", str(threads), str(ref_fa), str(reads_path)],
             stdout=sam_out,
             stderr=subprocess.PIPE,
+            timeout=_TOOL_TIMEOUT,
             text=True,
             check=True,
         )
@@ -2151,6 +2163,7 @@ def run_delly_for_query(query_row: dict[str, str], out_dir: Path, threads: int) 
         subprocess.run(
             ["delly", "call", "-g", str(ref_fa), "-o", str(bcf_path), str(bam_sorted)],
             check=True, text=True, capture_output=True, env=env, cwd=str(ROOT),
+            timeout=_TOOL_TIMEOUT,
         )
     except subprocess.CalledProcessError:
         return None
@@ -2161,6 +2174,7 @@ def run_delly_for_query(query_row: dict[str, str], out_dir: Path, threads: int) 
         subprocess.run(
             ["bcftools", "view", str(bcf_path)],
             stdout=out_fh, stderr=subprocess.PIPE, text=True, check=True,
+            timeout=_TOOL_TIMEOUT,
         )
     return {"label": "delly", "vcf": str(vcf_path)}
 
@@ -2320,6 +2334,7 @@ def run_svim_asm_for_query(query_row: dict[str, str], out_dir: Path, threads: in
         subprocess.run(
             ["minimap2", "-ax", "asm5", "-t", str(threads), str(ref_fa), str(query_fa)],
             stdout=sam_out, stderr=subprocess.PIPE, text=True, check=True,
+            timeout=_TOOL_TIMEOUT,
         )
     try:
         run(
@@ -2398,6 +2413,7 @@ def run_anchorwave_for_query(query_row: dict[str, str], out_dir: Path, threads: 
         subprocess.run(
             ["minimap2", "-ax", "asm5", "--cs", "-t", str(threads), str(ref_fa), str(query_fa)],
             stdout=sam_out, stderr=subprocess.PIPE, text=True, check=True,
+            timeout=_TOOL_TIMEOUT,
         )
     # Step 2: SAM -> PAF via paftools for downstream AnchorWave refinement.
     try:
@@ -2405,6 +2421,7 @@ def run_anchorwave_for_query(query_row: dict[str, str], out_dir: Path, threads: 
             subprocess.run(
                 [paftools, "sam2paf", str(sam_path)],
                 stdout=paf_out, stderr=subprocess.PIPE, text=True, check=True,
+                timeout=_TOOL_TIMEOUT,
             )
     except subprocess.CalledProcessError:
         return None
@@ -2414,6 +2431,7 @@ def run_anchorwave_for_query(query_row: dict[str, str], out_dir: Path, threads: 
             subprocess.run(
                 ["sort", "-k6,6", "-k8,8n", str(paf_path)],
                 stdout=srt_out, stderr=subprocess.PIPE, text=True, check=True,
+                timeout=_TOOL_TIMEOUT,
             )
     except subprocess.CalledProcessError:
         return None
@@ -2427,6 +2445,7 @@ def run_anchorwave_for_query(query_row: dict[str, str], out_dir: Path, threads: 
             subprocess.run(
                 [paftools, "call", "-f", str(ref_fa), "-L", "50", str(sorted_paf)],
                 stdout=vcf_out, stderr=subprocess.PIPE, text=True, check=True,
+                timeout=_TOOL_TIMEOUT,
             )
     except subprocess.CalledProcessError:
         return None

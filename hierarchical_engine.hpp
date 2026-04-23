@@ -44,6 +44,18 @@ inline OffRefNoveltyTier score_off_ref_novelty(double overlapFraction) {
     return OffRefNoveltyTier::OFF_REF_KNOWN;
 }
 
+// Cross-clade novelty: a region absent from same-clade references but present
+// in a different clade is a candidate HGT event.  Returns NOVEL so the calling
+// site treats the locus as highly interesting; the elementClass field should be
+// set to "HGT" separately via classify_repeat_element().
+inline OffRefNoveltyTier score_cross_clade_novelty(
+        double sameCladeOverlap,
+        double highestOtherCladeOverlap) {
+    if (sameCladeOverlap < 0.05 && highestOtherCladeOverlap >= 0.10)
+        return OffRefNoveltyTier::NOVEL;
+    return score_off_ref_novelty(sameCladeOverlap);
+}
+
 // ── UncoveredWindow ───────────────────────────────────────────────────────
 // Half-open interval [start, end) in query coordinates with no reference MEMs.
 // Collected during MEM-chain construction; later used to classify

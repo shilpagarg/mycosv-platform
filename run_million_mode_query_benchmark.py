@@ -24,7 +24,7 @@ DEFAULT_ANALYZE = ROOT / "analyze_new_biology_candidates.py"
 
 
 def run(cmd: list[str], cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(cmd, cwd=str(cwd) if cwd else None, text=True, capture_output=True, check=True)
+    return subprocess.run(cmd, cwd=str(cwd) if cwd else None, text=True, capture_output=True, check=True, timeout=7200)
 
 
 def compile_binary(main_cpp: Path, binary_path: Path) -> None:

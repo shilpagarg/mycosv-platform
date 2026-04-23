@@ -1604,16 +1604,18 @@ struct SvTypeFromChain {
             return res;
         }
 
-        // INV: any reverse-complement seed in chain
-        bool hasRev = false;
-        for (bool r : isRevComp) if (r) { hasRev = true; break; }
-        if (hasRev) {
+        // INV: require enough revcomp evidence (>= minSvLen) to avoid false
+        // positives from single short palindromic k-mers
+        int totalRevLen = 0;
+        for (size_t i = 0; i < isRevComp.size(); ++i)
+            if (isRevComp[i]) totalRevLen += chain[i].len;
+        if (totalRevLen >= minSvLen) {
             int start = chain[0].qPos;
             int end   = chain[static_cast<size_t>(N-1)].qPos +
                         chain[static_cast<size_t>(N-1)].len;
             res.type        = Type::INV;
             res.qBreakStart = start;
-            res.qBreakEnd   = end;
+            res.qBreakEnd   = end - 1;  // 0-based inclusive; caller adds +1 for 1-based VCF
             res.rBreakStart = chain[0].rPos;
             res.rBreakEnd   = chain[static_cast<size_t>(N-1)].rPos +
                               chain[static_cast<size_t>(N-1)].len;
@@ -1640,7 +1642,7 @@ struct SvTypeFromChain {
             res.type        = Type::DUP;
             res.qBreakStart = chain[0].qPos;
             res.qBreakEnd   = chain[static_cast<size_t>(N-1)].qPos +
-                              chain[static_cast<size_t>(N-1)].len;
+                              chain[static_cast<size_t>(N-1)].len - 1;  // 0-based inclusive
             res.rBreakStart = chain[0].rPos;
             res.rBreakEnd   = res.rBreakStart + (-rGap);
             res.svLen       = -rGap;

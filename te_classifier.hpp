@@ -26,6 +26,7 @@
 // Dependencies: layer3_routing_index.hpp (CladeCentroid, VPTree)
 
 #include "layer3_routing_index.hpp"
+#include "fungi_tol_bridge.hpp"  // FastaStream for gz-transparent FASTA reading
 
 #include <cassert>
 #include <cmath>
@@ -184,8 +185,8 @@ inline tol::CladeCentroid build_centroid(const std::string& label,
 // =========================================================================
 inline void read_fasta(const std::string& path,
                         const std::function<void(const std::string&, const std::string&)>& cb) {
-    std::ifstream in(path);
-    if (!in) throw std::runtime_error("Cannot open FASTA: " + path);
+    FastaStream fs(path);
+    std::istream& in = fs.get();
     std::string line, hdr, seq;
     while (std::getline(in, line)) {
         if (line.empty()) continue;

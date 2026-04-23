@@ -1,10 +1,22 @@
 #ifndef FUNGI_TOL_BRIDGE_HPP
 #define FUNGI_TOL_BRIDGE_HPP
 
-// fungi_tol_bridge.hpp — v14
+// fungi_tol_bridge.hpp — v15
 //
-// Fixes vs v13
+// Fixes vs v14
 // ============
+//  FIX-C1  TE classification for DEL: classify_repeat_element() now called on
+//          the deleted reference subsequence (rBreakStart–rBreakEnd, offset by
+//          contig start), enabling TE-mediated deletion annotation.
+//
+//  FIX-C2  HGT cross-clade novelty: Path C in both hierarchical_call_assembly
+//          and hierarchical_call_assembly_multirank now tracks sameCladeOverlap
+//          and otherCladeOverlap separately, calls score_cross_clade_novelty(),
+//          and stamps elementClass="HGT" when same-clade overlap < 0.05 and
+//          other-clade overlap >= 0.10.
+//
+// Fixes vs v13 (carried forward from v14)
+// ========================================
 //  FIX-B1  kmer_overlap_fraction: replaced unordered_set<string> O(N·k) with a
 //          rolling polynomial hash (FNV-1a) O(N) build → O(1) lookup.  This
 //          reduces peak memory from ~200 MB to ~4 MB on a 10 Mb AMF contig.
@@ -26,7 +38,9 @@
 #include <atomic>
 #include <cctype>
 #include <cmath>
+#include <cstdio>
 #include <deque>
+#include <ext/stdio_filebuf.h>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
@@ -52,6 +66,35 @@
 #include "taxonomy_ranks.hpp"
 
 namespace fs = std::filesystem;
+
+// ── gz-transparent FASTA stream ──────────────────────────────────────────
+// Opens a plain or .gz FASTA file for line-by-line reading.
+// .gz files are piped through "gzip -dc" without writing a decompressed copy.
+struct FastaStream {
+    FILE* pipe_  = nullptr;
+    std::unique_ptr<__gnu_cxx::stdio_filebuf<char>> gbuf_;
+    std::ifstream plain_;
+    std::istream* is_  = nullptr;
+
+    explicit FastaStream(const std::string& path) {
+        bool gz = path.size() > 3 && path.compare(path.size() - 3, 3, ".gz") == 0;
+        if (gz) {
+            std::string cmd = "gzip -dc '" + path + "'";
+            pipe_ = popen(cmd.c_str(), "r");
+            if (!pipe_) throw std::runtime_error("Cannot open gz FASTA: " + path);
+            gbuf_ = std::make_unique<__gnu_cxx::stdio_filebuf<char>>(pipe_, std::ios::in);
+            is_   = new std::istream(gbuf_.get());
+        } else {
+            plain_.open(path);
+            if (!plain_) throw std::runtime_error("Cannot open FASTA: " + path);
+            is_ = &plain_;
+        }
+    }
+    ~FastaStream() {
+        if (pipe_) { delete is_; pclose(pipe_); }
+    }
+    std::istream& get() { return *is_; }
+};
 
 // ── VariantCallBridge ────────────────────────────────────────────────────
 struct VariantCallBridge {
@@ -239,8 +282,8 @@ inline std::vector<std::string> split_csv(const std::string& s) {
 // ── read_fasta_local ──────────────────────────────────────────────────────
 inline std::unordered_map<std::string, std::string>
 read_fasta_local(const std::string& path) {
-    std::ifstream in(path);
-    if (!in) throw std::runtime_error("Cannot open FASTA: " + path);
+    FastaStream fs(path);
+    std::istream& in = fs.get();
     std::unordered_map<std::string, std::string> out;
     std::string name, seq, line;
     while (std::getline(in, line)) {
@@ -619,18 +662,20 @@ partition_manifest_for_index_build(const std::string& manifestPath,
 
 inline std::string read_fasta_seed_sequence(const std::string& fastaPath, size_t maxBases = 128) {
     if (fastaPath.empty()) return "N";
-    std::ifstream in(fastaPath);
-    if (!in) return "N";
-    std::string line, seq;
-    while (std::getline(in, line)) {
-        if (line.empty() || line[0] == '>') continue;
-        for (char c : line) {
-            const char u = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
-            if (u == 'A' || u == 'C' || u == 'G' || u == 'T' || u == 'N') seq.push_back(u);
-            if (seq.size() >= maxBases) return seq;
+    try {
+        FastaStream fs(fastaPath);
+        std::istream& in = fs.get();
+        std::string line, seq;
+        while (std::getline(in, line)) {
+            if (line.empty() || line[0] == '>') continue;
+            for (char c : line) {
+                const char u = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+                if (u == 'A' || u == 'C' || u == 'G' || u == 'T' || u == 'N') seq.push_back(u);
+                if (seq.size() >= maxBases) return seq;
+            }
         }
-    }
-    return seq.empty() ? std::string("N") : seq;
+        return seq.empty() ? std::string("N") : seq;
+    } catch (...) { return "N"; }
 }
 
 inline std::vector<uint64_t> minimizer_hashes_for_sequence(const std::string& seq, int k, size_t limit = 32) {
@@ -1773,11 +1818,79 @@ static bool try_mem_chain_call(
         }
         if (chain.empty()) return out;
 
-        const double bestScore = static_cast<double>(treap.best_chain_score());
+        double bestScore = static_cast<double>(treap.best_chain_score());
         if (chain.size() < 2 || bestScore < fo.minBlockScore)
             return out;
 
         auto res = SvTypeFromChain::classify(chain, chainRev, sa, fo.minSvLen);
+
+        // DUP fallback: ChainTreap requires strictly-increasing rPos and silently
+        // drops backward-mapping MEMs that are the signature of tandem duplications.
+        // Re-classify the qPos-sorted forward MEMs directly to catch that pattern.
+        if (res.type == SvTypeFromChain::Type::NONE) {
+            std::vector<SuffixArray::Mem> fwdSorted;
+            fwdSorted.reserve(fwdMems.size());
+            for (int i : order)
+                if (!isRev[static_cast<size_t>(i)])
+                    fwdSorted.push_back(allMems[static_cast<size_t>(i)]);
+            if (fwdSorted.size() >= 2) {
+                auto dupRes = SvTypeFromChain::classify(
+                    fwdSorted, std::vector<bool>(fwdSorted.size(), false),
+                    sa, fo.minSvLen);
+                if (dupRes.type == SvTypeFromChain::Type::DUP) {
+                    double dupScore = 0.0;
+                    for (const auto& m : fwdSorted) dupScore += static_cast<double>(m.len);
+                    if (dupScore >= fo.minBlockScore) {
+                        res       = dupRes;
+                        chain     = fwdSorted;
+                        chainRev.assign(fwdSorted.size(), false);
+                        bestScore = dupScore;
+                    }
+                }
+            }
+        }
+
+        // TRA fallback: large query gaps between cross-contig anchors can exceed
+        // chainGapBand, preventing ChainTreap from linking them.  Scan allMems
+        // directly with a generous tolerance (500 kb).
+        if (res.type == SvTypeFromChain::Type::NONE) {
+            auto ctg_of = [&](int rp) -> int {
+                for (int ci = 0; ci < static_cast<int>(sa.contigEnd.size()); ++ci)
+                    if (rp < sa.contigEnd[static_cast<size_t>(ci)]) return ci;
+                return -1;
+            };
+            const SuffixArray::Mem* srcMem = nullptr;
+            const SuffixArray::Mem* dstMem = nullptr;
+            int srcCtg = -1;
+            const int traGap = 500000;
+            for (int i : order) {
+                if (isRev[static_cast<size_t>(i)]) continue;
+                const auto& m = allMems[static_cast<size_t>(i)];
+                const int ci = ctg_of(m.rPos);
+                if (srcCtg < 0) { srcCtg = ci; srcMem = &m; continue; }
+                if (ci >= 0 && ci != srcCtg) {
+                    const int qGap = m.qPos - (srcMem->qPos + srcMem->len);
+                    if (qGap >= 0 && qGap <= traGap &&
+                        (dstMem == nullptr || m.len > dstMem->len))
+                        dstMem = &m;
+                }
+            }
+            if (srcMem && dstMem) {
+                std::vector<SuffixArray::Mem> traChain = {*srcMem, *dstMem};
+                auto traRes = SvTypeFromChain::classify(
+                    traChain, {false, false}, sa, fo.minSvLen);
+                if (traRes.type == SvTypeFromChain::Type::TRA) {
+                    double traScore = static_cast<double>(srcMem->len + dstMem->len);
+                    if (traScore >= fo.minBlockScore) {
+                        res       = traRes;
+                        chain     = traChain;
+                        chainRev  = {false, false};
+                        bestScore = traScore;
+                    }
+                }
+            }
+        }
+
         if (res.type == SvTypeFromChain::Type::NONE) return out;
 
         auto contig_of = [&](int rPos) -> int {
@@ -1804,10 +1917,12 @@ static bool try_mem_chain_call(
         out.call.refPos  = 0;
         out.call.refEnd  = 0;
         out.call.pos     = std::max(1, res.qBreakStart + 1);
-        out.call.end     = std::max(out.call.pos, res.qBreakEnd > 0 ? res.qBreakEnd : out.call.pos);
+        out.call.end     = std::max(out.call.pos, res.qBreakEnd >= 0 ? res.qBreakEnd + 1 : out.call.pos);
         out.call.svlen   = res.svLen;
         out.call.genotype    = "0/1";
-        out.call.gq          = 40.0;
+        out.call.gq = std::min(99.0,
+            10.0 * std::log10(1.0 + static_cast<double>(chain.size()))
+            + 0.5 * bestScore);
         out.call.blockScore  = bestScore;
         out.call.anchors     = static_cast<int>(chain.size());
         out.call.alignmentMode = secondaryPass
@@ -1869,6 +1984,43 @@ static bool try_mem_chain_call(
                 break;
             default: return out;
         }
+
+        // Wire TE classification: INS/DUP/INV use the query subsequence;
+        // DEL uses the deleted reference sequence (TE-mediated deletions are common).
+        using T2 = SvTypeFromChain::Type;
+        if (res.type == T2::INS || res.type == T2::DUP || res.type == T2::INV) {
+            const double gcBg = (primaryRef != nullptr) ? primaryRef->cladeGc : 0.45;
+            const int teS = res.qBreakStart;
+            const int teE = (res.type == T2::INS)
+                ? std::min(teS + res.svLen, static_cast<int>(qSeq.size()))
+                : std::min(res.qBreakEnd + 1, static_cast<int>(qSeq.size()));
+            if (teE > teS && teS >= 0) {
+                const ElementClass ec = classify_repeat_element(
+                    std::string_view(qSeq.data() + teS,
+                                     static_cast<size_t>(teE - teS)),
+                    gcBg);
+                if (ec != ElementClass::NONE)
+                    out.call.elementClass = element_class_name(ec);
+            }
+        } else if (res.type == T2::DEL && primaryRef != nullptr && primaryRef->has_seq()) {
+            const double gcBg = primaryRef->cladeGc;
+            const int ctgOff = (primaryContigIdx > 0)
+                ? sa.contigEnd[static_cast<size_t>(primaryContigIdx) - 1] : 0;
+            const int rS = res.rBreakStart - ctgOff;
+            const int rE = res.rBreakEnd   - ctgOff;
+            const auto& refSeq = primaryRef->seq();
+            const int safeS = std::max(0, rS);
+            const int safeE = std::min(static_cast<int>(refSeq.size()), rE);
+            if (safeE > safeS) {
+                const ElementClass ec = classify_repeat_element(
+                    std::string_view(refSeq.data() + safeS,
+                                     static_cast<size_t>(safeE - safeS)),
+                    gcBg);
+                if (ec != ElementClass::NONE)
+                    out.call.elementClass = element_class_name(ec);
+            }
+        }
+
         out.score = bestScore;
         out.anchors = static_cast<int>(chain.size());
         out.valid = true;
@@ -2044,44 +2196,67 @@ hierarchical_call_assembly(const std::string& qAsm,
             }
         }
 
-        // ── Path C: OFF_REF novelty scoring ───────────────────────────
+        // ── Path C: OFF_REF novelty scoring with cross-clade HGT detection ─
+        // Track same-clade and other-clade overlaps separately so that a region
+        // absent from same-clade refs but present in another clade can be flagged
+        // as a candidate HGT event via score_cross_clade_novelty().
         if (is_low_complexity_sequence(seq)) continue;
-        double bestOverlap  = 0.0;
+        double sameCladeOverlap  = 0.0;
+        double otherCladeOverlap = 0.0;
         double bestCladeGc  = 0.45;
         std::string bestAsmName = "OFF_REFERENCE";
         std::string bestCladeRank = ".";
         std::string bestPhylum = ".";
+        double bestOtherCladeGc = 0.45;
+        std::string bestOtherAsmName = "OFF_REFERENCE";
+        std::string bestOtherCladeRank = ".";
+        std::string bestOtherPhylum = ".";
         const int k = std::max(5, std::min(fo.fallbackSketchParams.k > 0
                                            ? fo.fallbackSketchParams.k : 7, 9));
         for (const auto& ref : allRefs) {
-            if (!clade_allowed(ref)) continue;
             if (!ref.has_seq()) continue;
-            double ov = kmer_overlap_fraction(seq, ref.seq(), k);
-            if (ov > bestOverlap) {
-                bestOverlap  = ov;
-                bestCladeGc  = ref.cladeGc;
-                bestAsmName  = ref.clade.empty() ? ref.asmName : ref.clade;
-                bestCladeRank = ref.cladeRank.empty() ? "." : ref.cladeRank;
-                bestPhylum = ref.phylum.empty() ? "." : ref.phylum;
-            }
-        }
-        if (bestOverlap <= 0.0 && !routedClades.empty()) {
-            for (const auto& ref : allRefs) {
-                if (!ref.has_seq()) continue;
-                double ov = kmer_overlap_fraction(seq, ref.seq(), k);
-                if (ov > bestOverlap) {
-                    bestOverlap  = ov;
-                    bestCladeGc  = ref.cladeGc;
-                    bestAsmName  = ref.clade.empty() ? ref.asmName : ref.clade;
+            const double ov = kmer_overlap_fraction(seq, ref.seq(), k);
+            if (clade_allowed(ref)) {
+                if (ov > sameCladeOverlap) {
+                    sameCladeOverlap = ov;
+                    bestCladeGc   = ref.cladeGc;
+                    bestAsmName   = ref.clade.empty() ? ref.asmName : ref.clade;
                     bestCladeRank = ref.cladeRank.empty() ? "." : ref.cladeRank;
-                    bestPhylum = ref.phylum.empty() ? "." : ref.phylum;
+                    bestPhylum    = ref.phylum.empty() ? "." : ref.phylum;
+                }
+            } else {
+                if (ov > otherCladeOverlap) {
+                    otherCladeOverlap  = ov;
+                    bestOtherCladeGc   = ref.cladeGc;
+                    bestOtherAsmName   = ref.clade.empty() ? ref.asmName : ref.clade;
+                    bestOtherCladeRank = ref.cladeRank.empty() ? "." : ref.cladeRank;
+                    bestOtherPhylum    = ref.phylum.empty() ? "." : ref.phylum;
                 }
             }
         }
-        const std::string tier = infer_novelty_tier(bestOverlap);
+        const bool hasRoutingCtx = !routedClades.empty();
+        const bool isHgt = hasRoutingCtx &&
+            sameCladeOverlap < 0.05 && otherCladeOverlap >= 0.10;
+        if (isHgt) {
+            bestCladeGc   = bestOtherCladeGc;
+            bestAsmName   = bestOtherAsmName;
+            bestCladeRank = bestOtherCladeRank;
+            bestPhylum    = bestOtherPhylum;
+        } else if (sameCladeOverlap <= 0.0 && otherCladeOverlap > 0.0) {
+            bestCladeGc   = bestOtherCladeGc;
+            bestAsmName   = bestOtherAsmName;
+            bestCladeRank = bestOtherCladeRank;
+            bestPhylum    = bestOtherPhylum;
+        }
+        const OffRefNoveltyTier noveltyTier = hasRoutingCtx
+            ? score_cross_clade_novelty(sameCladeOverlap, otherCladeOverlap)
+            : score_off_ref_novelty(std::max(sameCladeOverlap, otherCladeOverlap));
+        const std::string tier = novelty_tier_name(noveltyTier);
         if (tier == "NOVEL" || tier == "NOVEL_WEAK" || tier == "DIVERGED") {
-            out.push_back(make_offref_call(qAsm, name, seq, tier,
-                                           bestCladeGc, bestAsmName, bestCladeRank, bestPhylum));
+            auto ofcall = make_offref_call(qAsm, name, seq, tier,
+                                           bestCladeGc, bestAsmName, bestCladeRank, bestPhylum);
+            if (isHgt) ofcall.elementClass = "HGT";
+            out.push_back(std::move(ofcall));
         }
     }
 
@@ -2270,46 +2445,66 @@ hierarchical_call_assembly_multirank(
                 }
             }
 
-            // Path C: OFF_REF novelty scoring (only on final species pass to avoid
-            // emitting the same novel contig once per rank)
+            // Path C: OFF_REF novelty scoring with cross-clade HGT detection
+            // (only on final species pass to avoid emitting the same novel contig once per rank)
             if (ri == kNRanks - 1) {
                 if (is_low_complexity_sequence(seq)) continue;
-                double bestOverlap = 0.0;
+                double sameCladeOverlap  = 0.0;
+                double otherCladeOverlap = 0.0;
                 double bestCladeGc = 0.45;
                 std::string bestAsmName = "OFF_REFERENCE";
                 std::string bestCladeRank = ".";
                 std::string bestPhylum = ".";
+                double bestOtherCladeGc = 0.45;
+                std::string bestOtherAsmName = "OFF_REFERENCE";
+                std::string bestOtherCladeRank = ".";
+                std::string bestOtherPhylum = ".";
                 const int k = std::max(5, std::min(fo.fallbackSketchParams.k > 0
                                                    ? fo.fallbackSketchParams.k : 7, 9));
                 for (const auto& ref : allRefs) {
-                    if (!clade_allowed(ref)) continue;
                     if (!ref.has_seq()) continue;
-                    double ov = kmer_overlap_fraction(seq, ref.seq(), k);
-                    if (ov > bestOverlap) {
-                        bestOverlap  = ov;
-                        bestCladeGc  = ref.cladeGc;
-                        bestAsmName  = ref.clade.empty() ? ref.asmName : ref.clade;
-                        bestCladeRank = ref.cladeRank.empty() ? "." : ref.cladeRank;
-                        bestPhylum = ref.phylum.empty() ? "." : ref.phylum;
-                    }
-                }
-                if (bestOverlap <= 0.0 && !routedClades.empty()) {
-                    for (const auto& ref : allRefs) {
-                        if (!ref.has_seq()) continue;
-                        double ov = kmer_overlap_fraction(seq, ref.seq(), k);
-                        if (ov > bestOverlap) {
-                            bestOverlap  = ov;
-                            bestCladeGc  = ref.cladeGc;
-                            bestAsmName  = ref.clade.empty() ? ref.asmName : ref.clade;
+                    const double ov = kmer_overlap_fraction(seq, ref.seq(), k);
+                    if (clade_allowed(ref)) {
+                        if (ov > sameCladeOverlap) {
+                            sameCladeOverlap = ov;
+                            bestCladeGc   = ref.cladeGc;
+                            bestAsmName   = ref.clade.empty() ? ref.asmName : ref.clade;
                             bestCladeRank = ref.cladeRank.empty() ? "." : ref.cladeRank;
-                            bestPhylum = ref.phylum.empty() ? "." : ref.phylum;
+                            bestPhylum    = ref.phylum.empty() ? "." : ref.phylum;
+                        }
+                    } else {
+                        if (ov > otherCladeOverlap) {
+                            otherCladeOverlap  = ov;
+                            bestOtherCladeGc   = ref.cladeGc;
+                            bestOtherAsmName   = ref.clade.empty() ? ref.asmName : ref.clade;
+                            bestOtherCladeRank = ref.cladeRank.empty() ? "." : ref.cladeRank;
+                            bestOtherPhylum    = ref.phylum.empty() ? "." : ref.phylum;
                         }
                     }
                 }
-                const std::string tier = infer_novelty_tier(bestOverlap);
+                const bool hasRoutingCtx = !routedClades.empty();
+                const bool isHgt = hasRoutingCtx &&
+                    sameCladeOverlap < 0.05 && otherCladeOverlap >= 0.10;
+                if (isHgt) {
+                    bestCladeGc   = bestOtherCladeGc;
+                    bestAsmName   = bestOtherAsmName;
+                    bestCladeRank = bestOtherCladeRank;
+                    bestPhylum    = bestOtherPhylum;
+                } else if (sameCladeOverlap <= 0.0 && otherCladeOverlap > 0.0) {
+                    bestCladeGc   = bestOtherCladeGc;
+                    bestAsmName   = bestOtherAsmName;
+                    bestCladeRank = bestOtherCladeRank;
+                    bestPhylum    = bestOtherPhylum;
+                }
+                const OffRefNoveltyTier noveltyTier = hasRoutingCtx
+                    ? score_cross_clade_novelty(sameCladeOverlap, otherCladeOverlap)
+                    : score_off_ref_novelty(std::max(sameCladeOverlap, otherCladeOverlap));
+                const std::string tier = novelty_tier_name(noveltyTier);
                 if (tier == "NOVEL" || tier == "NOVEL_WEAK" || tier == "DIVERGED") {
-                    rankCalls.push_back(make_offref_call(qAsm, name, seq, tier,
-                                                         bestCladeGc, bestAsmName, bestCladeRank, bestPhylum));
+                    auto ofcall = make_offref_call(qAsm, name, seq, tier,
+                                                   bestCladeGc, bestAsmName, bestCladeRank, bestPhylum);
+                    if (isHgt) ofcall.elementClass = "HGT";
+                    rankCalls.push_back(std::move(ofcall));
                 }
             }
         }
