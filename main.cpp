@@ -2086,6 +2086,7 @@ static void write_vcf_header(std::ostream& out,
         << "##INFO=<ID=MATE_OFFREF,Number=0,Type=Flag,Description=\"Mate breakpoint is off-reference\">\n"
         << "##INFO=<ID=EC,Number=1,Type=String,Description=\"Element class: NONE/REPEAT/TE_LTR/TE_TIR/TE_LINE/TE_SINE/STARSHIP/HGT/RIP\">\n"
         << "##INFO=<ID=QMODE,Number=1,Type=String,Description=\"Query input mode: assembly/long-reads/short-reads\">\n"
+        << "##INFO=<ID=SUPPORT,Number=1,Type=Integer,Description=\"Read support: cluster size for long-reads, min k-mer depth for short-reads; absent for assembly\">\n"
         << "##INFO=<ID=FUSED_POST,Number=1,Type=Float,Description=\"Posterior alt probability after probabilistic evidence fusion\">\n"
         << "##INFO=<ID=FUSED_LOGODDS,Number=1,Type=Float,Description=\"Log-odds for the alternative allele after evidence fusion\">\n"
         << "##INFO=<ID=FUSED_DEPTH,Number=1,Type=Float,Description=\"Effective depth used by evidence fusion\">\n"
@@ -2128,6 +2129,7 @@ static void write_vcf_record(std::ostream& out,
         << ";FUSED_LOGODDS=" << std::fixed << std::setprecision(4) << v.fusedLogOddsAlt
         << ";FUSED_DEPTH=" << std::fixed << std::setprecision(3) << v.fusedEffectiveDepth
         << ";FUSED_LAYERS=" << std::max(0, v.fusedLayersUsed);
+    if (v.readSupport >= 0) out << ";SUPPORT=" << v.readSupport;
     if (v.refPos > 0) out << ";REFPOS=" << v.refPos;
     if (v.refEnd > 0) out << ";REFEND=" << v.refEnd;
     if (primaryOffRef) out << ";OFFREF";
@@ -2174,6 +2176,7 @@ static void write_tsv_record(std::ostream& out,
         << '\t' << v.fusedLogOddsAlt
         << '\t' << v.fusedEffectiveDepth
         << '\t' << v.fusedLayersUsed
+        << '\t' << v.readSupport
         << '\n';
 }
 
@@ -2856,7 +2859,8 @@ int main(int argc, char** argv) {
     tsv_out << "query_asm\tquery_contig\ttype\tref_asm\tref_contig"
                "\tref_pos\tref_end\tpos\tend\tsvlen\tblock_score\tanchors"
                "\tgenotype\tgq\tannotation\talignment_mode\tquery_mode"
-               "\tfused_posterior_alt\tfused_logodds_alt\tfused_effective_depth\tfused_layers\n";
+               "\tfused_posterior_alt\tfused_logodds_alt\tfused_effective_depth\tfused_layers"
+               "\tread_support\n";
     write_vcf_header(vcf_out, "fungi_graphsv_tol_v3");
     if (o.tolAncestralAlign) tol::write_ancestral_tsv_header(anc_out);
 

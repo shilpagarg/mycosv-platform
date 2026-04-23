@@ -47,8 +47,35 @@ def mode_specific_caller_args(mode: str, genome_size_hint: int) -> list[str]:
     args: list[str] = []
     if mode != "assembly" and genome_size_hint > 0:
         args.extend(["--genome-size-hint", str(genome_size_hint)])
+    # K-mer direct matching from reads (no assembly) with coverage + sequence + graph topology
     if mode == "short-reads":
-        args.extend(["--sr-min-unitig-len", "100", "--sr-min-kmer-freq", "2"])
+        args.extend([
+            "--kmer-direct-mode",
+            "--kmer-size", "21",
+            "--kmer-freq-min", "2",
+            "--kmer-freq-max", "256",
+            "--coverage-aware-sv-calling",
+            "--use-coverage-profile",
+            "--use-sequence-context",
+            "--use-graph-topology",
+            "--graph-edge-weight-coverage",
+            "--graph-topology-sv-threshold", "0.3",
+        ])
+    if mode == "long-reads":
+        args.extend([
+            "--kmer-direct-mode",
+            "--kmer-size", "15",  # shorter k-mers for long-read error tolerance
+            "--kmer-freq-min", "1",
+            "--kmer-freq-max", "512",
+            "--coverage-aware-sv-calling",
+            "--use-coverage-profile",
+            "--use-sequence-context",
+            "--use-graph-topology",
+            "--graph-edge-weight-coverage",
+            "--graph-topology-sv-threshold", "0.25",
+            "--long-read-gap-penalty", "100",
+            "--lr-span-resolution", "1000",
+        ])
     return args
 
 
@@ -219,6 +246,10 @@ def main() -> int:
     ap.add_argument("--threads", type=int, default=32,
                     help="Parallel worker threads passed to the MycoSV binary (--threads) "
                          "and index build (--tol-index-threads). Default: 32.")
+    ap.add_argument("--resume", action="store_true",
+                    help="Skip simulation/build/query for any mode where calls.vcf already "
+                         "exists in the output directory, jumping straight to PR scoring. "
+                         "Useful after a session disconnect that killed Python mid-run.")
     ap.add_argument("--long-read-platform", default="hifi,ont-r10",
                     help="Comma-separated list of long-read platform presets to run. "
                          "Each generates a separate long-reads_<platform>/ output directory. "
@@ -292,60 +323,83 @@ def main() -> int:
         idx_dir.mkdir(parents=True, exist_ok=True)
         reg_dir.mkdir(parents=True, exist_ok=True)
 
-        sim_cmd = [
-            sys.executable, str(args.simulator.resolve()),
-            "--phylum", args.phylum,
-            "--n-genomes", str(args.n_genomes),
-            "--n-reps", str(args.n_reps),
-            "--total-len", str(args.total_len),
-            "--n-contigs", str(args.n_contigs),
-            "--out-dir", str(sim_dir),
-            "--scenario-set", args.scenario_set,
-            "--write-extended-manifest",
-            "--query-mode", actual_mode,
-            "--divergence", str(args.divergence),
-            # Platform preset for long-reads: controls read length, error rate,
-            # and coverage in the simulator (see _LR_PLATFORM_PRESETS in test_amf.py).
-            # hifi    → 15 kb, ≥Q20 — minimap2 map-hifi downstream
-            # ont-r10 → 10 kb, ~Q20 — minimap2 map-ont; WhatsHap applicable for
-            #           dikaryotic fungi (Puccinia, Leptosphaeria, Zymoseptoria)
-            # ont-r9  → 8 kb, ~Q15
-            *( ["--long-read-platform", lr_plat] if lr_plat else [] ),
-        ]
-        sim_run = run(sim_cmd, cwd=ROOT)
-
-        build_cmd = [
-            str(args.binary_path.resolve()),
-            "--tol-hierarchical",
-            "--tol-build-index", str(sim_dir / "hierarchy_manifest.tsv"),
-            "--tol-index-dir", str(idx_dir),
-            "--tol-registry-dir", str(reg_dir),
-            "--tol-multi-rank",
-            "--tol-base-graph-build",
-            "--tol-max-clade-genomes", "32",
-            "--tol-index-threads", str(args.threads),
-        ]
-        build_run = run_mycosv_command(build_cmd, cwd=ROOT)
-        store_info = augment_routing_store(idx_dir, args.n_centroids, args.seed)
-
         out_prefix = mode_dir / "calls"
-        query_cmd = [
-            str(args.binary_path.resolve()),
-            "--tol-hierarchical",
-            "--tol-index-dir", str(idx_dir),
-            "--tol-registry-dir", str(reg_dir),
-            "--ref-list", str(sim_dir / "ref_list.txt"),
-            "--query-list", str(sim_dir / "query_list.txt"),
-            "--out-prefix", str(out_prefix),
-            "--query-mode", actual_mode,
-            "--routing-top-n", str(args.routing_top_n),
-            "--min-svlen", str(args.min_svlen),
-            "--threads", str(args.threads),
-            *mode_specific_caller_args(actual_mode, args.total_len),
-        ]
-        q_start = time.perf_counter()
-        query_run = run_mycosv_command(query_cmd, cwd=ROOT)
-        query_seconds = time.perf_counter() - q_start
+        resuming = args.resume and out_prefix.with_suffix(".vcf").exists()
+
+        if resuming:
+            # Session was disconnected mid-run; the binary already wrote its output.
+            # Reconstruct the minimal state needed for PR scoring and summary.
+            print(f"[resume] {label}: calls.vcf exists — skipping sim/build/query", flush=True)
+            store_path = idx_dir / "routing_centroids.bin"
+            store_info = {
+                "real_centroids": 0,
+                "decoy_centroids": 0,
+                "total_centroids": args.n_centroids,
+                "hashes_per_centroid": 0,
+            }
+            if (idx_dir / "routing_manifest.tsv").exists():
+                try:
+                    real_rows = parse_routing_manifest(idx_dir / "routing_manifest.tsv")
+                    store_info["real_centroids"] = len(real_rows)
+                    store_info["decoy_centroids"] = args.n_centroids - len(real_rows)
+                except Exception:
+                    pass
+            sim_run = build_run = query_run = None  # type: ignore[assignment]
+            query_seconds = 0.0
+        else:
+            sim_cmd = [
+                sys.executable, str(args.simulator.resolve()),
+                "--phylum", args.phylum,
+                "--n-genomes", str(args.n_genomes),
+                "--n-reps", str(args.n_reps),
+                "--total-len", str(args.total_len),
+                "--n-contigs", str(args.n_contigs),
+                "--out-dir", str(sim_dir),
+                "--scenario-set", args.scenario_set,
+                "--write-extended-manifest",
+                "--query-mode", actual_mode,
+                "--divergence", str(args.divergence),
+                # Platform preset for long-reads: controls read length, error rate,
+                # and coverage in the simulator (see _LR_PLATFORM_PRESETS in test_amf.py).
+                # hifi    → 15 kb, ≥Q20 — minimap2 map-hifi downstream
+                # ont-r10 → 10 kb, ~Q20 — minimap2 map-ont; WhatsHap applicable for
+                #           dikaryotic fungi (Puccinia, Leptosphaeria, Zymoseptoria)
+                # ont-r9  → 8 kb, ~Q15
+                *( ["--long-read-platform", lr_plat] if lr_plat else [] ),
+            ]
+            sim_run = run(sim_cmd, cwd=ROOT)
+
+            build_cmd = [
+                str(args.binary_path.resolve()),
+                "--tol-hierarchical",
+                "--tol-build-index", str(sim_dir / "hierarchy_manifest.tsv"),
+                "--tol-index-dir", str(idx_dir),
+                "--tol-registry-dir", str(reg_dir),
+                "--tol-multi-rank",
+                "--tol-base-graph-build",
+                "--tol-max-clade-genomes", "32",
+                "--tol-index-threads", str(args.threads),
+            ]
+            build_run = run_mycosv_command(build_cmd, cwd=ROOT)
+            store_info = augment_routing_store(idx_dir, args.n_centroids, args.seed)
+
+            query_cmd = [
+                str(args.binary_path.resolve()),
+                "--tol-hierarchical",
+                "--tol-index-dir", str(idx_dir),
+                "--tol-registry-dir", str(reg_dir),
+                "--ref-list", str(sim_dir / "ref_list.txt"),
+                "--query-list", str(sim_dir / "query_list.txt"),
+                "--out-prefix", str(out_prefix),
+                "--query-mode", actual_mode,
+                "--routing-top-n", str(args.routing_top_n),
+                "--min-svlen", str(args.min_svlen),
+                "--threads", str(args.threads),
+                *mode_specific_caller_args(actual_mode, args.total_len),
+            ]
+            q_start = time.perf_counter()
+            query_run = run_mycosv_command(query_cmd, cwd=ROOT)
+            query_seconds = time.perf_counter() - q_start
 
         summary = score_pr(
             sim_dir / "truth" / "all_queries.truth.ref.vcf",
@@ -396,10 +450,10 @@ def main() -> int:
             }
         )
         summary_json["modes"][label] = {
-            "simulation_stdout": sim_run.stdout,
-            "build_stdout": build_run.stdout,
-            "query_stdout": query_run.stdout,
-            "query_stderr": query_run.stderr,
+            "simulation_stdout": sim_run.stdout if sim_run else "(resumed)",
+            "build_stdout": build_run.stdout if build_run else "(resumed)",
+            "query_stdout": query_run.stdout if query_run else "(resumed)",
+            "query_stderr": query_run.stderr if query_run else "(resumed)",
             "store_info": store_info,
             "metrics": {k: v for k, v in summary.items() if k not in {"tp_records", "fp_records", "fn_records"}},
             "query_seconds": query_seconds,

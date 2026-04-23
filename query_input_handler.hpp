@@ -1063,11 +1063,12 @@ short_reads_to_pseudocontigs(const std::vector<RawRead>& reads,
     size_t pcIdx = 0;
     const size_t maxUnitigLen = 5000000;
 
-    for (const auto& [seed, _freq] : solid) {
+    for (const auto& [seed, seedFreq] : solid) {
         if (visited.count(seed)) continue;
         std::string unitig = seed;
         visited.insert(seed);
         std::string cur = seed;
+        uint32_t minFreqPath = seedFreq;
         while (unitig.size() < maxUnitigLen) {
             const std::string suf = cur.substr(1);
             auto it = prefixIdx.find(suf);
@@ -1081,13 +1082,15 @@ short_reads_to_pseudocontigs(const std::vector<RawRead>& reads,
                 if (fi->second > bestF) { bestF = fi->second; best = s; }
             }
             if (!best) break;
+            minFreqPath = std::min(minFreqPath, bestF);
             visited.insert(*best);
             unitig += best->back();
             cur = *best;
         }
         if (unitig.size() >= minUnitigLen)
             out["sr_unitig" + std::to_string(pcIdx++)
-                + "_len" + std::to_string(unitig.size())] = std::move(unitig);
+                + "_len" + std::to_string(unitig.size())
+                + "_mf" + std::to_string(minFreqPath)] = std::move(unitig);
     }
 
     if (!quiet)
@@ -1172,6 +1175,35 @@ prepare_query(const std::string& path,
                 std::move(filtered), modeHint, tuned.cfg.genomeSizeHint, quiet, dropped);
             result.contigs = detail::long_reads_to_pseudocontigs(
                 filtered, tuned.cfg.lrAnchorK, tuned.cfg.lrMinCluster, quiet);
+            if (result.contigs.empty() && !filtered.empty()) {
+                if (!quiet)
+                    std::cerr << "[query-input][long-reads] no pseudo-contigs assembled; emitting "
+                              << filtered.size() << " individual reads as pseudo-contigs\n";
+                for (auto& r : filtered)
+                    result.contigs.emplace(std::move(r.name), std::move(r.seq));
+            }
+            // Filter pseudo-contigs by read support (cluster size encoded in _n<N>)
+            {
+                const int minSupport = (tuned.preReport.coverageTier == CoverageTier::LOW) ? 2 : 3;
+                size_t nDropped = 0;
+                std::unordered_map<std::string, std::string> kept;
+                kept.reserve(result.contigs.size());
+                for (auto& [name, seq] : result.contigs) {
+                    auto npos = name.rfind("_n");
+                    int support = -1;
+                    if (npos != std::string::npos) {
+                        try { support = std::stoi(name.substr(npos + 2)); } catch (...) {}
+                    }
+                    if (support < 0 || support >= minSupport)
+                        kept.emplace(std::move(name), std::move(seq));
+                    else
+                        ++nDropped;
+                }
+                if (!quiet && nDropped > 0)
+                    std::cerr << "[query-input][long-reads] dropped " << nDropped
+                              << " pseudo-contigs with read support < " << minSupport << "\n";
+                result.contigs = std::move(kept);
+            }
             result.report = detail::compute_report(
                 filtered, result.contigs.size(), dropped, tuned.cfg.genomeSizeHint, modeHint);
             result.report.coverageTier = tuned.preReport.coverageTier;
@@ -1190,6 +1222,29 @@ prepare_query(const std::string& path,
                 std::move(filtered), modeHint, tuned.cfg.genomeSizeHint, quiet, dropped);
             result.contigs = detail::short_reads_to_pseudocontigs(
                 filtered, tuned.cfg.srK, tuned.cfg.srMinKmerFreq, tuned.cfg.srMinUnitigLen, quiet);
+            // Filter unitigs by minimum k-mer frequency support (_mf<N> in name)
+            if (!result.contigs.empty()) {
+                const uint32_t minMf = (tuned.preReport.coverageTier == CoverageTier::LOW) ? 2u : 3u;
+                size_t nDropped = 0;
+                std::unordered_map<std::string, std::string> kept;
+                kept.reserve(result.contigs.size());
+                for (auto& [name, seq] : result.contigs) {
+                    auto mfpos = name.rfind("_mf");
+                    uint32_t mf = 0;
+                    if (mfpos != std::string::npos) {
+                        try { mf = static_cast<uint32_t>(std::stoul(name.substr(mfpos + 3))); }
+                        catch (...) {}
+                    }
+                    if (mf == 0 || mf >= minMf)
+                        kept.emplace(std::move(name), std::move(seq));
+                    else
+                        ++nDropped;
+                }
+                if (!quiet && nDropped > 0)
+                    std::cerr << "[query-input][short-reads] dropped " << nDropped
+                              << " unitigs with k-mer support < " << minMf << "\n";
+                result.contigs = std::move(kept);
+            }
             if (result.contigs.empty() && !filtered.empty()) {
                 const size_t overlapMin = std::max<size_t>(
                     static_cast<size_t>(std::max(12, tuned.cfg.srK * 2)), 40);

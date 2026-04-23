@@ -53,12 +53,8 @@
 | File | Purpose | Status |
 |------|---------|--------|
 | `install_tools.sh` | Install all MycoSV + SOTA comparator tools into conda env | ✅ Active |
-| `preserve_test_intermediates.sh` | Capture small-scale test VCF/TSV/FASTA/FASTQ | ✅ Active |
-| `capture_benchmark_intermediates.sh` | Capture mode-specific benchmark outputs | ✅ Active |
-| `run_updated_tests.sh` | Full test suite (C++/Python) | ✅ Active |
-| `run_comprehensive_experiments.sh` | Million-scale simulations | ✅ Active |
+| `run_all_experiments.sh` | Simulated + real benchmarks, all modes | ✅ Active |
 | `cleanup_and_organize.sh` | Remove dead code & cache | ✅ Active |
-| `quick_start_intermediates.sh` | Quick reference for intermediate file handling | ✅ Active |
 
 ### Documentation
 
@@ -84,7 +80,6 @@
 
 | File | Purpose | Scale | Status |
 |------|---------|-------|--------|
-| `run_mode_pr_benchmark.py` | Precision/recall per mode | Medium | ✅ Active |
 | `run_real_fungal_benchmark.py` | Real NCBI/ENA data | Real | ✅ Active |
 | `run_million_mode_query_benchmark.py` | Million-scale simulation | 1M refs | ✅ Active |
 | `run_te_benchmark.py` | TE classification vs PanTEon SOTA | Real | ✅ Active |
@@ -234,11 +229,11 @@ fungi_graphsv_tol \
 ### Testing
 
 ```bash
-# Small-scale tests with intermediate preservation
-bash preserve_test_intermediates.sh small
+# Simulated benchmarks (all modes)
+bash run_all_experiments.sh --simulated
 
-# All benchmarks
-bash run_updated_tests.sh
+# Real fungal benchmarks
+bash run_all_experiments.sh --real
 ```
 
 ---
@@ -283,21 +278,25 @@ bash run_updated_tests.sh
 
 ---
 
-## 🧹 Code Cleanup (20 April 2026)
+## 🧹 Code Cleanup (April 2026)
 
-**Removed** (unused, replaced by new infrastructure):
-- ✂️ FINAL_STATUS_REPORT.sh (obsolete)
-- ✂️ run_tol_bench.sh (superseded)
+**Removed** (unused, superseded by active scripts):
+- ✂️ FINAL_STATUS_REPORT.sh
+- ✂️ run_tol_bench.sh (placeholder only)
+- ✂️ run_updated_tests.sh (old DS-7..18 audit script)
+- ✂️ run_comprehensive_experiments.sh (duplicate of run_all_experiments.sh)
+- ✂️ run_mode_pr_benchmark.py (predecessor to run_million_mode_query_benchmark.py)
+- ✂️ generate_comprehensive_report.py (superseded by sv_visualization_report.py)
+- ✂️ generate_small_test_metrics.sh (referenced deleted small_tests/ dir)
+- ✂️ run_quick_tests.sh (superseded by run_all_experiments.sh --simulated)
+- ✂️ quick_start_intermediates.sh (documentation-only heredoc)
+- ✂️ preserve_test_intermediates.sh (thin pytest wrapper, not pipeline-integrated)
+- ✂️ capture_benchmark_intermediates.sh (subset of run_all_experiments.sh --simulated)
 
 **Cleaned**:
 - ✂️ Python __pycache__ directories
 - ✂️ .pytest_cache directories
 - ✂️ experiments/old_data/.old_experiments
-
-**Disk Usage**:
-- Before: 3.2 GB
-- After: 387 MB
-- **Savings**: ~2.8 GB (cache/dead code)
 
 ---
 

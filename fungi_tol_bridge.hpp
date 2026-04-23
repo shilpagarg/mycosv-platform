@@ -93,6 +93,11 @@ struct VariantCallBridge {
     double      fusedLogOddsAlt     = 0.0;
     double      fusedEffectiveDepth = 0.0;
     int         fusedLayersUsed     = 0;
+    // Read support backing this call's pseudo-contig:
+    //   long-reads  → cluster size (_n<N> in contig name), exact read count
+    //   short-reads → min k-mer frequency along unitig path (_mf<N>), coverage proxy
+    //   assembly    → -1 (not applicable)
+    int         readSupport         = -1;
 };
 
 namespace tol {
@@ -1480,6 +1485,24 @@ private:
     bool initialized_ = false;
 };
 
+// Parse read support from a pseudo-contig name.
+// _n<N>  = long-reads cluster size  (exact read count)
+// _mf<N> = short-reads min k-mer frequency along unitig path (coverage proxy)
+inline int parse_pseudocontig_support(const std::string& name) {
+    for (const char* tag : {"_n", "_mf"}) {
+        const size_t tlen = __builtin_strlen(tag);
+        auto pos = name.rfind(tag);
+        if (pos != std::string::npos) {
+            try {
+                size_t nchars = 0;
+                const int v = std::stoi(name.substr(pos + tlen), &nchars);
+                if (nchars > 0 && v >= 0) return v;
+            } catch (...) {}
+        }
+    }
+    return -1;
+}
+
 // ── make_insdel_call ──────────────────────────────────────────────────────
 inline VariantCallBridge make_insdel_call(const std::string& qAsm,
                                           const std::string& qContig,
@@ -1513,8 +1536,9 @@ inline VariantCallBridge make_insdel_call(const std::string& qAsm,
     v.pantreeClass = v.type;
     v.isNonRefVariant  = false;
     v.triallelicTopology = ".";
-    v.cladeRank = ref.cladeRank.empty() ? "." : ref.cladeRank;
-    v.phylum    = ref.phylum.empty() ? "." : ref.phylum;
+    v.cladeRank   = ref.cladeRank.empty() ? "." : ref.cladeRank;
+    v.phylum      = ref.phylum.empty() ? "." : ref.phylum;
+    v.readSupport = parse_pseudocontig_support(qContig);
     return v;
 }
 
@@ -1549,8 +1573,9 @@ inline VariantCallBridge make_offref_call(const std::string& qAsm,
     v.pantreeClass = "NON_REF";
     v.isNonRefVariant  = true;
     v.triallelicTopology = ".";
-    v.cladeRank = cladeRank.empty() ? "." : cladeRank;
-    v.phylum    = phylum.empty() ? "." : phylum;
+    v.cladeRank   = cladeRank.empty() ? "." : cladeRank;
+    v.phylum      = phylum.empty() ? "." : phylum;
+    v.readSupport = parse_pseudocontig_support(qContig);
     // Classify element type for GFA EC tag
     const ElementClass ec = seq.empty()
         ? ElementClass::NONE
@@ -1767,8 +1792,9 @@ static bool try_mem_chain_call(
                 ? saRefs[static_cast<size_t>(primaryContigIdx)]
                 : (saRefs.empty() ? nullptr : saRefs.front());
 
-        out.call.qAsm    = qAsm;
-        out.call.qContig = qContig;
+        out.call.qAsm         = qAsm;
+        out.call.qContig      = qContig;
+        out.call.readSupport  = parse_pseudocontig_support(qContig);
         out.call.refAsm  = (primaryRef != nullptr && !primaryRef->asmName.empty())
             ? primaryRef->asmName
             : ((primaryRef != nullptr && !primaryRef->clade.empty()) ? primaryRef->clade : "unknown");
@@ -2008,7 +2034,9 @@ hierarchical_call_assembly(const std::string& qAsm,
                 }
             }
 
-            if (best && bestDelta >= fo.minSvLen && bestDelta <= fo.maxSvLen) {
+            if (best && bestDelta >= fo.minSvLen && bestDelta <= fo.maxSvLen &&
+                bestDelta <= static_cast<int>(
+                    std::min(seq.size(), best->seq().size()) / 2)) {
                 out.push_back(make_insdel_call(qAsm, name, *best,
                                                static_cast<int>(seq.size()), fo));
                 append_window_calls(name, seq);
@@ -2232,7 +2260,9 @@ hierarchical_call_assembly_multirank(
                     }
                 }
 
-                if (best && bestDelta >= fo.minSvLen && bestDelta <= fo.maxSvLen) {
+                if (best && bestDelta >= fo.minSvLen && bestDelta <= fo.maxSvLen &&
+                    bestDelta <= static_cast<int>(
+                        std::min(seq.size(), best->seq().size()) / 2)) {
                     rankCalls.push_back(make_insdel_call(qAsm, name, *best,
                                                          static_cast<int>(seq.size()), fo));
                     append_rank_window_calls(name, seq);

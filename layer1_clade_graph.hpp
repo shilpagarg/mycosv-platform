@@ -1619,6 +1619,7 @@ struct SvTypeFromChain {
                               chain[static_cast<size_t>(N-1)].len;
             res.svLen       = end - start;
             if (res.svLen < minSvLen) return Result{};
+            if (c0 >= 0) res.rContig = sa.contigName[static_cast<size_t>(c0)];
             return res;
         }
 
@@ -1643,6 +1644,7 @@ struct SvTypeFromChain {
             res.rBreakStart = chain[0].rPos;
             res.rBreakEnd   = res.rBreakStart + (-rGap);
             res.svLen       = -rGap;
+            if (c0 >= 0) res.rContig = sa.contigName[static_cast<size_t>(c0)];
             return res;
         }
 
@@ -1657,6 +1659,7 @@ struct SvTypeFromChain {
             res.qBreakEnd = res.qBreakStart;
             res.rBreakEnd = res.rBreakStart + (-delta);
         }
+        if (c0 >= 0) res.rContig = sa.contigName[static_cast<size_t>(c0)];
         return res;
     }
 };
