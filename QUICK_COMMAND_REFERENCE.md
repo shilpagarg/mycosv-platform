@@ -52,29 +52,32 @@ python3 run_million_mode_query_benchmark.py \
   --seed 42
 ```
 
-### Mode PR Benchmarks (Each mode separately)
+### Million-Scale Per-Mode Benchmark
 ```bash
 cd /mnt/bmh01-rds/Shilpa_Group/2024/projects/fungi/AMF/scale
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-mkdir -p experiments/large_scale/$TIMESTAMP/mode_pr/{assembly,short-reads,long-reads}
 
-# Assembly mode
-python3 run_mode_pr_benchmark.py \
-  --modes assembly \
-  --out-dir experiments/large_scale/$TIMESTAMP/mode_pr/assembly \
-  --n-refs 500 --n-queries 20 --seed 42
+for mode in assembly short-reads long-reads; do
+  python3 run_million_mode_query_benchmark.py \
+    --modes "$mode" \
+    --out-dir experiments/large_scale/$TIMESTAMP/mode_$mode \
+    --n-centroids 1000000 \
+    --n-genomes 8 \
+    --seed 42
+done
+```
 
-# Short-reads mode
-python3 run_mode_pr_benchmark.py \
-  --modes short-reads \
-  --out-dir experiments/large_scale/$TIMESTAMP/mode_pr/short-reads \
-  --n-refs 500 --n-queries 20 --seed 42
-
-# Long-reads mode
-python3 run_mode_pr_benchmark.py \
-  --modes long-reads \
-  --out-dir experiments/large_scale/$TIMESTAMP/mode_pr/long-reads \
-  --n-refs 500 --n-queries 20 --seed 42
+### Visualization Report (HTML + PNG)
+```bash
+cd /mnt/bmh01-rds/Shilpa_Group/2024/projects/fungi/AMF/scale
+python3 sv_visualization_report.py \
+  --sv-tsv experiments/large_scale/$TIMESTAMP/results.sv.tsv \
+  --out-dir reports/$TIMESTAMP
+# Output: reports/$TIMESTAMP/mycosv_report.html
+#   Section 1: SV type breakdown
+#   Section 2: Precision/recall per mode
+#   Section 3: TE classification
+#   Section 4: Clade-SV, TE-architecture, HGT-propagation plots
 ```
 
 ### Real Fungal Data - Single Panel (e.g., compact_yeast)

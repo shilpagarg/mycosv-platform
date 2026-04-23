@@ -1,14 +1,14 @@
 # MycoSV Project Documentation Index
 
 **Project**: MycoSV — Fungal Pangenome Structural Variant Caller  
-**Date**: 20 April 2026  
+**Date**: 23 April 2026  
 **Status**: Production-ready with comprehensive documentation  
 
 ---
 
 ## 📚 Documentation Structure
 
-### 1. **MYCOSV_ALGORITHM.md** (25 KB, 763 lines)
+### 1. **MYCOSV_ALGORITHM.md** (v1.1, ~1000 lines)
 **Comprehensive technical specification** 
 
 **Contents**:
@@ -17,7 +17,10 @@
 - Query input modes (assembly, long-reads, short-reads)
 - Seeding & alignment algorithms (syncmers, chain-and-refine)
 - SV classification (5 types × triallelic topology)
-- Repeat & TE annotation (8 detectors)
+- **SV calling paths (Path A / B / C)** — MEM-chain, length-delta, off-reference novelty
+- Repeat & TE annotation (8 detectors, all 5 SV types annotated)
+- **Off-reference novelty tiers** — NOVEL / NOVEL_WEAK / DIVERGED / OFF_REF_KNOWN
+- **Cross-clade HGT detection** — score_cross_clade_novelty() logic
 - **TE classification** (k-mer nearest-centroid classifier; PanTEon benchmark)
 - Precision & recall benchmarks (Wilson CI)
 - Real fungal data benchmarks
@@ -55,6 +58,7 @@
 | `install_tools.sh` | Install all MycoSV + SOTA comparator tools into conda env | ✅ Active |
 | `run_all_experiments.sh` | Simulated + real benchmarks, all modes | ✅ Active |
 | `cleanup_and_organize.sh` | Remove dead code & cache | ✅ Active |
+| `sv_visualization_report.py` | HTML report: clade-SV, TE-architecture, HGT-propagation plots | ✅ Active |
 
 ### Documentation
 
@@ -71,7 +75,7 @@
 | File | Purpose | Tests | Status |
 |------|---------|-------|--------|
 | `test_amf.py` | Fungal SV simulator (23 corrections) | — | ✅ Core |
-| `test_pipeline_features.py` | Pipeline feature validation | 30+ | ✅ Pass |
+| `test_pipeline_features.py` | Pipeline feature validation | 52 | ✅ Pass |
 | `test_all_use_cases.py` | End-to-end scenarios | 13 | ✅ Pass |
 | `test_real_fungal_benchmark.py` | Real data integration | 13 | ✅ Pass |
 | `test_new_biology_candidates.py` | Novel biology detection | — | ✅ Core |
@@ -93,7 +97,7 @@
 | `layer1_clade_graph.hpp` | Per-clade pangenome graphs | DS-7 to DS-18 | 1000+ |
 | `layer2_registry.hpp` | LRU clade registry | DS-1 to DS-3 | 500+ |
 | `layer3_routing_index.hpp` | VP-tree routing | DS-4 to DS-6, DS-19 | 600+ |
-| `fungi_tol_bridge.hpp` | Integration layer | All | 400+ |
+| `fungi_tol_bridge.hpp` | Integration layer (v15) | All | 2879 |
 | `taxonomy_ranks.hpp` | Taxonomic ranks | — | 100+ |
 | `te_classifier.hpp` | k-mer nearest-centroid TE classifier | DS-4 reuse | 300+ |
 
@@ -345,7 +349,7 @@ query_001       chr2            DEL     5000    1000    0.99        0.94    0.96
 
 | Component | Status | Notes |
 |-----------|--------|-------|
-| **Algorithm** | ✅ Documented | 763 lines (MYCOSV_ALGORITHM.md) |
+| **Algorithm** | ✅ Documented | ~1026 lines (MYCOSV_ALGORITHM.md v1.1) |
 | **Quick Reference** | ✅ Documented | 360 lines (MYCOSV_QUICK_REFERENCE.md) |
 | **Tests** | ✅ Pass | 24/24 (100%) |
 | **Infrastructure** | ✅ Clean | 2.8 GB freed; dead code removed |
@@ -354,6 +358,6 @@ query_001       chr2            DEL     5000    1000    0.99        0.94    0.96
 
 ---
 
-**MycoSV v1.0** — Fungal Pangenome Structural Variant Caller  
-**Created**: 20 April 2026  
+**MycoSV v1.1** — Fungal Pangenome Structural Variant Caller  
+**Created**: 20 April 2026 | **Updated**: 23 April 2026  
 **For**: Million-scale fungal genome pangenome analysis

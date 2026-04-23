@@ -30,7 +30,10 @@ This codebase is intended for fungal ecology, plant-fungal symbiosis, genome pla
 - [Query Input Modes](#query-input-modes)
 - [Seeding & Alignment](#seeding--alignment)
 - [SV Classification](#sv-classification)
+  - [SV Calling Paths (Path A / B / C)](#sv-calling-paths-path-a--b--c)
 - [Repeat & TE Annotation](#repeat--te-annotation)
+  - [TE Annotation per SV Type](#te-annotation-per-sv-type)
+- [Off-Reference Novelty Tiers](#off-reference-novelty-tiers)
 - [TE Classification](#te-classification)
 - [Precision & Recall](#precision--recall)
 - [Benchmarks](#benchmarks)
@@ -455,6 +458,73 @@ function is_translocation(path, ref_contig, graph):
             any(is_decreasing(positions) for consecutive positions))
 ```
 
+### SV Calling Paths (Path A / B / C)
+
+SV classification uses three complementary paths depending on evidence availability:
+
+#### Path A — MEM-Chain Classification (Primary)
+
+Operates on the Suffix Array (DS-13) + ChainTreap (DS-18) pipeline.
+
+```
+allMems ← suffixArray.queryMems(query, ref)
+  ↓
+Pre-scan allMems for backward-mapping MEMs (rPos decreasing)
+  → If any: hasBwdMems = true (DUP candidate)
+  ↓
+ChainTreap.chain(allMems) → best forward chain
+  ↓
+SvTypeFromChain::classify(chain)
+  ├─ INS: large query gap, small ref gap
+  ├─ DEL: small query gap, large ref gap
+  ├─ INV: reverse-complement MEMs (totalRevLen ≥ minSvLen guard)
+  ├─ DUP fallback: hasBwdMems → scan for forward collinear overlap
+  └─ TRA fallback: cross-contig MEM gap > 500 kb → TRA
+```
+
+**DUP fallback**: ChainTreap drops overlapping rPos MEMs by design. The pre-scan detects backward-mapping MEMs indicating a tandem copy, then re-classifies after confirming a forward-only collinear overlap. Prevents false-negative DUP calls when the duplicated region produces overlapping anchors.
+
+**TRA fallback**: A query gap > 500 kb bridging two different reference contigs triggers cross-contig MEM scanning with 500 kb gap tolerance, producing a TRA call with cross-contig coordinates.
+
+**INV guard**: `totalRevLen >= minSvLen` is required before any INV is emitted. Prevents single palindromic k-mers (one reverse-complement MEM) from triggering false inversion calls.
+
+#### Path B — Length-Delta Fallback (Reads Mode)
+
+Used when MEM chains are too short or absent (short-reads / sparse coverage):
+
+```
+Pseudo-contig vs reference unitig
+  ↓
+length_delta ← |query_len − ref_len|
+kmer_overlap ← kmer_overlap_fraction(query, ref, k=7..9)
+  ↓
+if length_delta > minSvLen and kmer_overlap < 0.80:
+    INS (query > ref)  or  DEL (query < ref)
+```
+
+Uses a rolling FNV-1a polynomial hash (O(N) build, O(1) lookup per k-mer window).
+
+#### Path C — Off-Reference Novelty (OFF_REF)
+
+Activated when the query has no sufficient overlap with any reference in the clade:
+
+```
+Query
+  ↓
+kmer_overlap_fraction(query, ref, k=7..9) for each reference in catalog
+  ├─ sameCladeOverlap  ← max overlap among same-clade references
+  └─ otherCladeOverlap ← max overlap among other-clade references
+  ↓
+score_cross_clade_novelty(sameCladeOverlap, otherCladeOverlap)
+  ├─ NOVEL:          sameCladeOverlap < 0.05  AND  otherCladeOverlap ≥ 0.10
+  │                  → elementClass = "HGT" (cross-clade horizontal transfer)
+  ├─ NOVEL_WEAK:     sameCladeOverlap < 0.20
+  ├─ DIVERGED:       sameCladeOverlap < 0.50
+  └─ OFF_REF_KNOWN:  sameCladeOverlap ≥ 0.50
+```
+
+**Cross-clade HGT detection**: When the novel sequence has near-zero overlap with same-clade genomes but ≥ 10% overlap with at least one other-clade genome, it is stamped `elementClass="HGT"`. Implemented in `score_cross_clade_novelty()` (`hierarchical_engine.hpp`) and called from `hierarchical_call_assembly()` and `hierarchical_call_assembly_multirank()` (`fungi_tol_bridge.hpp`).
+
 ---
 
 ## Repeat & TE Annotation
@@ -556,6 +626,48 @@ function classify_repeat_element(seq, clade_gc=0.45):
     
     return NONE
 ```
+
+### TE Annotation per SV Type
+
+All five SV types receive TE/repeat annotation by passing the relevant sequence through `classify_repeat_element()`:
+
+| SV Type | Sequence annotated | Notes |
+|---------|-------------------|-------|
+| **INS** | Inserted query sequence | Novel insertion examined for TE content |
+| **DEL** | Deleted reference subsequence `[rBreakStart, rBreakEnd)` | Identifies removed TE insertions |
+| **DUP** | Duplicated query sequence | Flags tandem TE expansions |
+| **INV** | Inverted query sequence | Detects TE-driven inversions |
+| **TRA** | Breakpoint-flanking sequences | Cross-contig TE signatures |
+
+**DEL TE classification (FIX-C1)**: For deletions, the deleted reference subsequence is extracted using the suffix-array contig offset `sa.contigEnd[primaryContigIdx-1]` to map global SA coordinates back to per-contig positions:
+
+```
+DEL call detected
+  ↓
+contigOffset ← sa.contigEnd[primaryContigIdx - 1]   (0 if first contig)
+ref_subseq   ← refSeq[rBreakStart − offset : rBreakEnd − offset]
+  ↓
+classify_repeat_element(ref_subseq, clade_gc)
+  ↓
+elementClass ← TE_LTR | TE_TIR | TE_LINE | REPEAT | HGT | RIP | STARSHIP | ...
+```
+
+---
+
+## Off-Reference Novelty Tiers
+
+Path C calls are scored into four novelty tiers based on k-mer overlap fractions:
+
+| Tier | Condition | Interpretation |
+|------|-----------|---------------|
+| **NOVEL** | sameCladeOverlap < 0.05 **and** otherCladeOverlap ≥ 0.10 | Cross-clade HGT — sequence present in another clade but absent from own |
+| **NOVEL_WEAK** | sameCladeOverlap < 0.20 | Highly diverged or genuinely novel insertion |
+| **DIVERGED** | sameCladeOverlap < 0.50 | Present in clade but highly diverged copy |
+| **OFF_REF_KNOWN** | sameCladeOverlap ≥ 0.50 | Known sequence missing from reference set |
+
+The `NOVEL` tier additionally sets `elementClass = "HGT"` in the output VCF/TSV when the cross-clade pattern is confirmed by `score_cross_clade_novelty()`.
+
+**Multi-rank calling**: `hierarchical_call_assembly_multirank()` routes independently at each Linnaean rank (phylum → class → order → family → genus → species). At the species rank (innermost), the same Path C novelty scoring applies, allowing HGT calls to be qualified by phylogenetic resolution. `fuse_probabilistic_evidence()` in `hierarchical_engine.hpp` merges evidence across assembly/long-read/short-read layers using a log-likelihood additive model.
 
 ---
 
@@ -909,6 +1021,6 @@ For issues, feature requests, or benchmark contributions, please contact the mai
 
 ---
 
-**Version**: 1.0  
-**Last Updated**: 20 April 2026  
+**Version**: 1.1  
+**Last Updated**: 23 April 2026  
 **Citation**: If you use MycoSV, please cite: [TO BE DEFINED]

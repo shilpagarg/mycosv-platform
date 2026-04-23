@@ -53,20 +53,19 @@ python3 run_million_mode_query_benchmark.py \
 - 8 query genomes × 3 replicates
 - Output: `experiments/large_scale/YYYYMMDD_HHMMSS/million_scale_simulated/`
 
-### 4. Mode Precision-Recall Benchmarks (~15-25 minutes per mode)
+### 4. Per-Mode Million-Scale Benchmarks (~20-40 minutes per mode)
 ```bash
 for mode in assembly short-reads long-reads; do
-  python3 run_mode_pr_benchmark.py \
+  python3 run_million_mode_query_benchmark.py \
     --modes "$mode" \
-    --out-dir experiments/large_scale/YYYYMMDD_HHMMSS/mode_pr_benchmark/$mode \
-    --n-refs 500 \
-    --n-queries 20 \
+    --out-dir experiments/large_scale/YYYYMMDD_HHMMSS/mode_$mode \
+    --n-centroids 1000000 \
+    --n-genomes 8 \
     --seed 42
 done
 ```
-- Precision/recall metrics for each query mode
-- 500 references × 20 queries per mode
-- Output: `experiments/large_scale/YYYYMMDD_HHMMSS/mode_pr_benchmark/{assembly,short-reads,long-reads}/`
+- Million-scale catalog simulation per query mode
+- Output: `experiments/large_scale/YYYYMMDD_HHMMSS/mode_{assembly,short-reads,long-reads}/`
 
 ### 5. Real Fungal Data Benchmarks (~30-60 minutes per panel)
 ```bash
@@ -159,14 +158,12 @@ cat experiments/small_tests/$TIMESTAMP/simulated/pytest_output.log
 cat experiments/small_tests/$TIMESTAMP/real_data/pytest_output.log
 ```
 
-### Analyze results
+### Generate visualization report
 ```bash
-python3 analyze_results.py --input-dir experiments/large_scale/$TIMESTAMP
-```
-
-### Generate comprehensive report
-```bash
-bash run_comprehensive_experiments.sh
+python3 sv_visualization_report.py \
+  --sv-tsv experiments/large_scale/$TIMESTAMP/results.sv.tsv \
+  --out-dir reports/$TIMESTAMP
+# Produces: mycosv_report.html with clade-SV, TE-architecture, HGT-propagation plots
 ```
 
 ### Check intermediate files

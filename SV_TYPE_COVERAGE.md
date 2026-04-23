@@ -113,16 +113,13 @@ python3 run_million_mode_query_benchmark.py \
   --seed 42
 ```
 
-### Option 3: Use updated scripts (defaults updated)
+### Option 3: Run simulated benchmark suite
 ```bash
-# Uses: compact_yeast,pathogenic,te_rich_pathogen,cross_phylum_hgt
-bash run_mode_pr_benchmark.py --out-dir output
+# Default scenario includes te_rich_pathogen (all 5 SV types)
+python3 run_million_mode_query_benchmark.py --out-dir output
 
-# Uses: te_rich_pathogen (or override with --scenario-set)
-bash run_million_mode_query_benchmark.py --out-dir output
-
-# Uses: compact_yeast,pathogenic,te_rich_pathogen,cross_phylum_hgt
-bash run_quick_tests.sh
+# Full simulated suite (all scenarios)
+bash run_all_experiments.sh --simulated
 ```
 
 ---
@@ -165,14 +162,12 @@ cut -f1,2 pr_metrics_by_scenario.tsv | tail -n +2 | sort -u
 
 ---
 
-## Default Scenario Sets After Update
+## Default Scenario Sets
 
-| Script | Previous | Updated |
-|--------|----------|---------|
-| run_all_experiments.sh | compact_yeast | te_rich_pathogen, cross_phylum_hgt |
-| run_mode_pr_benchmark.py | compact_yeast, pathogenic, hgt_receiver | **compact_yeast, pathogenic, te_rich_pathogen, cross_phylum_hgt** |
-| run_million_mode_query_benchmark.py | compact_yeast | te_rich_pathogen |
-| run_quick_tests.sh | compact_yeast | te_rich_pathogen |
+| Script | Default Scenario Set |
+|--------|---------------------|
+| run_all_experiments.sh | te_rich_pathogen, cross_phylum_hgt |
+| run_million_mode_query_benchmark.py | te_rich_pathogen |
 
 ---
 
