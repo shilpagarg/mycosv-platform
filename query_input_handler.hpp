@@ -42,12 +42,15 @@
 #include <cassert>
 #include <cctype>
 #include <cmath>
+#include <cstdio>
+#include <ext/stdio_filebuf.h>
 #include <filesystem>
 #include <fstream>
 #include <functional>
 #include <iomanip>
 #include <iostream>
 #include <limits>
+#include <memory>
 #include <numeric>
 #include <string>
 #include <unordered_map>
@@ -259,16 +262,33 @@ inline void sanitise_seq(std::string& seq) {
 struct RawRead { std::string name, seq; };
 
 // Reads FASTA or FASTQ (detected by first character), up to maxRecords.
+// Supports plain files and .gz files (piped through gzip -dc).
 inline std::vector<RawRead>
 load_reads(const std::string& path, size_t maxRecords, bool quiet) {
+    // Open the input: plain file or gz pipe backed by __gnu_cxx::stdio_filebuf.
+    FILE* gz_pipe = nullptr;
+    std::unique_ptr<__gnu_cxx::stdio_filebuf<char>> gz_buf;
+    std::unique_ptr<std::istream> gz_is;
+    std::ifstream plain_file;
+    std::istream* in_ptr = nullptr;
+
     if (is_gzipped(path)) {
-        if (!quiet)
-            std::cerr << "[query-input] WARNING: gzip not supported without zlib.\n"
-                      << "  Decompress first: gunzip -k " << path << '\n';
-        return {};
+        std::string cmd = "gzip -dc '" + path + "'";
+        gz_pipe = popen(cmd.c_str(), "r");
+        if (!gz_pipe) {
+            if (!quiet)
+                std::cerr << "[query-input] ERROR: cannot decompress " << path << '\n';
+            return {};
+        }
+        gz_buf = std::make_unique<__gnu_cxx::stdio_filebuf<char>>(gz_pipe, std::ios::in);
+        gz_is  = std::make_unique<std::istream>(gz_buf.get());
+        in_ptr = gz_is.get();
+    } else {
+        plain_file.open(path);
+        if (!plain_file) throw std::runtime_error("Cannot open query file: " + path);
+        in_ptr = &plain_file;
     }
-    std::ifstream in(path);
-    if (!in) throw std::runtime_error("Cannot open query file: " + path);
+    std::istream& in = *in_ptr;
 
     std::vector<RawRead> reads;
     reads.reserve(std::min(maxRecords, static_cast<size_t>(100000)));
@@ -328,6 +348,11 @@ load_reads(const std::string& path, size_t maxRecords, bool quiet) {
             sanitise_seq(seq); reads.push_back({name, std::move(seq)});
         }
     }
+
+    // Close the gz pipe after destroying gz_is and gz_buf (destructor order).
+    gz_is.reset();
+    gz_buf.reset();
+    if (gz_pipe) pclose(gz_pipe);
     return reads;
 }
 
@@ -1050,13 +1075,15 @@ short_reads_to_pseudocontigs(const std::vector<RawRead>& reads,
     }
     if (solid.empty()) return {};
 
-    // Prefix -> list-of-solid-k-mers (for O(1) successor lookup)
-    std::unordered_map<std::string, std::vector<const std::string*>> prefixIdx;
-    prefixIdx.reserve(solid.size());
-    for (const auto& kv : solid)
-        prefixIdx[kv.first.substr(0, kSZ - 1)].push_back(&kv.first);
-
-    // Step 4: greedy extension
+    // Step 4: greedy extension with correct canonical k-mer orientation handling.
+    // A canonical k-mer may be stored as the reverse complement of the actual
+    // sequence k-mer (when RC is lexicographically smaller).  A prefix index
+    // keyed on the first (k-1) chars of the canonical form therefore misses
+    // successors whose canonical form is their own RC: the RC's first (k-1)
+    // chars differ from the last (k-1) chars of the current canonical k-mer.
+    // Fix: enumerate all four possible next bases, compute canonical(overlap+b),
+    // and look up directly in solid.  cur_actual tracks the k-mer in its
+    // traversal direction (may differ from its canonical form in solid/visited).
     std::unordered_set<std::string> visited;
     visited.reserve(solid.size());
     std::unordered_map<std::string, std::string> out;
@@ -1067,25 +1094,32 @@ short_reads_to_pseudocontigs(const std::vector<RawRead>& reads,
         if (visited.count(seed)) continue;
         std::string unitig = seed;
         visited.insert(seed);
-        std::string cur = seed;
+        std::string cur_actual = seed;  // actual traversal direction (may not be canonical)
         uint32_t minFreqPath = seedFreq;
         while (unitig.size() < maxUnitigLen) {
-            const std::string suf = cur.substr(1);
-            auto it = prefixIdx.find(suf);
-            if (it == prefixIdx.end() || it->second.empty()) break;
-            const std::string* best = nullptr;
+            const std::string overlap = cur_actual.substr(1);  // last (k-1) bases in traversal dir
+            const std::string* bestCanon = nullptr;
             uint32_t bestF = 0;
-            for (const std::string* s : it->second) {
-                if (visited.count(*s)) continue;
-                auto fi = solid.find(*s);
-                if (fi == solid.end()) continue;
-                if (fi->second > bestF) { bestF = fi->second; best = s; }
+            char bestBase = 0;
+            for (const char b : {'A', 'C', 'G', 'T'}) {
+                std::string cand = overlap;
+                cand += b;
+                std::string rcCand = reverse_complement_copy(cand);
+                const std::string& canon = (cand <= rcCand) ? cand : rcCand;
+                auto fi = solid.find(canon);
+                if (fi == solid.end() || visited.count(canon)) continue;
+                if (fi->second > bestF) {
+                    bestF = fi->second;
+                    bestCanon = &fi->first;
+                    bestBase = b;
+                }
             }
-            if (!best) break;
+            if (!bestCanon || bestF == 0) break;
             minFreqPath = std::min(minFreqPath, bestF);
-            visited.insert(*best);
-            unitig += best->back();
-            cur = *best;
+            visited.insert(*bestCanon);
+            unitig += bestBase;
+            cur_actual.erase(cur_actual.begin());
+            cur_actual.push_back(bestBase);
         }
         if (unitig.size() >= minUnitigLen)
             out["sr_unitig" + std::to_string(pcIdx++)

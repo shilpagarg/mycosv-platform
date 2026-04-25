@@ -47,34 +47,18 @@ def mode_specific_caller_args(mode: str, genome_size_hint: int) -> list[str]:
     args: list[str] = []
     if mode != "assembly" and genome_size_hint > 0:
         args.extend(["--genome-size-hint", str(genome_size_hint)])
-    # K-mer direct matching from reads (no assembly) with coverage + sequence + graph topology
     if mode == "short-reads":
         args.extend([
-            "--kmer-direct-mode",
-            "--kmer-size", "21",
-            "--kmer-freq-min", "2",
-            "--kmer-freq-max", "256",
-            "--coverage-aware-sv-calling",
-            "--use-coverage-profile",
-            "--use-sequence-context",
-            "--use-graph-topology",
-            "--graph-edge-weight-coverage",
-            "--graph-topology-sv-threshold", "0.3",
+            "--sr-kmer-size", "21",
+            "--sr-min-kmer-freq", "2",
+            "--min-anchors-per-block", "3",
         ])
     if mode == "long-reads":
         args.extend([
-            "--kmer-direct-mode",
-            "--kmer-size", "15",  # shorter k-mers for long-read error tolerance
-            "--kmer-freq-min", "1",
-            "--kmer-freq-max", "512",
-            "--coverage-aware-sv-calling",
-            "--use-coverage-profile",
-            "--use-sequence-context",
-            "--use-graph-topology",
-            "--graph-edge-weight-coverage",
-            "--graph-topology-sv-threshold", "0.25",
-            "--long-read-gap-penalty", "100",
-            "--lr-span-resolution", "1000",
+            "--lr-anchor-k", "15",       # shorter k for long-read error tolerance
+            "--chain-gap-band", "15000",  # wider band for large read-length gaps
+            "--min-anchors-per-block", "1",
+            "--min-block-score", "3.0",
         ])
     return args
 

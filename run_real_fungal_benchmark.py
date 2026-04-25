@@ -31,6 +31,7 @@ ROOT = Path(__file__).resolve().parent
 DEFAULT_BIN = ROOT / "fungi_graphsv_tol_bin"
 DEFAULT_ANALYZE = ROOT / "analyze_new_biology_candidates.py"
 MYCOSV_BRIDGE_CPP = ROOT / "mycosv_cli_bridge.cpp"
+DEFAULT_DATA_CACHE = ROOT / "data_cache"
 
 NCBI_ASSEMBLY_SUMMARY = {
     "ncbi-refseq": "https://ftp.ncbi.nlm.nih.gov/genomes/refseq/fungi/assembly_summary.txt",
@@ -498,6 +499,77 @@ def fetch_taxonomy_lineages(taxids: list[str], cache_path: Path | None = None) -
     if cache_path:
         cache_path.parent.mkdir(parents=True, exist_ok=True)
         cache_path.write_text(json.dumps(cache, indent=2, sort_keys=True))
+    return cache
+
+
+# NCBI BioSample attribute names that carry ecologically relevant phenotypic info.
+_PHENOTYPE_ATTRS = {
+    "isolation_source", "host", "disease", "geographic_location",
+    "collection_date", "env_biome", "env_feature", "env_material",
+    "pathogenicity", "trophic_level", "lifestyle", "tissue",
+    "culture_collection", "strain", "substrain",
+}
+
+
+def fetch_ncbi_biosample_phenotypes(
+    biosample_ids: list[str],
+    cache_path: Path | None = None,
+) -> dict[str, dict[str, str]]:
+    """Download BioSample phenotypic attributes for a list of BioSample accessions.
+
+    Results are stored in *cache_path* (JSON) so subsequent runs skip the
+    network round-trip.  Pass cache_path=data_cache_dir/'phenotypic_metadata.json'
+    to persist across experiments.
+    """
+    cache: dict[str, dict[str, str]] = {}
+    if cache_path and cache_path.exists():
+        try:
+            cache = json.loads(cache_path.read_text(encoding="utf-8"))
+        except Exception:
+            cache = {}
+
+    wanted = [bid for bid in biosample_ids if bid and bid not in cache]
+    if not wanted:
+        return cache
+
+    for start in range(0, len(wanted), 200):
+        batch = wanted[start : start + 200]
+        query = urllib.parse.urlencode({
+            "db": "biosample",
+            "id": ",".join(batch),
+            "retmode": "xml",
+        })
+        try:
+            xml_text = http_get_text(
+                f"https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi?{query}"
+            )
+        except Exception as exc:
+            sys.stderr.write(f"[warn] BioSample phenotype fetch failed for batch: {exc}\n")
+            continue
+        try:
+            root = ET.fromstring(xml_text)
+        except Exception:
+            continue
+        for bs in root.findall(".//BioSample"):
+            accession = bs.get("accession", "")
+            if not accession:
+                for attr in bs.findall(".//Id[@db='BioSample']"):
+                    accession = (attr.text or "").strip()
+                    break
+            if not accession:
+                continue
+            attrs: dict[str, str] = {}
+            for attr_el in bs.findall(".//Attribute"):
+                name = (attr_el.get("attribute_name") or attr_el.get("harmonized_name") or "").lower()
+                val = (attr_el.text or "").strip()
+                if name in _PHENOTYPE_ATTRS and val:
+                    attrs[name] = val
+            cache[accession] = attrs
+        time.sleep(0.34)
+
+    if cache_path:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        cache_path.write_text(json.dumps(cache, indent=2, sort_keys=True), encoding="utf-8")
     return cache
 
 
@@ -1015,12 +1087,22 @@ def prepare_from_ncbi(args: argparse.Namespace) -> int:
         print(f"catalog_only\tassemblies={len(selected_rows)}\tsource={args.source}")
         return 0
 
+    cache_base = args.data_cache_dir.resolve() if args.data_cache_dir else (out_dir / "downloads")
+    cache_base.mkdir(parents=True, exist_ok=True)
+
     taxonomy_cache = fetch_taxonomy_lineages(
         sorted({row.get("taxid", "") for row in selected_rows if row.get("taxid")}),
-        cache_path=out_dir / "taxonomy_cache.json",
+        cache_path=cache_base / "taxonomy_cache.json",
     )
 
-    cache_base = args.data_cache_dir.resolve() if args.data_cache_dir else (out_dir / "downloads")
+    # Download BioSample phenotypic metadata once into data_cache (reused across runs).
+    phenotype_cache_path = cache_base / "phenotypic_metadata.json"
+    biosample_ids = sorted({row.get("biosample", "") for row in selected_rows if row.get("biosample")})
+    if biosample_ids:
+        phenotype_meta = fetch_ncbi_biosample_phenotypes(biosample_ids, cache_path=phenotype_cache_path)
+        print(f"[phenotype] cached {len(phenotype_meta)} BioSample records -> {phenotype_cache_path}")
+    else:
+        phenotype_meta: dict[str, dict[str, str]] = {}
     refs_dir = cache_base / "refs"
     queries_dir = cache_base / "queries"
     refs_dir.mkdir(parents=True, exist_ok=True)
@@ -1295,6 +1377,16 @@ def prepare_from_ncbi(args: argparse.Namespace) -> int:
         ["query_asm", "role", "query_mode", "source_type", "source_accession", "source_url", "local_path", "species"],
     )
     write_public_resource_links(out_dir / "public_resource_links.tsv")
+
+    # Write a symlink / copy of the phenotypic metadata into the prepared dir for
+    # downstream analysis scripts that expect it alongside other manifests.
+    if phenotype_meta:
+        phenotype_out = out_dir / "phenotypic_metadata.json"
+        if not phenotype_out.exists():
+            phenotype_out.write_text(
+                json.dumps(phenotype_meta, indent=2, sort_keys=True), encoding="utf-8"
+            )
+
     with (out_dir / "prepare_summary.json").open("w", encoding="utf-8") as fh:
         json.dump(
             {
@@ -1312,6 +1404,7 @@ def prepare_from_ncbi(args: argparse.Namespace) -> int:
                 "max_query_downloads": args.max_query_downloads,
                 "allow_no_queries": bool(args.allow_no_queries),
                 "public_query_manifest": str(args.public_query_manifest) if args.public_query_manifest else "",
+                "phenotypic_records_cached": len(phenotype_meta),
             },
             fh,
             indent=2,
@@ -1744,6 +1837,8 @@ def run_mycosv(
     extra_args: list[str],
     *,
     query_list_override: Path | None = None,
+    threads: int = 8,
+    max_clade_genomes: int = 32,
 ) -> dict[str, str]:
     mycosv_dir = out_dir / "mycosv"
     mycosv_dir.mkdir(parents=True, exist_ok=True)
@@ -1759,14 +1854,51 @@ def run_mycosv(
             caller_args.extend(["--genome-size-hint", str(genome_size_hint)])
     query_list_path = (query_list_override.resolve() if query_list_override
                        else (prepared_dir / "query_list.txt").resolve())
-    cmd = [
-        str(binary_path.resolve()),
-        "--ref-list", str((prepared_dir / "ref_list.txt").resolve()),
-        "--query-list", str(query_list_path),
-        "--out-prefix", str(out_prefix.resolve()),
-        "--query-mode", mode,
-        *caller_args,
-    ]
+
+    # Use hierarchical routing when a hierarchy_manifest.tsv exists (real-data panels
+    # with multi-species refs benefit greatly from routing; without it the binary would
+    # try to load all refs into a flat graph and produce 0 calls across phyla).
+    hierarchy_manifest = prepared_dir / "hierarchy_manifest.tsv"
+    if hierarchy_manifest.exists() and (prepared_dir / "ref_list.txt").stat().st_size > 0:
+        idx_dir = mycosv_dir / "idx"
+        reg_dir = mycosv_dir / "reg"
+        idx_dir.mkdir(parents=True, exist_ok=True)
+        reg_dir.mkdir(parents=True, exist_ok=True)
+        # Build index only if not already present.
+        if not (idx_dir / "routing_manifest.tsv").exists():
+            build_cmd = [
+                str(binary_path.resolve()),
+                "--tol-hierarchical",
+                "--tol-build-index", str(hierarchy_manifest.resolve()),
+                "--tol-index-dir", str(idx_dir.resolve()),
+                "--tol-registry-dir", str(reg_dir.resolve()),
+                "--tol-multi-rank",
+                "--tol-base-graph-build",
+                "--tol-max-clade-genomes", str(max_clade_genomes),
+                "--tol-index-threads", str(threads),
+            ]
+            run_mycosv_command(build_cmd, cwd=ROOT)
+        cmd = [
+            str(binary_path.resolve()),
+            "--tol-hierarchical",
+            "--tol-index-dir", str(idx_dir.resolve()),
+            "--tol-registry-dir", str(reg_dir.resolve()),
+            "--ref-list", str((prepared_dir / "ref_list.txt").resolve()),
+            "--query-list", str(query_list_path),
+            "--out-prefix", str(out_prefix.resolve()),
+            "--query-mode", mode,
+            "--tol-index-threads", str(threads),
+            *caller_args,
+        ]
+    else:
+        cmd = [
+            str(binary_path.resolve()),
+            "--ref-list", str((prepared_dir / "ref_list.txt").resolve()),
+            "--query-list", str(query_list_path),
+            "--out-prefix", str(out_prefix.resolve()),
+            "--query-mode", mode,
+            *caller_args,
+        ]
     run_mycosv_command(cmd, cwd=ROOT)
     return {
         "vcf": str(out_prefix.with_suffix(".vcf")),
@@ -3123,7 +3255,7 @@ def build_parser() -> argparse.ArgumentParser:
     smr.add_argument("--max-clade-genomes", type=int, default=32)
     smr.add_argument("--binary-path", type=Path, default=DEFAULT_BIN)
     smr.add_argument("--force-rebuild", action="store_true")
-    smr.add_argument("--data-cache-dir", type=Path, default=None, help="Shared directory for downloaded FASTA files; reused across runs to avoid re-downloading.")
+    smr.add_argument("--data-cache-dir", type=Path, default=DEFAULT_DATA_CACHE, help="Shared directory for downloaded FASTA files; reused across runs to avoid re-downloading. Defaults to data_cache/ next to this script.")
 
     spp = sub.add_parser("prepare", help="Download a real fungal panel and write MycoSV-ready manifests.")
     spp.add_argument("--out-dir", type=Path, required=True)
@@ -3150,7 +3282,7 @@ def build_parser() -> argparse.ArgumentParser:
     spp.add_argument("--query-mode", default="assembly", choices=["assembly", "short-reads", "long-reads", "mixed"], help="Which query modes to prepare. 'mixed' produces assembly + short-reads + long-reads queries for each panel species. Read-mode queries come from ENA filereport lookups.")
     spp.add_argument("--read-accessions-per-species", type=int, default=0, help="For each panel species and each requested reads mode, download up to this many public ENA read runs. Set to 0 to disable reads-mode query generation.")
     spp.add_argument("--ena-max-rows-per-species", type=int, default=200, help="Maximum read_run rows to pull from ENA per species before filtering by platform.")
-    spp.add_argument("--data-cache-dir", type=Path, default=None, help="Shared directory for downloaded FASTA files; reused across runs to avoid re-downloading.")
+    spp.add_argument("--data-cache-dir", type=Path, default=DEFAULT_DATA_CACHE, help="Shared directory for downloaded FASTA files; reused across runs to avoid re-downloading. Defaults to data_cache/ next to this script.")
 
     sb = sub.add_parser("benchmark", help="Run MycoSV on a prepared real-data panel and compare to exact normalized truth/query-aware callsets.")
     sb.add_argument("--prepared-dir", type=Path, required=True)

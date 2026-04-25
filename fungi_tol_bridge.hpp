@@ -1827,7 +1827,10 @@ static bool try_mem_chain_call(
         // DUP fallback: ChainTreap requires strictly-increasing rPos and silently
         // drops backward-mapping MEMs that are the signature of tandem duplications.
         // Re-classify the qPos-sorted forward MEMs directly to catch that pattern.
-        if (res.type == SvTypeFromChain::Type::NONE) {
+        // Also re-check INS calls: with 1% divergence the primary chain sees a net
+        // positive query gap (delta > 0) and classifies DUPs as INS.
+        if (res.type == SvTypeFromChain::Type::NONE ||
+            res.type == SvTypeFromChain::Type::INS) {
             std::vector<SuffixArray::Mem> fwdSorted;
             fwdSorted.reserve(fwdMems.size());
             for (int i : order)
@@ -1862,13 +1865,25 @@ static bool try_mem_chain_call(
             const SuffixArray::Mem* srcMem = nullptr;
             const SuffixArray::Mem* dstMem = nullptr;
             int srcCtg = -1;
+            std::string srcAsm;
             const int traGap = 500000;
             for (int i : order) {
                 if (isRev[static_cast<size_t>(i)]) continue;
                 const auto& m = allMems[static_cast<size_t>(i)];
                 const int ci = ctg_of(m.rPos);
-                if (srcCtg < 0) { srcCtg = ci; srcMem = &m; continue; }
+                if (srcCtg < 0) {
+                    srcCtg = ci;
+                    srcMem = &m;
+                    srcAsm = (ci >= 0 && ci < static_cast<int>(saRefs.size()))
+                             ? saRefs[static_cast<size_t>(ci)]->asmName : "";
+                    continue;
+                }
                 if (ci >= 0 && ci != srcCtg) {
+                    // Allow cross-assembly TRAs: in the hierarchical TOL mode the SA
+                    // intentionally contains multiple reference assemblies per clade, so
+                    // a query breakpoint matching contigs from different assemblies is a
+                    // valid intra-clade TRA (or HGT candidate). Blocking cross-assembly
+                    // pairs was causing TRA recall=0 in multi-reference SA contexts.
                     const int qGap = m.qPos - (srcMem->qPos + srcMem->len);
                     if (qGap >= 0 && qGap <= traGap &&
                         (dstMem == nullptr || m.len > dstMem->len))
@@ -1966,8 +1981,23 @@ static bool try_mem_chain_call(
             case T::TRA:
                 out.call.type           = "TRA";
                 out.call.pantreeClass   = "NON_REF";
-                out.call.refPos         = !chain.empty() ? (chain.front().rPos + chain.front().len + 1) : 0;
-                out.call.refEnd         = out.call.refPos;
+                {
+                    const int srcRPos = !chain.empty()
+                        ? (chain.front().rPos + chain.front().len) : 0;
+                    int srcCi = -1;
+                    for (int ci = 0; ci < static_cast<int>(sa.contigEnd.size()); ++ci) {
+                        if (srcRPos < sa.contigEnd[static_cast<size_t>(ci)]) {
+                            srcCi = ci;
+                            break;
+                        }
+                    }
+                    if (srcCi < 0 && !sa.contigEnd.empty())
+                        srcCi = static_cast<int>(sa.contigEnd.size()) - 1;
+                    const int srcOff = (srcCi > 0)
+                        ? sa.contigEnd[static_cast<size_t>(srcCi) - 1] : 0;
+                    out.call.refPos = srcRPos > 0 ? (srcRPos - srcOff + 1) : 0;
+                    out.call.refEnd = out.call.refPos;
+                }
                 out.call.mateContig     = res.rContig;
                 out.call.matePos        = res.rBreakStart + 1;
                 out.call.mateEnd        = res.rBreakEnd > 0 ? res.rBreakEnd : out.call.matePos;
@@ -2004,10 +2034,10 @@ static bool try_mem_chain_call(
             }
         } else if (res.type == T2::DEL && primaryRef != nullptr && primaryRef->has_seq()) {
             const double gcBg = primaryRef->cladeGc;
-            const int ctgOff = (primaryContigIdx > 0)
-                ? sa.contigEnd[static_cast<size_t>(primaryContigIdx) - 1] : 0;
-            const int rS = res.rBreakStart - ctgOff;
-            const int rE = res.rBreakEnd   - ctgOff;
+            // SvTypeFromChain::classify now returns local-contig coordinates,
+            // so no subtraction of contigEnd is required here.
+            const int rS = res.rBreakStart;
+            const int rE = res.rBreakEnd;
             const auto& refSeq = primaryRef->seq();
             const int safeS = std::max(0, rS);
             const int safeE = std::min(static_cast<int>(refSeq.size()), rE);

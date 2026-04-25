@@ -25,6 +25,13 @@ ELEMENT_CLASS_ALIASES = {
 }
 TE_CLASSES = {"TE", "LTR_GYPSY", "LTR_COPIA", "LINE", "SINE", "DNA_TIR", "HELITRON", "MITE", "RIP", "STARSHIP", "HGT", "REPEAT", "TE_LTR", "TE_TIR", "TE_LINE", "TE_SINE"}
 
+# MGE subtypes for Mobile Genetic Element breakdown.
+# Separated from the TE_CLASSES superset to allow independent MGE reporting.
+MGE_INTEGRATIVE = {"STARSHIP", "HGT"}    # integrative island-type MGEs
+MGE_TRANSPOSABLE = {"TE", "LTR_GYPSY", "LTR_COPIA", "DNA_TIR", "HELITRON", "MITE",
+                    "TE_LTR", "TE_TIR", "LINE", "SINE"}
+MGE_REPEAT_BASED = {"REPEAT", "RIP"}     # repeat/RIP elements (not strictly MGE)
+
 # Curated functional exemplars used to make the report more actionable.
 # These are short, concrete analogies that tie a structural signal to a real-data
 # biological pattern reviewers will recognize: expression changes, chromatin
@@ -90,6 +97,18 @@ FUNCTIONAL_EXAMPLES: list[dict[str, object]] = [
         'real_data_signal': 'A nearby gene already shows a significant expression shift, so the structural event becomes a direct mechanistic candidate rather than only a novelty hypothesis.',
         'why_relevant': 'Best fit when the caller and expression data agree on a local TE-linked or ancestry-shifted structural event near a significantly changed gene.',
         'suggested_readout': 'Validate the breakpoint and quantify allele- or condition-specific expression around the affected gene set.',
+    },
+    {
+        'name': 'inter-phylum HGT translocation breakpoint',
+        'match_ec': {'HGT', 'STARSHIP'},
+        'match_candidate_types': {'hgt_candidate'},
+        'match_svtypes': {'TRA', 'OFF_REF'},
+        'priority': 7,
+        'evidence_axis': 'horizontal_gene_transfer',
+        'system': 'cross-phylum HGT translocation (Rhizophagus / Puccinia accessory island analogy)',
+        'real_data_signal': 'Translocation breakpoints with HGT-class sequence and low same-clade overlap indicate donor-recipient boundaries of an horizontally transferred genomic island.',
+        'why_relevant': 'Highest-priority hit when a TRA or off-reference segment is both phylogenetically novel within its clade and carried in a sequence class (HGT / Starship) associated with lateral transfer.',
+        'suggested_readout': 'Confirm breakpoint with long reads, survey presence/absence across species panel, BLAST cargo genes against fungal + prokaryotic databases, and test expression of cargo under relevant conditions.',
     },
 ]
 
@@ -560,6 +579,29 @@ def expression_for_candidate(
 
 
 
+def is_hgt_candidate(ec: str, svtype: str, annot: str) -> bool:
+    """True when the call has hallmarks of horizontal gene transfer:
+    HGT element class OR a translocation with cross-clade novelty signal."""
+    if ec == 'HGT':
+        return True
+    if svtype == 'TRA' and annot in {'NOVEL', 'NOVEL_WEAK'}:
+        return True
+    if svtype == 'OFF_REF' and annot in {'NOVEL', 'NOVEL_WEAK'} and ec in MGE_INTEGRATIVE:
+        return True
+    return False
+
+
+def mge_subtype(ec: str) -> str:
+    """Coarser MGE category for reporting: integrative, transposable, or repeat."""
+    if ec in MGE_INTEGRATIVE:
+        return 'integrative'
+    if ec in MGE_TRANSPOSABLE:
+        return 'transposable'
+    if ec in MGE_REPEAT_BASED:
+        return 'repeat'
+    return 'none'
+
+
 def classify_candidate(
     svtype: str,
     ec: str,
@@ -569,9 +611,16 @@ def classify_candidate(
 ) -> tuple[str, int, str]:
     novelty = annot in NOVEL_TIERS or svtype == 'OFF_REF'
     te_like = ec in TE_CLASSES and ec != 'NONE'
+    hgt = is_hgt_candidate(ec, svtype, annot)
     ancestry_switch = bool(anc and (len(anc.get('clades', set())) > 1 or anc.get('has_breakpoints')))
     expr_supported = bool(expr and expr.get('supported'))
 
+    # HGT candidates rank highest: cross-clade or Starship/integrative-island events
+    # that are novel relative to the same-clade references.
+    if hgt and ancestry_switch:
+        return 'hgt_candidate', 7, 'Cross-clade TRA or HGT-class insertion with multi-clade ancestry — strong HGT signal.'
+    if hgt:
+        return 'hgt_candidate', 6, 'HGT element class or cross-clade translocation with novel sequence tier.'
     if expr_supported and te_like and ancestry_switch:
         return 'mosaic_te_expression_link', 6, 'TE-associated ancestry switch near a gene with direct expression support.'
     if expr_supported and te_like:
@@ -743,6 +792,8 @@ def main() -> int:
             'architecture': architecture,
             'svtype': svtype,
             'element_class': raw_ec,
+            'mge_subtype': mge_subtype(ec),
+            'hgt_flag': 'yes' if is_hgt_candidate(ec, svtype, annot) else 'no',
             'novelty': annot,
             'pos': int(pos),
             'end': int(end),
@@ -775,8 +826,8 @@ def main() -> int:
     with args.out_tsv.open('w', newline='') as fh:
         fieldnames = [
             'priority', 'candidate_type', 'phylum', 'query_asm', 'query_contig', 'scenario', 'lifestyle',
-            'architecture', 'svtype', 'element_class', 'novelty', 'pos', 'end', 'ref_target',
-            'alignment_mode', 'ancestral_clades', 'ancestral_ranks', 'ancestral_breakpoints',
+            'architecture', 'svtype', 'element_class', 'mge_subtype', 'hgt_flag', 'novelty', 'pos', 'end',
+            'ref_target', 'alignment_mode', 'ancestral_clades', 'ancestral_ranks', 'ancestral_breakpoints',
             'ancestral_segment_bp', 'expression_supported', 'expression_gene', 'expression_distance_bp',
             'expression_log2_fc', 'expression_padj', 'expression_condition', 'rationale',
             'functional_example', 'evidence_axis', 'example_system',
@@ -792,6 +843,28 @@ def main() -> int:
     by_axis = Counter(r['evidence_axis'] for r in rows)
     by_expr = Counter(r['expression_supported'] for r in rows)
     example_names = Counter(r['functional_example'] for r in rows)
+
+    # SV phylogeny: count SVs per phylum / scenario / lifestyle for phylogenetic landscape.
+    phylo_dist: dict[str, dict[str, int]] = {}
+    for r in rows:
+        ph = str(r.get('phylum', '.') or '.')
+        sc = str(r.get('scenario', '.') or '.')
+        sv = str(r.get('svtype', '.') or '.')
+        phylo_dist.setdefault(ph, {})
+        phylo_dist[ph][sv] = phylo_dist[ph].get(sv, 0) + 1
+        phylo_dist[ph].setdefault('_scenario', sc)
+
+    # MGE breakdown: separate integrative islands (HGT/Starship), transposable elements,
+    # and repeat-based elements for downstream MGE-specific reporting.
+    mge_breakdown: dict[str, int] = {'integrative': 0, 'transposable': 0, 'repeat': 0, 'none': 0}
+    for r in rows:
+        mge_breakdown[mge_subtype(str(r.get('element_class', 'NONE')))] += 1
+
+    # HGT-specific summary: candidates classified as hgt_candidate with TRA or OFF_REF type.
+    hgt_rows = [r for r in rows if r.get('candidate_type') == 'hgt_candidate']
+    hgt_by_svtype = dict(Counter(str(r.get('svtype')) for r in hgt_rows))
+    hgt_by_phylum = dict(Counter(str(r.get('phylum')) for r in hgt_rows))
+
     with args.summary_json.open('w') as fh:
         json.dump({
             'phylum': args.phylum,
@@ -802,6 +875,13 @@ def main() -> int:
             'by_evidence_axis': dict(by_axis),
             'by_expression_support': dict(by_expr),
             'functional_examples': dict(example_names),
+            'phylo_sv_distribution': phylo_dist,
+            'mge_breakdown': mge_breakdown,
+            'hgt_summary': {
+                'count': len(hgt_rows),
+                'by_svtype': hgt_by_svtype,
+                'by_phylum': hgt_by_phylum,
+            },
             'top_priorities': rows[:10],
         }, fh, indent=2, sort_keys=True)
     return 0

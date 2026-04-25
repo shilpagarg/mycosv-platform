@@ -917,12 +917,32 @@ select_mem_chain_refs(const std::string& contigName,
                       query_input::QueryMode mode,
                       size_t maxShortlist = 12) {
     std::vector<const RefContigInfo*> out;
-    auto it = refIdx.find(strip_sv_suffix(contigName));
+    const std::string baseName = strip_sv_suffix(contigName);
+    std::unordered_set<std::string> matchingAsms;
+    auto it = refIdx.find(baseName);
     if (it != refIdx.end()) {
         out.reserve(it->second.size());
         for (const auto& cand : it->second)
-            if (!cand.sequence.empty()) out.push_back(&cand);
-        if (!out.empty()) return out;
+            if (!cand.sequence.empty()) {
+                out.push_back(&cand);
+                matchingAsms.insert(cand.asmName);
+            }
+    }
+
+    // Augment shortlist with the other contigs of each assembly that contains
+    // a same-named contig. Required for inter-contig TRA detection: with only
+    // same-named contigs in the SA, MEM chains never see the cross-contig
+    // anchor needed by SvTypeFromChain to emit a TRA.
+    if (!matchingAsms.empty()) {
+        for (const auto& bucket : refIdx) {
+            if (bucket.first == baseName) continue;
+            for (const auto& cand : bucket.second) {
+                if (cand.sequence.empty()) continue;
+                if (matchingAsms.count(cand.asmName))
+                    out.push_back(&cand);
+            }
+        }
+        return out;
     }
 
     const int overlapK = reads_mode_overlap_k(mode, seq.size());
@@ -1064,12 +1084,19 @@ mem_chain_sv_calls(const std::string& qAsm,
             continue;
         }
         VariantCallBridge cachedChainCall;
-        if (prefilterBestRef != nullptr &&
+        const bool cachedSuccess = prefilterBestRef != nullptr &&
             prefilterBestOverlap >= 0.01 &&
             try_mem_chain_call_single_ref_cached(
-                qAsm, contigName, seq, prefilterBestRef, memCache, eff_fo, cachedChainCall)) {
-            out.push_back(std::move(cachedChainCall));
-            continue;
+                qAsm, contigName, seq, prefilterBestRef, memCache, eff_fo, cachedChainCall);
+        if (cachedSuccess) {
+            out.push_back(cachedChainCall);
+            // For simple indel/duplication calls skip the more expensive multi-ref
+            // chain path. For TRA/INV the single-ref alignment cannot see an
+            // inter-contig breakpoint, so fall through and also try the multi-ref
+            // chain; select_best_call_per_contig will pick the better result.
+            const bool complexRearr = (cachedChainCall.type == "TRA" ||
+                                       cachedChainCall.type == "INV");
+            if (!complexRearr) continue;
         }
 
         const auto shortlist = select_mem_chain_refs(
@@ -1173,6 +1200,31 @@ static bool try_mem_chain_call_single_ref_cached(
             return out;
 
         auto res = tol::SvTypeFromChain::classify(chain, chainRev, sa, fo.minSvLen);
+        // DUP fallback: ChainTreap requires strictly-increasing rPos and silently
+        // drops backward-mapping MEMs that are the signature of tandem duplications.
+        // With diverged genomes the primary chain classifies DUPs as INS.
+        if (res.type == tol::SvTypeFromChain::Type::NONE ||
+            res.type == tol::SvTypeFromChain::Type::INS) {
+            std::vector<tol::SuffixArray::Mem> fwdSorted;
+            fwdSorted.reserve(fwdMems.size());
+            for (int i : order)
+                if (!isRev[static_cast<size_t>(i)])
+                    fwdSorted.push_back(allMems[static_cast<size_t>(i)]);
+            if (fwdSorted.size() >= 2) {
+                auto dupRes = tol::SvTypeFromChain::classify(
+                    fwdSorted, std::vector<bool>(fwdSorted.size(), false),
+                    sa, fo.minSvLen);
+                if (dupRes.type == tol::SvTypeFromChain::Type::DUP) {
+                    double dupScore = 0.0;
+                    for (const auto& m : fwdSorted) dupScore += static_cast<double>(m.len);
+                    if (dupScore >= fo.minBlockScore) {
+                        res      = dupRes;
+                        chain    = fwdSorted;
+                        chainRev.assign(fwdSorted.size(), false);
+                    }
+                }
+            }
+        }
         if (res.type == tol::SvTypeFromChain::Type::NONE) return out;
 
         out.call.qAsm = qAsm;
@@ -1227,8 +1279,23 @@ static bool try_mem_chain_call_single_ref_cached(
             case T::TRA:
                 out.call.type = "TRA";
                 out.call.pantreeClass = "NON_REF";
-                out.call.refPos = !chain.empty() ? (chain.front().rPos + chain.front().len + 1) : 0;
-                out.call.refEnd = out.call.refPos;
+                {
+                    const int srcRPos = !chain.empty()
+                        ? (chain.front().rPos + chain.front().len) : 0;
+                    int srcCi = -1;
+                    for (int ci = 0; ci < static_cast<int>(sa.contigEnd.size()); ++ci) {
+                        if (srcRPos < sa.contigEnd[static_cast<size_t>(ci)]) {
+                            srcCi = ci;
+                            break;
+                        }
+                    }
+                    if (srcCi < 0 && !sa.contigEnd.empty())
+                        srcCi = static_cast<int>(sa.contigEnd.size()) - 1;
+                    const int srcOff = (srcCi > 0)
+                        ? sa.contigEnd[static_cast<size_t>(srcCi) - 1] : 0;
+                    out.call.refPos = srcRPos > 0 ? (srcRPos - srcOff + 1) : 0;
+                    out.call.refEnd = out.call.refPos;
+                }
                 out.call.mateContig = res.rContig.empty() ? primaryRef.contig : res.rContig;
                 out.call.matePos = res.rBreakStart + 1;
                 out.call.mateEnd = res.rBreakEnd > 0 ? res.rBreakEnd : out.call.matePos;
@@ -1720,15 +1787,24 @@ static tol::EvidenceObservation make_evidence_observation(
         ref += overlap * 2.2;
     } else {
         if (overlap < 0.02) ref += 1.5;
-        if ((call.type == "INV" || call.type == "TRA" || call.type == "DUP") && overlap < 0.05)
+        // TRA with strong chain evidence (high blockScore + anchors) inherently has
+        // low reference overlap because the breakpoint spans two different reference
+        // contigs — penalising on overlap alone would suppress all inter-contig TRAs.
+        const bool strongChainTra = (call.type == "TRA" &&
+                                     call.blockScore >= 6.0 &&
+                                     call.anchors >= 2);
+        if ((call.type == "INV" || call.type == "DUP" ||
+             (call.type == "TRA" && !strongChainTra)) && overlap < 0.05)
             ref += 0.75;
-        if ((call.type == "INV" || call.type == "TRA" || call.type == "DUP") && overlap < 0.10) {
+        if ((call.type == "INV" || call.type == "DUP" ||
+             (call.type == "TRA" && !strongChainTra)) && overlap < 0.10) {
             alt -= 2.5;
             ref += 5.0 + (0.10 - overlap) * 20.0;
-            if (call.type == "TRA" && call.mateContig.empty()) {
-                alt -= 1.0;
-                ref += 2.0;
-            }
+        }
+        if (call.type == "TRA" && !strongChainTra &&
+            call.mateContig.empty() && overlap < 0.10) {
+            alt -= 1.0;
+            ref += 2.0;
         }
         if (call.alignmentMode.find("mem_chain") != std::string::npos) alt += 0.45;
         if (call.alignmentMode.find("simple_length_fallback") != std::string::npos) alt += 0.25;
@@ -1799,7 +1875,12 @@ static double candidate_priority_score(const VariantCallBridge& call,
     score += std::max(-6.0, std::min(12.0, fused.logOddsAlt)) * 12.0;
     score += std::min(8.0, fused.effectiveDepth) * 2.0;
     score += std::min<size_t>(4, fused.layersUsed) * 4.0;
-    if (fused.posteriorAlt < 0.35) score -= 120.0;
+    // Strong-evidence TRA calls have inherently low posterior because reference
+    // overlap is near zero for inter-contig events; skip the penalty for them.
+    const bool strongChainTra2 = (call.type == "TRA" &&
+                                   call.blockScore >= 6.0 &&
+                                   call.anchors >= 2);
+    if (fused.posteriorAlt < 0.35 && !strongChainTra2) score -= 120.0;
     if (fused.supports_variant(0.90)) score += 30.0;
 
     if (call.alignmentMode.find("mem_chain") != std::string::npos) score += 8.0;
@@ -1829,13 +1910,16 @@ static double candidate_priority_score(const VariantCallBridge& call,
             score += namedOverlap * 60.0;
         }
 
-        if (largeRearr && deltaLooksLikeIndel && namedOverlap >= 0.35) {
+        // Only apply the "large rearrangement that looks like indel" suppression for
+        // DUP (which should match by length).  INV legitimately spans large fractions
+        // of repeat-rich pathogen contigs, so applying this penalty causes false
+        // negatives in two_speed_pathogen_extreme and similar scenarios.
+        if (call.type == "DUP" && deltaLooksLikeIndel && namedOverlap >= 0.35) {
             score -= 90.0;
             if (!sameNamedRef) score -= 50.0;
         }
-        if ((call.type == "INV" || call.type == "TRA") && std::abs(call.svlen) > static_cast<int>(qSeq.size() * 0.60)) {
-            score -= 35.0;
-        }
+        // Do not penalise INV for spanning >60% of the query contig: large whole-
+        // contig inversions are common in TE-rich fungal pathogens.
     } else if (mode != query_input::QueryMode::ASSEMBLY) {
         // Reads-mode pseudo-contigs usually have synthetic names (sr_unitig*,
         // lr_pc*), so name-based arbitration is unavailable. In that case,
@@ -1847,7 +1931,8 @@ static double candidate_priority_score(const VariantCallBridge& call,
         if (call.type == "TRA" && !call.mateContig.empty() && overlap >= 0.30) score += 115.0;
         if (largeRearr && overlap < 0.02) score -= 180.0;
         if (largeRearr && overlap < 0.05) score -= 70.0;
-        if (call.type == "TRA" && overlap < 0.05 && call.mateContig.empty()) score -= 120.0;
+        if (call.type == "TRA" && overlap < 0.05 &&
+            call.mateContig.empty() && !strongChainTra2) score -= 120.0;
         if ((call.type == "INV" || call.type == "TRA") &&
             std::abs(call.svlen) > static_cast<int>(qSeq.size() * 0.60) &&
             overlap < 0.05) {

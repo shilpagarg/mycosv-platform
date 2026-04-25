@@ -28,9 +28,12 @@ __pycache__/
 # 🔹 Environment / config
 .env
 .venv/
+.claude*/
 env/
 
 # 🔹 OS / editor junk
 .DS_Store
 Thumbs.db
 .vscode/
+.claude/
+.codex*/

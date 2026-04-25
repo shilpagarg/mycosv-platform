@@ -1591,13 +1591,18 @@ struct SvTypeFromChain {
         // contig. The old code incorrectly reported the source contig again as
         // CHR2/POS2, which made valid inter-contig chains look like broken
         // self-translocations in VCF output.
+        // rBreakStart/rBreakEnd are returned in *local contig coordinates*
+        // (mate-contig space) so VCF POS2 is interpretable as a position on
+        // the named CHR2 contig — not the concatenated suffix-array offset.
         if (c0 >= 0 && cN1 >= 0 && c0 != cN1) {
             res.type        = Type::TRA;
             res.qBreakStart = chain[0].qPos + chain[0].len;
             res.qBreakEnd   = res.qBreakStart;
-            res.rBreakStart = chain[static_cast<size_t>(N-1)].rPos;
+            const int mateOff = (cN1 > 0)
+                ? sa.contigEnd[static_cast<size_t>(cN1) - 1] : 0;
+            res.rBreakStart = chain[static_cast<size_t>(N-1)].rPos - mateOff;
             res.rBreakEnd   = chain[static_cast<size_t>(N-1)].rPos +
-                              chain[static_cast<size_t>(N-1)].len;
+                              chain[static_cast<size_t>(N-1)].len - mateOff;
             res.rContig     = sa.contigName[static_cast<size_t>(cN1)];
             res.svLen       = std::max(0, chain[static_cast<size_t>(N-1)].qPos -
                                           res.qBreakStart);
@@ -1613,12 +1618,14 @@ struct SvTypeFromChain {
             int start = chain[0].qPos;
             int end   = chain[static_cast<size_t>(N-1)].qPos +
                         chain[static_cast<size_t>(N-1)].len;
+            const int ctgOff = (c0 > 0)
+                ? sa.contigEnd[static_cast<size_t>(c0) - 1] : 0;
             res.type        = Type::INV;
             res.qBreakStart = start;
             res.qBreakEnd   = end - 1;  // 0-based inclusive; caller adds +1 for 1-based VCF
-            res.rBreakStart = chain[0].rPos;
+            res.rBreakStart = chain[0].rPos - ctgOff;
             res.rBreakEnd   = chain[static_cast<size_t>(N-1)].rPos +
-                              chain[static_cast<size_t>(N-1)].len;
+                              chain[static_cast<size_t>(N-1)].len - ctgOff;
             res.svLen       = end - start;
             if (res.svLen < minSvLen) return Result{};
             if (c0 >= 0) res.rContig = sa.contigName[static_cast<size_t>(c0)];
@@ -1639,20 +1646,44 @@ struct SvTypeFromChain {
 
         // DUP: reference positions overlap (rGap < 0)
         if (rGap < -minSvLen) {
+            const int ctgOff = (c0 > 0)
+                ? sa.contigEnd[static_cast<size_t>(c0) - 1] : 0;
             res.type        = Type::DUP;
             res.qBreakStart = chain[0].qPos;
             res.qBreakEnd   = chain[static_cast<size_t>(N-1)].qPos +
                               chain[static_cast<size_t>(N-1)].len - 1;  // 0-based inclusive
-            res.rBreakStart = chain[0].rPos;
+            res.rBreakStart = chain[0].rPos - ctgOff;
             res.rBreakEnd   = res.rBreakStart + (-rGap);
             res.svLen       = -rGap;
             if (c0 >= 0) res.rContig = sa.contigName[static_cast<size_t>(c0)];
             return res;
         }
 
-        // INS / DEL
-        res.qBreakStart = chain[0].qPos + chain[0].len;
-        res.rBreakStart = chain[0].rPos + chain[0].len;
+        // INS / DEL: find the consecutive MEM pair with the dominant local gap
+        // mismatch — that is where the SV actually sits, not necessarily chain[0].
+        // With 1% genome divergence MEM chains have many short anchors so using
+        // chain[0] always places the breakpoint near contig start (wrong).
+        {
+            int bestBreakIdx = 0;
+            int bestLocalAbsDelta = 0;
+            for (int i = 0; i + 1 < N; ++i) {
+                const int lqg = chain[static_cast<size_t>(i+1)].qPos -
+                                (chain[static_cast<size_t>(i)].qPos + chain[static_cast<size_t>(i)].len);
+                const int lrg = chain[static_cast<size_t>(i+1)].rPos -
+                                (chain[static_cast<size_t>(i)].rPos + chain[static_cast<size_t>(i)].len);
+                const int ld = std::abs(lqg - lrg);
+                if (ld > bestLocalAbsDelta) { bestLocalAbsDelta = ld; bestBreakIdx = i; }
+            }
+            res.qBreakStart = chain[static_cast<size_t>(bestBreakIdx)].qPos +
+                              chain[static_cast<size_t>(bestBreakIdx)].len;
+            const int breakRPos =
+                chain[static_cast<size_t>(bestBreakIdx)].rPos +
+                chain[static_cast<size_t>(bestBreakIdx)].len;
+            const int breakCi   = contig_of(breakRPos > 0 ? breakRPos - 1 : 0);
+            const int ctgOff    = (breakCi > 0)
+                ? sa.contigEnd[static_cast<size_t>(breakCi) - 1] : 0;
+            res.rBreakStart = breakRPos - ctgOff;
+        }
         res.svLen       = std::abs(delta);
         if (delta > 0) {
             res.type = Type::INS;
