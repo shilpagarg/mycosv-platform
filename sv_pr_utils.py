@@ -75,6 +75,33 @@ def wilson_ci(k: int, n: int, z: float = 1.96) -> tuple[float, float]:
     return max(0.0, centre - half), min(1.0, centre + half)
 
 
+_ASM_EXT_STRIP = (
+    ".fasta.gz", ".fastq.gz", ".fna.gz", ".fa.gz", ".fq.gz",
+    ".fasta", ".fastq", ".fna", ".fa", ".fq",
+)
+
+
+def _asm_aliases(asm: str) -> list[str]:
+    """Return canonical alias forms for a query-asm name.
+
+    The C++ binary derives QASM from the input file path's stem, which strips
+    one extension (".fa" but not ".fa.gz"). Metadata TSVs sometimes carry the
+    bare name and sometimes the full filename. Try the bare name and several
+    extension-stripped variants so per-scenario lookups don't silently fall
+    back to "unknown" purely because of a naming convention mismatch.
+    """
+    out = [asm]
+    seen = {asm}
+    lower = asm.lower()
+    for ext in _ASM_EXT_STRIP:
+        if lower.endswith(ext):
+            stripped = asm[: -len(ext)]
+            if stripped and stripped not in seen:
+                seen.add(stripped)
+                out.append(stripped)
+    return out
+
+
 def load_query_asm_maps(pred_hits_tsv: Path | None,
                         query_meta_tsv: Path | None
                         ) -> tuple[dict[str, str], dict[tuple[str, str], dict[str, str]], dict[str, str]]:
@@ -99,8 +126,14 @@ def load_query_asm_maps(pred_hits_tsv: Path | None,
         with query_meta_tsv.open() as fh:
             for row in csv.DictReader(fh, delimiter="\t"):
                 asm = row.get("query_asm", "")
-                if asm:
-                    asm_to_scenario[asm] = row.get("scenario", "unknown")
+                scenario = row.get("scenario", "unknown")
+                if not asm:
+                    continue
+                # Index every alias so a binary-emitted QASM that includes a
+                # file extension (e.g. "core_asm3.fa") still resolves to the
+                # bare-name scenario row in query_metadata.tsv.
+                for alias in _asm_aliases(asm):
+                    asm_to_scenario.setdefault(alias, scenario)
 
     return contig_to_asm, call_context, asm_to_scenario
 
@@ -132,7 +165,14 @@ def parse_vcf_records(path: Path,
             pred_ctx = call_context.get((qasm, raw_chrom), {}) if is_pred and qasm else {}
             scenario = info.get("SCENARIO", "")
             if is_pred and not scenario and qasm:
-                scenario = asm_to_scenario.get(qasm, "")
+                # Try the qasm verbatim, then stem variants — the binary's
+                # QASM may carry a file extension while query_metadata.tsv
+                # is keyed on the bare asm name.
+                for alias in _asm_aliases(qasm):
+                    hit = asm_to_scenario.get(alias)
+                    if hit:
+                        scenario = hit
+                        break
             svtype = info.get("SVTYPE", "?")
             pos_i = int(fields[1])
             tol_bp = int(info["TOL_BP"]) if "TOL_BP" in info else DEFAULT_TOL_BP.get(svtype, 2500)
@@ -480,6 +520,68 @@ def score_pr(truth_vcf: Path,
     summary["fp_records"] = fp_records
     summary["fn_records"] = fn_records
     return summary
+
+
+def expand_to_multisample_vcf(src_vcf: Path, dst_vcf: Path) -> Path:
+    """Rewrite a single-sample MycoSV VCF as a multi-sample one.
+
+    The MycoSV binary emits one SAMPLE column with each row's per-query
+    provenance buried in the QASM (pred) or QUERY_ASM (truth) INFO field.
+    For multi-query benchmarks the user-facing expectation is one column
+    per query asm with GT 1/1 only for the owning sample. This walks the
+    file twice (cheap — VCFs here are small): pass 1 to enumerate sample
+    names, pass 2 to rewrite rows. Returns the destination path.
+    """
+    samples: list[str] = []
+    seen: set[str] = set()
+    with src_vcf.open(encoding="utf-8") as fh:
+        for line in fh:
+            if line.startswith("#") or not line.strip():
+                continue
+            cols = line.rstrip("\n").split("\t")
+            if len(cols) < 8:
+                continue
+            info = parse_info_field(cols[7])
+            asm = info.get("QASM") or info.get("QUERY_ASM") or ""
+            if asm and asm not in seen:
+                seen.add(asm)
+                samples.append(asm)
+    if not samples:
+        # Nothing to expand — copy through as-is.
+        dst_vcf.write_text(src_vcf.read_text(encoding="utf-8"), encoding="utf-8")
+        return dst_vcf
+    sample_index = {asm: i for i, asm in enumerate(samples)}
+    dst_vcf.parent.mkdir(parents=True, exist_ok=True)
+    with src_vcf.open(encoding="utf-8") as fh, dst_vcf.open("w", encoding="utf-8") as out:
+        for line in fh:
+            if line.startswith("##"):
+                out.write(line)
+                continue
+            if line.startswith("#CHROM"):
+                fixed = "\t".join([
+                    "#CHROM", "POS", "ID", "REF", "ALT",
+                    "QUAL", "FILTER", "INFO", "FORMAT",
+                ] + samples)
+                out.write(fixed + "\n")
+                continue
+            if not line.strip():
+                continue
+            cols = line.rstrip("\n").split("\t")
+            if len(cols) < 9:
+                out.write(line)
+                continue
+            info = parse_info_field(cols[7])
+            asm = info.get("QASM") or info.get("QUERY_ASM") or ""
+            owner = sample_index.get(asm, -1)
+            # Preserve FORMAT but force GT to be the only key so the
+            # multi-sample expansion is unambiguous; this matches the
+            # truth VCF schema produced by test_amf.write_truth_vcf.
+            cols[8] = "GT"
+            gts = ["0/0"] * len(samples)
+            if 0 <= owner < len(gts):
+                gts[owner] = "1/1"
+            out.write("\t".join(cols[:9] + gts) + "\n")
+    return dst_vcf
 
 
 def _write_tsv(path: Path, fieldnames: list[str], rows: list[dict[str, Any]]) -> None:

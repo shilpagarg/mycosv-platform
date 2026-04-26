@@ -65,6 +65,7 @@ import argparse
 import base64
 import io
 import math
+import sys
 import textwrap
 from dataclasses import dataclass
 from pathlib import Path
@@ -86,8 +87,21 @@ def read_table(path: Optional[str]) -> Optional[pd.DataFrame]:
     p = Path(path)
     if not p.exists():
         raise FileNotFoundError(f"Input file not found: {p}")
+    if p.stat().st_size == 0:
+        return pd.DataFrame()
     sep = "\t" if p.suffix.lower() in {".tsv", ".txt"} else ","
-    return pd.read_csv(p, sep=sep)
+    # Tolerate ragged rows that slip through upstream merging — pandas' default
+    # C parser bails on the first row whose field count differs from the
+    # header. Falling back to the python engine with on_bad_lines='skip'
+    # drops only the offending rows instead of aborting the whole report.
+    try:
+        return pd.read_csv(p, sep=sep)
+    except pd.errors.ParserError:
+        sys.stderr.write(
+            f"[read_table] Falling back to lenient parse for {p} "
+            "(skipping malformed rows)\n"
+        )
+        return pd.read_csv(p, sep=sep, engine="python", on_bad_lines="skip")
 
 
 COLUMN_ALIASES: Dict[str, Sequence[str]] = {

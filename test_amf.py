@@ -586,8 +586,27 @@ _LR_PLATFORM_PRESETS: dict[str, dict[str, int | float]] = {
 
 
 def write_truth_vcf(path: Path, rows: list[list[str]]) -> None:
-    """Write VCF4.3 truth file from truth TSV rows (15 fields each)."""
+    """Write VCF4.3 truth file from truth TSV rows (15 fields each).
+
+    Emits a *multi-sample* VCF: one column per distinct query assembly that
+    contributed truth events. Each row has GT 1/1 only for the query asm that
+    introduced the SV and 0/0 elsewhere. The QUERY_ASM info field is
+    preserved for downstream readers (sv_pr_utils.parse_vcf_records pulls
+    qasm from INFO, not from sample columns), so scoring keeps working.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
+    samples: list[str] = []
+    seen: set[str] = set()
+    for row in rows:
+        if not row:
+            continue
+        asm = row[0]
+        if asm and asm not in seen:
+            seen.add(asm)
+            samples.append(asm)
+    if not samples:
+        samples = ["SAMPLE"]
+    sample_index = {asm: i for i, asm in enumerate(samples)}
     with open(path, "w") as out:
         out.write("##fileformat=VCFv4.3\n##source=test_amf_simulator\n")
         for tag, desc in [
@@ -601,7 +620,9 @@ def write_truth_vcf(path: Path, rows: list[list[str]]) -> None:
             t = "Integer" if tag in {"SVLEN","END","POS2","END2"} else "String"
             n = "1"
             out.write(f'##INFO=<ID={tag},Number={n},Type={t},Description="{desc}">\n')
-        out.write("#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tSAMPLE\n")
+        out.write('##FORMAT=<ID=GT,Number=1,Type=String,Description="Genotype">\n')
+        out.write("#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\t"
+                  + "\t".join(samples) + "\n")
         for idx, row in enumerate(rows, start=1):
             if len(row) < 15:
                 row = list(row) + [".", "0", "0", "0"][: 15 - len(row)]
@@ -622,8 +643,12 @@ def write_truth_vcf(path: Path, rows: list[list[str]]) -> None:
                 mp = max(1, int(mate_pos))
                 me = max(mp, int(mate_end))
                 info += f";CHR2={mc};POS2={mp};END2={me}"
+            owner = sample_index.get(asm, -1)
+            gts = ["0/0"] * len(samples)
+            if 0 <= owner < len(gts):
+                gts[owner] = "1/1"
             out.write(f"{chrom}\t{pos_i}\ttruth{idx}\tN\t<{svtype}>\t60\tPASS"
-                      f"\t{info}\tGT\t1/1\n")
+                      f"\t{info}\tGT\t" + "\t".join(gts) + "\n")
 
 
 # ── main ──────────────────────────────────────────────────────────────────

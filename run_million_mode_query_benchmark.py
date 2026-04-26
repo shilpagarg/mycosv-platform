@@ -13,7 +13,7 @@ import time
 from pathlib import Path
 
 from mycosv_cli_runner import run_mycosv_command
-from sv_pr_utils import score_pr, write_pr_artifacts
+from sv_pr_utils import expand_to_multisample_vcf, score_pr, write_pr_artifacts
 
 
 ROOT = Path(__file__).resolve().parent
@@ -384,6 +384,18 @@ def main() -> int:
             q_start = time.perf_counter()
             query_run = run_mycosv_command(query_cmd, cwd=ROOT)
             query_seconds = time.perf_counter() - q_start
+
+        # The C++ binary emits calls.vcf as a single-sample VCF with per-query
+        # provenance only in INFO (QASM=). Produce a sibling multi-sample VCF
+        # that materializes one column per query asm so downstream tools (and
+        # spot-checks) see all queries explicitly.
+        try:
+            expand_to_multisample_vcf(
+                out_prefix.with_suffix(".vcf"),
+                out_prefix.parent / (out_prefix.name + ".multisample.vcf"),
+            )
+        except Exception as exc:
+            sys.stderr.write(f"[multisample-vcf] expand failed: {exc}\n")
 
         summary = score_pr(
             sim_dir / "truth" / "all_queries.truth.ref.vcf",

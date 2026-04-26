@@ -289,20 +289,44 @@ if [[ "$EXPERIMENT_TYPE" == "all" || "$EXPERIMENT_TYPE" == "simulated" || "$EXPE
   : > "${REAL_RESULTS}"
   : > "${BIO_RESULTS}"
 
+  # Schema-aware merge: input TSVs may have different (but overlapping) headers.
+  # We union all columns, then emit one merged TSV with empty fills for columns
+  # missing in any source file. Falls back to a no-op when no inputs are given.
   merge_tsv_group() {
     local out_file="$1"
     shift
-    local first_written=0
-    local f
-    for f in "$@"; do
-      [[ -f "$f" ]] || continue
-      if [[ $first_written -eq 0 ]]; then
-        cat "$f" >> "$out_file"
-        first_written=1
-      else
-        tail -n +2 "$f" >> "$out_file"
-      fi
-    done
+    [[ $# -eq 0 ]] && return 0
+    python3 - "$out_file" "$@" <<'PY'
+import csv, sys
+out_path = sys.argv[1]
+inputs = sys.argv[2:]
+rows = []
+columns = []
+seen = set()
+for path in inputs:
+    try:
+        with open(path, newline="") as fh:
+            reader = csv.DictReader(fh, delimiter="\t")
+            if not reader.fieldnames:
+                continue
+            for col in reader.fieldnames:
+                if col not in seen:
+                    seen.add(col)
+                    columns.append(col)
+            for row in reader:
+                rows.append(row)
+    except OSError:
+        continue
+if not columns:
+    open(out_path, "w").close()
+    sys.exit(0)
+with open(out_path, "w", newline="") as fh:
+    writer = csv.DictWriter(fh, fieldnames=columns, delimiter="\t",
+                            extrasaction="ignore")
+    writer.writeheader()
+    for row in rows:
+        writer.writerow({c: row.get(c, "") for c in columns})
+PY
     return 0
   }
 

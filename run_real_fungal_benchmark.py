@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import Any
 
 from run_million_mode_query_benchmark import augment_routing_store
-from sv_pr_utils import DEFAULT_TOL_BP, DEFAULT_TOL_LEN_FRAC, wilson_ci
+from sv_pr_utils import DEFAULT_TOL_BP, DEFAULT_TOL_LEN_FRAC, expand_to_multisample_vcf, wilson_ci
 
 
 ROOT = Path(__file__).resolve().parent
@@ -259,8 +259,78 @@ def run_mycosv_via_dll(argv: list[str]) -> subprocess.CompletedProcess[str]:
     return subprocess.CompletedProcess(argv, rc, "", "")
 
 
+def _detect_cgroup_memory_max_bytes() -> int | None:
+    """Return this process's cgroup v2 memory.max in bytes, or None if unset.
+
+    A SIGKILL with no stderr from the binary on a 754 GiB host is almost
+    always a cgroup OOM kill — the user-slice on shared HPC login nodes is
+    typically capped at 12 GiB. Surfacing this up front turns a confusing
+    silent kill into an actionable error.
+    """
+    try:
+        with open("/proc/self/cgroup", encoding="utf-8") as fh:
+            line = fh.readline().strip()
+    except OSError:
+        return None
+    # cgroup v2 lines look like "0::/user.slice/user-1234.slice/session-...scope"
+    if "::" not in line:
+        return None
+    rel = line.split("::", 1)[1].lstrip("/")
+    cur = Path("/sys/fs/cgroup")
+    parts = [p for p in rel.split("/") if p]
+    # Walk from the leaf upward; the first ancestor that has memory.max != "max"
+    # is the binding limit.
+    for depth in range(len(parts), -1, -1):
+        candidate = cur.joinpath(*parts[:depth]) / "memory.max"
+        try:
+            value = candidate.read_text(encoding="utf-8").strip()
+        except OSError:
+            continue
+        if value and value != "max":
+            try:
+                return int(value)
+            except ValueError:
+                continue
+    return None
+
+
+def _preflight_memory_check(cmd: list[str]) -> None:
+    limit = _detect_cgroup_memory_max_bytes()
+    if limit is None or limit <= 0:
+        return
+    gib = limit / (1024 ** 3)
+    # 12 GiB is the typical user-slice cap on shared HPC nodes; the AMF
+    # assembly stage routinely peaks at >20 GiB. Warn loudly so the operator
+    # knows to switch to a compute node or raise the cgroup limit instead of
+    # chasing a phantom binary bug.
+    if gib < 24:
+        sys.stderr.write(
+            f"[mycosv preflight] WARNING: cgroup memory limit is {gib:.1f} GiB. "
+            f"The MycoSV binary loads multiple references into RAM and may be "
+            f"SIGKILLed by the cgroup OOM-killer. Recommend running on a node "
+            f"with >=24 GiB available (slurm/srun --mem=32G), or raise the "
+            f"user-slice memory.max.\n"
+        )
+        sys.stderr.write(f"[mycosv preflight] cmd: {' '.join(cmd)}\n")
+
+
 def run_mycosv_command(cmd: list[str], cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
-    return run(cmd, cwd=cwd)
+    _preflight_memory_check(cmd)
+    try:
+        return run(cmd, cwd=cwd)
+    except subprocess.CalledProcessError as exc:
+        # Surface SIGKILL as an OOM signal rather than a generic exit code.
+        if exc.returncode in (-9, 137):
+            limit = _detect_cgroup_memory_max_bytes()
+            limit_str = (
+                f"{limit / (1024 ** 3):.1f} GiB" if limit else "unbounded host RAM"
+            )
+            sys.stderr.write(
+                f"[mycosv] binary was SIGKILLed (rc={exc.returncode}). This is "
+                f"almost certainly a cgroup OOM kill (cgroup memory.max = "
+                f"{limit_str}). Re-run with more memory or fewer refs.\n"
+            )
+        raise
 
 
 def list_panels_text() -> str:
@@ -1183,7 +1253,7 @@ def prepare_from_ncbi(args: argparse.Namespace) -> int:
         species_name = lineage.get("species", species)
         if benchmark_ref_local is None:
             benchmark_ref_local = species_ref_local
-        species_benchmark_defaults[species_name] = {
+        defaults_entry = {
             "benchmark_ref_asm": (
                 benchmark_ref_row.get("assembly_accession", "").replace(".", "_")
                 if benchmark_ref_local is not None and benchmark_ref_row.get("assembly_accession")
@@ -1191,6 +1261,13 @@ def prepare_from_ncbi(args: argparse.Namespace) -> int:
             ),
             "benchmark_ref_fasta": str(benchmark_ref_local) if benchmark_ref_local else ".",
         }
+        # Index under both the NCBI taxonomy species name and the panel-preset
+        # species name. The reads-mode loop below looks up by the panel-preset
+        # name; without the alias, NCBI strain suffixes (e.g. "Lachancea
+        # kluyveri NRRL Y-12651") silently miss and read queries are dropped.
+        species_benchmark_defaults[species_name] = defaults_entry
+        if species and species != species_name:
+            species_benchmark_defaults.setdefault(species, defaults_entry)
 
         if benchmark_ref_local is None:
             continue
@@ -1281,6 +1358,10 @@ def prepare_from_ncbi(args: argparse.Namespace) -> int:
         requested_read_modes = [args.query_mode]
 
     if requested_read_modes and args.read_accessions_per_species > 0:
+        sys.stderr.write(
+            f"[reads-mode] resolving ENA runs for {len(selectors)} panel species "
+            f"(modes={requested_read_modes}, max_runs/species={args.read_accessions_per_species})\n"
+        )
         for sel in selectors:
             species = sel.get("species", "")
             if not species:
@@ -1289,16 +1370,31 @@ def prepare_from_ncbi(args: argparse.Namespace) -> int:
             if not default_benchmark.get("benchmark_ref_fasta"):
                 # No reference was downloaded for this species — reads-mode
                 # benchmarks require one, so skip.
+                sys.stderr.write(
+                    f"[reads-mode] skip {species!r}: no reference assembly available "
+                    f"(known species keys: {sorted(species_benchmark_defaults.keys())[:5]}...)\n"
+                )
                 continue
             ena_runs = fetch_ena_read_runs_by_species(species, max_rows=args.ena_max_rows_per_species)
             if not ena_runs:
+                sys.stderr.write(
+                    f"[reads-mode] skip {species!r}: ENA filereport returned 0 runs "
+                    f"(check network or species name)\n"
+                )
                 continue
+            sys.stderr.write(f"[reads-mode] {species!r}: ENA returned {len(ena_runs)} candidate runs\n")
             for read_mode in requested_read_modes:
                 urls, meta_rows = select_ena_read_sources(
                     ena_runs, read_mode, args.read_accessions_per_species
                 )
                 if not urls:
+                    sys.stderr.write(
+                        f"[reads-mode] {species!r} mode={read_mode}: no eligible runs after platform filter\n"
+                    )
                     continue
+                sys.stderr.write(
+                    f"[reads-mode] {species!r} mode={read_mode}: picked {len(meta_rows)} run(s)\n"
+                )
                 # Bundle the selected FASTQs for the first picked run into a
                 # single local file so query_list.txt stays one-path-per-line
                 # (MycoSV reads that format).
@@ -2810,6 +2906,17 @@ def benchmark_real_data(args: argparse.Namespace) -> int:
         query_list_override=mode_query_list,
     )
 
+    # Materialize a multi-sample sibling of calls.vcf so spot-checks see one
+    # column per query asm (the binary writes a single SAMPLE column with
+    # provenance only in the QASM info field).
+    try:
+        vcf_path = Path(mycosv_paths["vcf"])
+        expand_to_multisample_vcf(
+            vcf_path, vcf_path.with_suffix(".multisample.vcf")
+        )
+    except Exception as exc:
+        sys.stderr.write(f"[multisample-vcf] expand failed: {exc}\n")
+
     mycosv_calls_by_query: dict[str, dict[str, list[NormalizedCall]]] = {}
     for row in query_manifest:
         query_asm = row["query_asm"]
@@ -2999,6 +3106,42 @@ def benchmark_real_data(args: argparse.Namespace) -> int:
                 for idx in used_pred:
                     support_by_key[call_key(pred_calls[idx])].append(label)
             summary_json["queries"][query_asm]["exact_benchmarks"][coord_space][label] = metrics
+
+    # If no comparator was available (e.g. all of pggb/minigraph/syri/svim_asm
+    # missing on this host) the per-query exact benchmarks above produce zero
+    # rows, leaving exact_benchmark_summary.tsv header-only and the merged
+    # real_merged.tsv empty. Emit a MycoSV-only placeholder per query so the
+    # visualization report has something to render and the operator gets a
+    # clear "no comparator was run" signal rather than silent emptiness.
+    if not agreement_rows:
+        any_tool_present = any(summary_json["tool_status"].values())
+        sys.stderr.write(
+            f"[benchmark] no comparator produced a truth set "
+            f"(tools_available={any_tool_present}). Emitting MycoSV-only "
+            f"placeholder rows so downstream reports stay populated.\n"
+        )
+        for query_row in query_manifest:
+            query_asm = query_row["query_asm"]
+            for coord_space, calls_key in (("query", "query"), ("reference", "reference")):
+                preds = mycosv_calls_by_query.get(query_asm, {}).get(calls_key, [])
+                agreement_rows.append({
+                    "query_asm": query_asm,
+                    "coordinate_space": coord_space,
+                    "truth_label": "no_comparator",
+                    "method": "mycosv",
+                    "truth_calls": 0,
+                    "pred_calls": len(preds),
+                    "tp": 0,
+                    "fp": 0,
+                    "fn": 0,
+                    "precision": float("nan"),
+                    "recall": float("nan"),
+                    "f1": float("nan"),
+                    "prec_lo95": float("nan"),
+                    "prec_hi95": float("nan"),
+                    "rec_lo95": float("nan"),
+                    "rec_hi95": float("nan"),
+                })
 
     write_agreement_summary(out_dir / "exact_benchmark_summary.tsv", agreement_rows)
     with (out_dir / "benchmark_summary.json").open("w", encoding="utf-8") as fh:
