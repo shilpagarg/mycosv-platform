@@ -67,16 +67,22 @@ def mode_specific_caller_args(mode: str, genome_size_hint: int) -> list[str]:
 
 def ensure_sv_volume(n_genomes: int, n_reps: int, n_contigs: int, total_len: int,
                      scenario_set: str, target_svs_per_scenario: int,
-                     min_contig_bp: int) -> tuple[int, int, int]:
+                     min_contig_bp: int,
+                     queries_per_scenario: int | None = None) -> tuple[int, int, int]:
     scenarios = [s.strip() for s in scenario_set.split(",") if s.strip()]
     n_scen = max(1, len(scenarios))
     n_reps = max(n_reps, n_scen)
-    query_genomes = max(0, n_genomes - n_reps)
-    per_query = max(1, n_contigs)
-    current = max(0, (query_genomes // n_scen) * per_query)
-    if current < target_svs_per_scenario:
-        needed_queries_per_scenario = (target_svs_per_scenario + per_query - 1) // per_query
-        n_genomes = max(n_genomes, n_reps + needed_queries_per_scenario * n_scen)
+    if queries_per_scenario is not None and queries_per_scenario > 0:
+        # Explicit per-scenario query budget overrides the SV-volume heuristic.
+        # Useful for fast testing: e.g. 20 queries × 3 scenarios = 60 query genomes.
+        n_genomes = n_reps + queries_per_scenario * n_scen
+    else:
+        query_genomes = max(0, n_genomes - n_reps)
+        per_query = max(1, n_contigs)
+        current = max(0, (query_genomes // n_scen) * per_query)
+        if current < target_svs_per_scenario:
+            needed_queries_per_scenario = (target_svs_per_scenario + per_query - 1) // per_query
+            n_genomes = max(n_genomes, n_reps + needed_queries_per_scenario * n_scen)
     per_contig_bp = max(1, total_len // max(1, n_contigs))
     if per_contig_bp < min_contig_bp:
         total_len = min_contig_bp * max(1, n_contigs)
@@ -226,6 +232,11 @@ def main() -> int:
     ap.add_argument("--min-svlen", type=int, default=40)
     ap.add_argument("--window-bp", type=int, default=2_000_000)
     ap.add_argument("--target-svs-per-scenario", type=int, default=3000)
+    ap.add_argument("--queries-per-scenario", type=int, default=0,
+                    help="If >0, set the number of query genomes per scenario directly "
+                         "(n_genomes = n_reps + queries_per_scenario * n_scenarios). "
+                         "Overrides --target-svs-per-scenario. Useful for fast testing, "
+                         "e.g. --queries-per-scenario 20.")
     ap.add_argument("--min-contig-bp", type=int, default=12000)
     ap.add_argument("--threads", type=int, default=32,
                     help="Parallel worker threads passed to the MycoSV binary (--threads) "
@@ -275,6 +286,7 @@ def main() -> int:
         args.scenario_set,
         args.target_svs_per_scenario,
         args.min_contig_bp,
+        queries_per_scenario=(args.queries_per_scenario if args.queries_per_scenario > 0 else None),
     )
 
     if not args.skip_build or not args.binary_path.exists():
@@ -292,6 +304,7 @@ def main() -> int:
             "n_contigs": args.n_contigs,
             "divergence": args.divergence,
             "target_svs_per_scenario": args.target_svs_per_scenario,
+            "queries_per_scenario": args.queries_per_scenario,
             "min_contig_bp": args.min_contig_bp,
             "long_read_platforms": lr_platforms,
         },

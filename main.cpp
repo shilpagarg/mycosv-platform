@@ -2519,6 +2519,50 @@ static void write_gfa_segments(std::ostream& out,
         return value;
     };
 
+    // emit_ref_anchor: write a placeholder S-line (sequence "*") for the
+    // reference contig that a variant is anchored to, plus a path containing
+    // just that anchor.  The S-line carries CL:Z:<refAsm> so downstream tools
+    // can group anchors by reference assembly.  Returns the segment id which
+    // is used by the L-edge that links the variant to its reference position.
+    //
+    // Using a per-(refAsm,refContig) segment keeps the augmented GFA compact
+    // even when many variants share the same reference contig — the segment
+    // is emitted once and every variant that maps to it adds an L-line.
+    auto emit_ref_anchor = [&](const std::string& refAsm,
+                                const std::string& refContig) -> std::string {
+        const std::string id = sanitize(refAsm + ":" + refContig + ":REF");
+        if (seen.insert("S:" + id).second) {
+            out << "S\t" << id << "\t*"
+                << "\tAN:Z:REFERENCE"
+                << "\tVT:Z:REF"
+                << "\tCL:Z:" << (refAsm.empty() ? std::string(".") : refAsm)
+                << "\tEC:Z:NONE"
+                << "\n";
+            out << "P\t" << id << "\t" << id << "+\t*\n";
+        }
+        return id;
+    };
+    auto emit_anchor_link = [&](const std::string& refSeg,
+                                 const std::string& varSeg,
+                                 const std::string& type,
+                                 const std::string& clade) {
+        if (refSeg.empty() || varSeg.empty()) return;
+        const std::string fwd = "L:" + refSeg + "->" + varSeg;
+        if (seen.insert(fwd).second) {
+            out << "L\t" << refSeg << "\t+\t" << varSeg << "\t+\t0M"
+                << "\tVT:Z:" << type
+                << "\tCL:Z:" << (clade.empty() ? std::string(".") : clade)
+                << "\tAN:Z:LEFT_FLANK\n";
+        }
+        const std::string rev = "L:" + varSeg + "->" + refSeg;
+        if (seen.insert(rev).second) {
+            out << "L\t" << varSeg << "\t+\t" << refSeg << "\t+\t0M"
+                << "\tVT:Z:" << type
+                << "\tCL:Z:" << (clade.empty() ? std::string(".") : clade)
+                << "\tAN:Z:RIGHT_FLANK\n";
+        }
+    };
+
     // emit_segment: write one GFA S-line + P-line.
     // elementClass carries the ElementClass tag (EC:Z:) so repeat/TE/HGT/RIP
     // annotation is visible to downstream GFA consumers.  For non-OFF_REF calls
@@ -2600,22 +2644,44 @@ static void write_gfa_segments(std::ostream& out,
                     << "\tMCL:Z:" << (c.mateOffReference ? "OFF_REFERENCE" : c.mateRefAsm)
                     << "\n";
             }
+            // Anchor each TRA breakend to its reference contig so the GFA is
+            // an augmentation of the reference backbone, not a free-floating
+            // catalog of variant segments.  A breakend without a refContig
+            // (e.g. OFF_REF) is skipped — there is no anchor to attach to.
+            if (!primaryOffRef && !c.refAsm.empty() && !c.refContig.empty()) {
+                const std::string refSeg = emit_ref_anchor(c.refAsm, c.refContig);
+                emit_anchor_link(refSeg, left, c.type, c.refAsm);
+            }
+            if (!c.mateOffReference && !c.mateRefAsm.empty() && !c.mateContig.empty()
+                && c.mateContig != ".") {
+                const std::string mateRefSeg = emit_ref_anchor(c.mateRefAsm, c.mateContig);
+                emit_anchor_link(mateRefSeg, right, "TRA_MATE", c.mateRefAsm);
+            }
             continue;
         }
 
         const int svlen = normalized_svlen_for_output(c);
         const int end = normalized_end_for_output(c);
         const bool placeholderOnly = (c.type == "DEL");
-        emit_segment(qr.qAsm + ":" + c.qContig + ":" + std::to_string(std::max(1, c.pos)) + "-" + std::to_string(end),
-                     c.qContig,
-                     c.pos,
-                     end,
-                     svlen,
-                     primaryOffRef ? "OFF_REFERENCE" : c.annotation,
-                     c.type,
-                     c.refAsm,
-                     c.elementClass,
-                     placeholderOnly);
+        const std::string varSeg = emit_segment(
+            qr.qAsm + ":" + c.qContig + ":" + std::to_string(std::max(1, c.pos)) + "-" + std::to_string(end),
+            c.qContig,
+            c.pos,
+            end,
+            svlen,
+            primaryOffRef ? "OFF_REFERENCE" : c.annotation,
+            c.type,
+            c.refAsm,
+            c.elementClass,
+            placeholderOnly);
+        // Augmentation: every reference-anchored variant gets two L-edges
+        // (ref→var, var→ref) to its parent reference contig.  OFF_REF variants
+        // have no ref anchor, so they remain disconnected — that is the correct
+        // graph topology for novel sequence in a pangenome augmentation.
+        if (!primaryOffRef && !c.refAsm.empty() && !c.refContig.empty()) {
+            const std::string refSeg = emit_ref_anchor(c.refAsm, c.refContig);
+            emit_anchor_link(refSeg, varSeg, c.type, c.refAsm);
+        }
     }
 }
 

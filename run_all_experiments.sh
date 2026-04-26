@@ -92,18 +92,23 @@ echo ""
 SIM_SCENARIO_SET="compact_yeast,two_speed_pathogen_extreme,arbuscular_mf"
 
 # ============================================================================
-# 1. SIMULATED BENCHMARK (precision/recall at million scale, hundreds of SVs)
+# 1. SIMULATED BENCHMARK (precision/recall at million scale)
 #
-# Parameters chosen to produce ≥270 truth SVs:
-#   n_genomes=30, n_reps=3, n_contigs=10, total_len=200000
-#   → (30-3)=27 query genomes × 10 contigs = 270 SVs across 3 scenarios
+# Per-scenario query budget controls runtime. With QUERIES_PER_SCENARIO=20 and
+# 3 scenarios → 60 query genomes (+ refs). At n_contigs=10 that is ~600 truth
+# SVs per mode — fast turnaround for testing. Override with the env var
+# SIM_QUERIES_PER_SCENARIO to scale up (e.g. 200 for ~6000 SVs).
 # ============================================================================
 
+SIM_QUERIES_PER_SCENARIO="${SIM_QUERIES_PER_SCENARIO:-20}"
+
 if [[ "$EXPERIMENT_TYPE" == "all" || "$EXPERIMENT_TYPE" == "simulated" ]]; then
-  echo -e "${YELLOW}[1/4] Running simulated benchmark (million-scale routing, 270 SVs)...${NC}"
+  N_SCENARIOS=$(awk -F',' '{print NF}' <<< "${SIM_SCENARIO_SET}")
+  TOTAL_QUERIES=$(( SIM_QUERIES_PER_SCENARIO * N_SCENARIOS ))
+  echo -e "${YELLOW}[1/4] Running simulated benchmark (million-scale routing)...${NC}"
   echo "      Modes: assembly, short-reads, long-reads"
   echo "      Scenarios: ${SIM_SCENARIO_SET} (covers INS/DEL/DUP/INV/TRA)"
-  echo "      Genomes: 30 total (3 refs + 27 queries), 10 contigs each"
+  echo "      Queries per scenario: ${SIM_QUERIES_PER_SCENARIO} → ${TOTAL_QUERIES} query genomes (+ 3 refs), 10 contigs each"
   echo "      Output: ${SIM_DIR}/benchmarks"
   mkdir -p "${SIM_DIR}/benchmarks"
 
@@ -112,12 +117,11 @@ if [[ "$EXPERIMENT_TYPE" == "all" || "$EXPERIMENT_TYPE" == "simulated" ]]; then
       --modes assembly,short-reads,long-reads \
       --scenario-set "${SIM_SCENARIO_SET}" \
       --n-centroids 1000000 \
-      --n-genomes 30 \
       --n-reps 3 \
       --n-contigs 10 \
       --total-len 200000 \
       --seed 42 \
-      --target-svs-per-scenario 3000 \
+      --queries-per-scenario "${SIM_QUERIES_PER_SCENARIO}" \
       --min-contig-bp 12000 \
       --long-read-platform "${LONG_READ_PLATFORM}" \
       --threads "${THREADS}" \
