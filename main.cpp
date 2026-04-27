@@ -1961,6 +1961,12 @@ select_best_call_per_contig(const std::unordered_map<std::string, std::string>& 
         const VariantCallBridge* best = nullptr;
         tol::FusedEvidenceScore bestFused;
         double bestScore = -1e100;
+        // Track best OFF_REF candidate separately so we can override the
+        // winner when it turns out to be a hallucinated indel/rearrangement
+        // on a contig that is actually novel (see post-pass below).
+        const VariantCallBridge* bestOff = nullptr;
+        tol::FusedEvidenceScore bestOffFused;
+        double bestOffOverlap = 0.0;
         for (const auto& cand : kv.second) {
             tol::FusedEvidenceScore fused;
             const double score = candidate_priority_score(
@@ -1969,6 +1975,40 @@ select_best_call_per_contig(const std::unordered_map<std::string, std::string>& 
                 best = &cand;
                 bestScore = score;
                 bestFused = fused;
+            }
+            if (cand.type == "OFF_REF" &&
+                (cand.annotation == "NOVEL" || cand.annotation == "NOVEL_WEAK" ||
+                 cand.annotation == "DIVERGED")) {
+                if (bestOff == nullptr || cand.svlen > bestOff->svlen) {
+                    bestOff = &cand;
+                    bestOffFused = fused;
+                    bestOffOverlap = candidate_ref_overlap(qSeq, cand, refIdx, cache, mode);
+                }
+            }
+        }
+        // OFF_REF override (assembly mode only): if the priority winner is an
+        // indel/rearrangement with very low chain support AND there is a
+        // valid novelty-tier OFF_REF candidate on the same contig, the indel
+        // is almost certainly a stray-k-mer artifact (the caller forced an
+        // alignment against an unrelated reference because the contig is
+        // actually novel).  Switch to the OFF_REF candidate.  Real anchored
+        // indels in the simulator accumulate BSCORE in the thousands, so the
+        // BSCORE<100 cap reliably separates noise from signal.
+        //
+        // Restricted to assembly mode because reads-mode pseudo-contigs
+        // (sr_unitig*, lr_pc*) legitimately have low overlap on every
+        // candidate; reads mode already filters spurious OFF_REF emissions
+        // upstream in simple_offref_fallback_calls (locus-overlap gates).
+        if (mode == query_input::QueryMode::ASSEMBLY &&
+            best != nullptr && bestOff != nullptr && best != bestOff) {
+            const bool indel = (best->type == "INS" || best->type == "DEL");
+            const bool rearr = (best->type == "INV" || best->type == "DUP" ||
+                                is_translocation_type(best->type));
+            const double bestOverlap = candidate_ref_overlap(qSeq, *best, refIdx, cache, mode);
+            if ((indel || rearr) && best->blockScore < 100.0 && bestOverlap < 0.10) {
+                best = bestOff;
+                bestFused = bestOffFused;
+                (void)bestOffOverlap;
             }
         }
         if (best != nullptr) {
