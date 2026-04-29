@@ -578,6 +578,58 @@ def expression_for_candidate(
     return summarize_expression(by_contig.get((qasm, contig), []))
 
 
+def nearest_gene_for_candidate(
+    gene_annotations: dict[tuple[str, str], list[dict[str, object]]],
+    qasm: str,
+    contig: str,
+    pos: str,
+    end: str,
+) -> dict[str, object] | None:
+    """Return {'gene_id', 'gene_name', 'distance_bp'} for the nearest annotated
+    gene to the (pos, end) breakpoint on (qasm, contig). Falls back to the
+    wildcard ('.', contig) bucket if no asm-keyed match exists. Returns None
+    when no gene_annotations were loaded for this contig.
+
+    This is the "no expression matrix" fallback: it lets biology_candidates.tsv
+    show *which* gene a breakpoint is sitting on or near, even when nobody has
+    measured its expression in a public DB. Without this, expression_gene was
+    always '.' and the analyzer's follow-up suggestion stayed generic.
+    """
+    genes = gene_annotations.get((qasm, contig)) or gene_annotations.get(('.', contig))
+    if not genes:
+        return None
+    try:
+        sv_lo = int(pos)
+        sv_hi = int(end)
+    except ValueError:
+        return None
+    if sv_hi < sv_lo:
+        sv_lo, sv_hi = sv_hi, sv_lo
+    best: dict[str, object] | None = None
+    best_dist: int | None = None
+    for gene in genes:
+        gstart = int(gene['start'])
+        gend = int(gene['end'])
+        if gend < gstart:
+            gstart, gend = gend, gstart
+        if gend < sv_lo:
+            dist = sv_lo - gend
+        elif gstart > sv_hi:
+            dist = gstart - sv_hi
+        else:
+            dist = 0
+        if best_dist is None or dist < best_dist:
+            best_dist = dist
+            best = {
+                'gene_id': str(gene['gene_id']),
+                'gene_name': str(gene.get('gene_name') or gene['gene_id']),
+                'distance_bp': dist,
+            }
+            if dist == 0:
+                break
+    return best
+
+
 
 def is_hgt_candidate(ec: str, svtype: str, annot: str) -> bool:
     """True when the call has hallmarks of horizontal gene transfer:
@@ -728,8 +780,12 @@ def main() -> int:
     ap.add_argument('--top-n', type=int, default=50)
     args = ap.parse_args()
 
-    if bool(args.expression_long_tsv) != bool(args.gene_annotations):
-        ap.error('--expression-long-tsv and --gene-annotations must be provided together')
+    # gene_annotations alone is now valid: it powers the nearest-gene fallback
+    # so expression_gene / expression_distance_bp populate without an RNA-seq
+    # matrix. The reverse — expression_long without gene_annotations — still
+    # cannot resolve gene-coord lookups and is an error.
+    if args.expression_long_tsv and not args.gene_annotations:
+        ap.error('--expression-long-tsv requires --gene-annotations to map gene_id -> contig coordinates')
 
     hits = load_hits(args.hits)
     meta = load_query_meta(args.query_metadata)
@@ -737,11 +793,17 @@ def main() -> int:
     records = load_vcf_records(args.vcf)
 
     expression = load_expression(args.expression_tsv)
+    # Always load gene_annotations even when no expression_long is supplied —
+    # it lets the per-candidate fallback below populate expression_gene /
+    # expression_distance_bp from the nearest annotated gene, so the operator
+    # at least sees which gene is closest to each breakpoint without needing
+    # an RNA-seq matrix (which most fungal panels don't have publicly).
+    gene_annotations_lookup = load_gene_annotations(args.gene_annotations)
     if args.expression_long_tsv and args.gene_annotations:
         derived_expression = derive_expression_support_from_quant(
             records,
             hits,
-            load_gene_annotations(args.gene_annotations),
+            gene_annotations_lookup,
             load_expression_long(args.expression_long_tsv),
             args.expression_window_bp,
             args.expression_group_a,
@@ -769,6 +831,13 @@ def main() -> int:
         lifestyle = meta.get(qasm, {}).get('lifestyle', '.') if qasm in meta else '.'
         anc = ancestral.get((qasm, chrom)) or ancestral.get(('.', chrom))
         expr = expression_for_candidate(expression, qasm, chrom, pos, end, svtype)
+        # Even when no expression matrix was supplied, the gene_annotations.tsv
+        # alone tells us which annotated gene the breakpoint is closest to.
+        # Surface that as expression_gene + expression_distance_bp; leave
+        # expression_log2_fc / expression_padj as '.' since we have no measurement.
+        nearest = None
+        if expr is None or not expr.get('best_gene'):
+            nearest = nearest_gene_for_candidate(gene_annotations_lookup, qasm, chrom, pos, end)
         candidate_type, priority, rationale = classify_candidate(svtype, ec, annot, anc, expr)
         if candidate_type == 'other':
             continue
@@ -776,8 +845,10 @@ def main() -> int:
         clade_ranks = ','.join(sorted(anc['ranks'])) if anc else '.'
         example = choose_functional_example(candidate_type, svtype, ec, scenario, anc, expr)
         expr_supported = 'yes' if expr and expr.get('supported') else 'no'
-        expr_gene = expr.get('best_gene', '.') if expr else '.'
-        expr_distance = expr.get('distance_bp', '.') if expr else '.'
+        expr_gene = (expr.get('best_gene') if expr and expr.get('best_gene') else
+                     (nearest['gene_name'] if nearest else '.'))
+        expr_distance = (expr.get('distance_bp') if expr and expr.get('best_gene') else
+                         (nearest['distance_bp'] if nearest else '.'))
         expr_log2_fc = expr.get('log2_fc', '.') if expr else '.'
         expr_padj = expr.get('padj', '.') if expr else '.'
         expr_condition = expr.get('condition', '.') if expr else '.'

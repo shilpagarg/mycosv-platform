@@ -1,472 +1,379 @@
 #!/usr/bin/env bash
-# install_tools.sh — Install all tools required by the MycoSV benchmark environment.
+# install_tools_github_comparators.sh — install MycoSV comparator tools without Bioconda.
 #
-# Sets up a conda environment named "mycosv" containing:
-#   Core build tools   : g++, cmake, make
-#   SV callers         : SyRI+minimap2, minigraph, PGGB, Minigraph-Cactus,
-#                        SVIM-asm, AnchorWave, Delly, Manta,
-#                        SVIM, Sniffles2, cuteSV, samtools, bcftools
-#   TE classifiers     : DeepTE, NeuralTE, TERL, Terrier, ClassifyTE, CREATE, TEClass2
-#   Python packages    : biopython, pandas, scikit-learn, pytorch (CPU), tensorflow (CPU)
-#   MycoSV binary      : compiled from main.cpp after environment activation
+# Installs the comparator pre-flight dependency closure from GitHub source trees,
+# GitHub-hosted release artifacts, or official GitHub/OCI containers for very
+# large pangenome stacks.
+#
+# Comparator closure covered:
+#   syri        : minimap2 + syri
+#   minigraph  : minigraph + gfatools
+#   pggb       : official GHCR pggb image wrapper, source cloned for provenance
+#   cactus     : cactus-pangenome official release/container wrapper
+#   svim_asm   : svim-asm + minimap2 + samtools
+#   anchorwave : anchorwave + minimap2 + samtools + paftools.js
+#   delly/manta helpers: bcftools for BCF/VCF normalization
 #
 # Usage:
-#   bash install_tools.sh                  # full install (creates/updates mycosv env)
-#   bash install_tools.sh --check          # only check what is/isn't installed
-#   bash install_tools.sh --sv-only        # SV tools only (skip TE classifiers)
-#   bash install_tools.sh --te-only        # TE tools only (skip SV callers)
-#   bash install_tools.sh --mycosv-only    # build MycoSV binary only
+#   bash install_tools_github_comparators.sh              # install comparator closure
+#   bash install_tools_github_comparators.sh --check      # report tool availability only
+#   bash install_tools_github_comparators.sh all          # install broad SV benchmark stack
+#   bash install_tools_github_comparators.sh syri pggb    # install selected tools
 #
-# Environment variables:
-#   CONDA_ENV_NAME=mycosv      Override the conda environment name
-#   MAMBA=1                    Use mamba instead of conda for speed
-#   SKIP_CONDA=1               Skip conda steps (assume env already active)
-#
-# Requirements:
-#   - conda or mamba on PATH
-#   - Internet access for package downloads
-#   - ~15 GB free disk space for full install
+# Environment overrides:
+#   ENV_PATH=/path/to/conda/env
+#   CONDA_INIT=/path/to/conda.sh
+#   WORK_DIR=/path/to/project/workdir
+#   SRC_DIR=/path/to/source/cache
+#   THREADS=8
+#   FORCE=1
+#   USE_APPTAINER=1
+#   CACTUS_MODE=container|release     # default: container
 
-set -euo pipefail
+set -u
+set -o pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ENV_NAME="${CONDA_ENV_NAME:-mycosv}"
-CONDA_CMD="${MAMBA:-0}" ; [[ "${MAMBA:-0}" == "1" ]] && CONDA_CMD="mamba" || CONDA_CMD="conda"
-MODE="${1:-all}"
-MODE="${MODE#--}"  # strip leading --
+readonly DEFAULT_ENV_PATH="/mnt/bmh01-rds/Shilpa_Group/2024/projects/fungi/tools/envs/envs/fungi_graph_sv"
+readonly DEFAULT_CONDA_INIT="/opt/apps/apps/binapps/conda/miniforge3/25.9.1-0/etc/profile.d/conda.sh"
 
-# ---------------------------------------------------------------------------
-# Colors
-# ---------------------------------------------------------------------------
+ENV_PATH="${ENV_PATH:-$DEFAULT_ENV_PATH}"
+CONDA_INIT="${CONDA_INIT:-$DEFAULT_CONDA_INIT}"
+WORK_DIR="${WORK_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
+SRC_DIR="${SRC_DIR:-$WORK_DIR/tools_src}"
+THREADS="${THREADS:-4}"
+FORCE="${FORCE:-0}"
+USE_APPTAINER="${USE_APPTAINER:-1}"
+CACTUS_MODE="${CACTUS_MODE:-container}"
+
 GREEN='\033[0;32m'; RED='\033[0;31m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'; NC='\033[0m'
-ok()   { echo -e "${GREEN}  ✓ $*${NC}"; }
-warn() { echo -e "${YELLOW}  ⚠ $*${NC}"; }
-fail() { echo -e "${RED}  ✗ $*${NC}"; }
-info() { echo -e "${BLUE}  → $*${NC}"; }
+ok()   { printf "${GREEN}  OK    %s${NC}\n" "$*"; }
+fail() { printf "${RED}  FAIL  %s${NC}\n" "$*"; }
+info() { printf "${BLUE}  ->    %s${NC}\n" "$*"; }
+hdr()  { printf "\n${YELLOW}== %s ==${NC}\n" "$*"; }
 
-# ---------------------------------------------------------------------------
-# Tool check helpers
-# ---------------------------------------------------------------------------
-MISSING_TOOLS=()
-AVAILABLE_TOOLS=()
+have() { command -v "$1" >/dev/null 2>&1; }
+need() { ! have "$1" || [[ "$FORCE" == "1" ]]; }
 
-check_tool() {
-    local name="$1"
-    if command -v "$name" &>/dev/null; then
-        local ver
-        ver=$(command -v "$name")
-        AVAILABLE_TOOLS+=("$name")
-        ok "$name  →  $ver"
-        return 0
-    else
-        MISSING_TOOLS+=("$name")
-        fail "$name  (not found)"
+require_cmd() {
+    local missing=0 cmd
+    for cmd in "$@"; do
+        if ! have "$cmd"; then
+            fail "required command missing: $cmd"
+            missing=1
+        fi
+    done
+    [[ "$missing" == 0 ]]
+}
+
+activate_env() {
+    if [[ ! -f "$CONDA_INIT" ]]; then
+        echo "[error] conda init script not found: $CONDA_INIT" >&2
         return 1
     fi
+    # shellcheck disable=SC1090
+    source "$CONDA_INIT"
+    conda activate "$ENV_PATH"
+    ENV_BIN="$CONDA_PREFIX/bin"
+    mkdir -p "$SRC_DIR" "$ENV_BIN"
 }
 
-check_python_module() {
-    local mod="$1"
-    if python3 -c "import $mod" 2>/dev/null; then
-        ok "python:$mod"
-    else
-        MISSING_TOOLS+=("python:$mod")
-        fail "python:$mod  (not importable)"
-    fi
+pip_install() { python -m pip install "$@"; }
+clone_fresh() { local repo="$1" dest="$2"; rm -rf "$dest"; git clone --depth 1 "$repo" "$dest"; }
+
+install_minimap2() {
+    if ! need minimap2; then ok "minimap2 already on PATH"; return 0; fi
+    require_cmd git make install || return 1
+    clone_fresh https://github.com/lh3/minimap2.git "$SRC_DIR/minimap2" || return 1
+    (cd "$SRC_DIR/minimap2" && make -j"$THREADS") || return 1
+    install -m 755 "$SRC_DIR/minimap2/minimap2" "$ENV_BIN/minimap2"
+    have minimap2
 }
 
-# ---------------------------------------------------------------------------
-# --check mode: just report what is/isn't available
-# ---------------------------------------------------------------------------
-if [[ "$MODE" == "check" ]]; then
-    echo -e "${BLUE}========================================"
-    echo "MycoSV Tool Availability Check"
-    echo "========================================${NC}"
-    echo ""
-
-    echo "=== MycoSV binary ==="
-    check_tool "fungi_graphsv_tol" || true
-    echo ""
-
-    echo "=== Compiler ==="
-    check_tool "g++" || true
-    echo ""
-
-    echo "=== Assembly-mode SV comparators ==="
-    check_tool "minimap2"        || true
-    check_tool "syri"            || true
-    check_tool "minigraph"       || true
-    check_tool "gfatools"        || true
-    check_tool "pggb"            || true
-    check_tool "cactus-pangenome"|| true
-    check_tool "svim-asm"        || true
-    check_tool "anchorwave"      || true
-    echo ""
-
-    echo "=== Short-reads SV comparators ==="
-    check_tool "delly"           || true
-    check_tool "configManta.py"  || true
-    check_tool "samtools"        || true
-    check_tool "bcftools"        || true
-    echo ""
-
-    echo "=== Long-reads SV comparators ==="
-    check_tool "svim"            || true
-    check_tool "sniffles"        || true
-    check_tool "cuteSV"          || true
-    echo ""
-
-    echo "=== TE classifiers ==="
-    check_tool "DeepTE.py"       || true
-    check_tool "NeuralTE.py"     || true
-    check_tool "TERL.py"         || true
-    check_tool "terrier.py"      || true
-    check_tool "ClassifyTE.py"   || true
-    check_tool "CREATE.py"       || true
-    check_tool "TEClass2"        || true
-    echo ""
-
-    echo "=== Python packages ==="
-    check_python_module "Bio"    || true
-    check_python_module "pandas" || true
-    check_python_module "sklearn"|| true
-    check_python_module "torch"  || true
-    check_python_module "tensorflow" || true
-    echo ""
-
-    echo "========================================"
-    echo "Summary:"
-    echo "  Available : ${#AVAILABLE_TOOLS[@]}"
-    echo "  Missing   : ${#MISSING_TOOLS[@]}"
-    if [[ ${#MISSING_TOOLS[@]} -gt 0 ]]; then
-        echo "  Missing tools:"
-        for t in "${MISSING_TOOLS[@]}"; do echo "    - $t"; done
-        echo ""
-        echo "To install missing tools, run:"
-        echo "  bash install_tools.sh"
-    fi
-    echo "========================================"
-    exit 0
-fi
-
-# ---------------------------------------------------------------------------
-# Require conda
-# ---------------------------------------------------------------------------
-if [[ "${SKIP_CONDA:-0}" != "1" ]]; then
-    if ! command -v conda &>/dev/null && ! command -v mamba &>/dev/null; then
-        echo -e "${RED}[error] conda or mamba not found on PATH.${NC}"
-        echo "Install Miniconda from: https://docs.conda.io/en/latest/miniconda.html"
-        echo "Then re-run this script."
-        exit 1
-    fi
-fi
-
-echo -e "${BLUE}========================================"
-echo "MycoSV Environment Installer"
-echo "========================================${NC}"
-echo "Environment : ${ENV_NAME}"
-echo "Installer   : ${CONDA_CMD}"
-echo "Mode        : ${MODE}"
-echo "Script dir  : ${SCRIPT_DIR}"
-echo ""
-
-# ---------------------------------------------------------------------------
-# Create / activate environment
-# ---------------------------------------------------------------------------
-if [[ "${SKIP_CONDA:-0}" != "1" && "$MODE" != "mycosv-only" ]]; then
-    if conda env list 2>/dev/null | grep -qE "^${ENV_NAME}\s"; then
-        info "Conda environment '${ENV_NAME}' already exists — updating"
-    else
-        info "Creating conda environment '${ENV_NAME}' (Python 3.11)"
-        ${CONDA_CMD} create -y -n "${ENV_NAME}" python=3.11
-    fi
-
-    # Activate for subsequent conda install calls
-    # shellcheck disable=SC1091
-    eval "$(conda shell.bash hook)"
-    conda activate "${ENV_NAME}"
-    info "Activated environment: ${ENV_NAME}"
-fi
-
-# ---------------------------------------------------------------------------
-# Helper: install a conda package, report result
-# ---------------------------------------------------------------------------
-install_conda() {
-    local pkg="$1"
-    local channel="${2:--c conda-forge}"
-    info "Installing conda package: $pkg"
-    if ${CONDA_CMD} install -y ${channel} "$pkg" 2>&1 | tail -3; then
-        ok "Installed: $pkg"
-    else
-        warn "Failed to install $pkg via conda — may need manual install"
-    fi
+install_k8() {
+    if ! need k8; then ok "k8 already on PATH"; return 0; fi
+    require_cmd git make install || return 1
+    clone_fresh https://github.com/lh3/k8.git "$SRC_DIR/k8" || return 1
+    (cd "$SRC_DIR/k8" && make -j"$THREADS") || return 1
+    install -m 755 "$SRC_DIR/k8/k8" "$ENV_BIN/k8"
+    have k8
 }
 
-install_pip() {
-    local pkg="$1"
-    info "Installing pip package: $pkg"
-    if python3 -m pip install -q "$pkg"; then
-        ok "Installed pip: $pkg"
-    else
-        warn "Failed to install pip: $pkg"
+install_paftools_js() {
+    if ! need paftools.js; then ok "paftools.js already on PATH"; return 0; fi
+    require_cmd git install || return 1
+    install_k8 || return 1
+    if [[ ! -f "$SRC_DIR/minimap2/misc/paftools.js" || "$FORCE" == "1" ]]; then
+        clone_fresh https://github.com/lh3/minimap2.git "$SRC_DIR/minimap2" || return 1
     fi
+    install -m 755 "$SRC_DIR/minimap2/misc/paftools.js" "$ENV_BIN/paftools.js"
+    have paftools.js
 }
 
-# ---------------------------------------------------------------------------
-# 1. Build tools (always needed)
-# ---------------------------------------------------------------------------
-if [[ "$MODE" =~ ^(all|sv-only|mycosv-only)$ ]]; then
-    echo ""
-    echo -e "${YELLOW}[1] Build tools${NC}"
-    install_conda "gxx_linux-64"  "-c conda-forge"
-    install_conda "cmake"         "-c conda-forge"
-    install_conda "make"          "-c conda-forge"
-fi
+install_minigraph() {
+    if ! need minigraph; then ok "minigraph already on PATH"; return 0; fi
+    require_cmd git make install || return 1
+    clone_fresh https://github.com/lh3/minigraph.git "$SRC_DIR/minigraph" || return 1
+    (cd "$SRC_DIR/minigraph" && make -j"$THREADS") || return 1
+    install -m 755 "$SRC_DIR/minigraph/minigraph" "$ENV_BIN/minigraph"
+    have minigraph
+}
 
-# ---------------------------------------------------------------------------
-# 2. Assembly-mode SV comparators
-# ---------------------------------------------------------------------------
-if [[ "$MODE" =~ ^(all|sv-only)$ ]]; then
-    echo ""
-    echo -e "${YELLOW}[2] Assembly-mode SV comparators${NC}"
+install_gfatools() {
+    if ! need gfatools; then ok "gfatools already on PATH"; return 0; fi
+    require_cmd git make install || return 1
+    clone_fresh https://github.com/lh3/gfatools.git "$SRC_DIR/gfatools" || return 1
+    (cd "$SRC_DIR/gfatools" && make -j"$THREADS") || return 1
+    install -m 755 "$SRC_DIR/gfatools/gfatools" "$ENV_BIN/gfatools"
+    have gfatools
+}
 
-    # minimap2 + samtools + bcftools (shared dependency)
-    install_conda "minimap2"    "-c bioconda -c conda-forge"
-    install_conda "samtools"    "-c bioconda -c conda-forge"
-    install_conda "bcftools"    "-c bioconda -c conda-forge"
-    install_conda "htslib"      "-c bioconda -c conda-forge"
+install_htslib() {
+    if have bgzip && have tabix && [[ "$FORCE" != "1" ]]; then ok "htslib tools already on PATH"; return 0; fi
+    require_cmd git make install autoreconf || return 1
+    clone_fresh https://github.com/samtools/htslib.git "$SRC_DIR/htslib" || return 1
+    (cd "$SRC_DIR/htslib" && autoreconf -i && ./configure --prefix="$CONDA_PREFIX" && make -j"$THREADS" && make install) || return 1
+    have bgzip && have tabix
+}
 
-    # SyRI — whole-genome synteny + SV detection (assembly vs reference)
-    # Paper: Goel et al. (2019); doi:10.1186/s13059-019-1793-5
-    install_conda "syri"        "-c bioconda -c conda-forge"
+install_samtools() {
+    if ! need samtools; then ok "samtools already on PATH"; return 0; fi
+    require_cmd git make install autoreconf || return 1
+    install_htslib || return 1
+    clone_fresh https://github.com/samtools/samtools.git "$SRC_DIR/samtools" || return 1
+    (cd "$SRC_DIR/samtools" && autoreconf -i && ./configure --prefix="$CONDA_PREFIX" --with-htslib="$CONDA_PREFIX" && make -j"$THREADS" && make install) || return 1
+    have samtools
+}
 
-    # minigraph — pangenome graph builder + GFA-based SV calling
-    # Paper: Li (2020); doi:10.1186/s13059-020-02168-z
-    install_conda "minigraph"   "-c bioconda -c conda-forge"
-    install_conda "gfatools"    "-c bioconda -c conda-forge"
+install_bcftools() {
+    if ! need bcftools; then ok "bcftools already on PATH"; return 0; fi
+    require_cmd git make install autoreconf || return 1
+    install_htslib || return 1
+    clone_fresh https://github.com/samtools/bcftools.git "$SRC_DIR/bcftools" || return 1
+    (cd "$SRC_DIR/bcftools" && autoreconf -i && ./configure --prefix="$CONDA_PREFIX" --with-htslib="$CONDA_PREFIX" && make -j"$THREADS" && make install) || return 1
+    have bcftools
+}
 
-    # PGGB — PanGenome Graph Builder (sequence-to-graph, odgi)
-    # Paper: Garrison et al. (2023); doi:10.1038/s41592-023-02014-7
-    install_conda "pggb"        "-c bioconda -c conda-forge"
-    install_conda "odgi"        "-c bioconda -c conda-forge"
-    install_conda "vg"          "-c bioconda -c conda-forge"
+install_syri() {
+    if ! need syri; then ok "syri already on PATH"; return 0; fi
+    require_cmd git || return 1
+    install_minimap2 || return 1
+    pip_install Cython numpy psutil pandas pysam scipy 2>&1 | tail -5 || return 1
+    clone_fresh https://github.com/schneebergerlab/syri.git "$SRC_DIR/syri-src" || return 1
+    (cd "$SRC_DIR/syri-src" && pip_install --no-build-isolation .) 2>&1 | tail -20 || return 1
+    have syri
+}
 
-    # SVIM-asm — SV calling from haplotype-resolved assemblies via minimap2
-    # Paper: Heller & Vingron (2021); doi:10.1093/bioinformatics/btab705
-    install_conda "svim-asm"    "-c bioconda -c conda-forge"
+install_svim() {
+    if ! need svim; then ok "svim already on PATH"; return 0; fi
+    require_cmd git || return 1
+    pip_install "git+https://github.com/eldariont/svim.git" 2>&1 | tail -20 || return 1
+    have svim
+}
 
-    # AnchorWave — sensitive whole-genome alignment for plant/fungal genomes
-    # Paper: Song et al. (2022); doi:10.1073/pnas.2106652119
-    install_conda "anchorwave"  "-c bioconda -c conda-forge"
-    # paftools.js (part of minimap2 package, but ensure it is on PATH)
-    install_conda "k8"          "-c bioconda -c conda-forge"
+install_svim-asm() {
+    if ! need svim-asm; then ok "svim-asm already on PATH"; return 0; fi
+    require_cmd git || return 1
+    install_minimap2 || return 1
+    install_samtools || return 1
+    pip_install "git+https://github.com/eldariont/svim-asm.git" 2>&1 | tail -20 || return 1
+    have svim-asm
+}
 
-    # Minigraph-Cactus (cactus-pangenome) — sequence-to-pangenome graph
-    # Paper: Armstrong et al. (2020); doi:10.1038/s41592-020-0939-8
-    # Note: large package; may take several minutes
-    info "Installing cactus (Minigraph-Cactus) — this may take several minutes..."
-    if ${CONDA_CMD} install -y -c bioconda -c conda-forge cactus 2>&1 | tail -3; then
-        ok "Installed: cactus (cactus-pangenome)"
-    else
-        warn "cactus install failed — try: pip install progressiveCactus"
-        warn "Or download a release binary: https://github.com/ComparativeGenomicsToolkit/cactus/releases"
-    fi
-fi
+install_sniffles() {
+    if ! need sniffles; then ok "sniffles already on PATH"; return 0; fi
+    require_cmd git || return 1
+    pip_install "git+https://github.com/fritzsedlazeck/Sniffles.git" 2>&1 | tail -20 || return 1
+    have sniffles
+}
 
-# ---------------------------------------------------------------------------
-# 3. Short-reads SV comparators
-# ---------------------------------------------------------------------------
-if [[ "$MODE" =~ ^(all|sv-only)$ ]]; then
-    echo ""
-    echo -e "${YELLOW}[3] Short-reads SV comparators${NC}"
+install_cuteSV() {
+    if ! need cuteSV; then ok "cuteSV already on PATH"; return 0; fi
+    require_cmd git || return 1
+    pip_install --no-build-isolation "git+https://github.com/brentp/cigar.git" 2>&1 | tail -5 || true
+    clone_fresh https://github.com/tjiangHIT/cuteSV.git "$SRC_DIR/cuteSV-src" || return 1
+    (cd "$SRC_DIR/cuteSV-src" && pip_install --no-build-isolation .) 2>&1 | tail -20 || return 1
+    have cuteSV
+}
 
-    # Delly — structural variant detection from paired-end reads
-    # Paper: Rausch et al. (2012); doi:10.1093/bioinformatics/bts378
-    install_conda "delly"       "-c bioconda -c conda-forge"
+install_anchorwave() {
+    if ! need anchorwave; then ok "anchorwave already on PATH"; return 0; fi
+    require_cmd git cmake make install || return 1
+    install_minimap2 || return 1
+    install_samtools || return 1
+    install_paftools_js || return 1
+    clone_fresh https://github.com/baoxingsong/AnchorWave.git "$SRC_DIR/AnchorWave" || return 1
+    (cd "$SRC_DIR/AnchorWave" && cmake -DCMAKE_BUILD_TYPE=Release . && make -j"$THREADS") || return 1
+    install -m 755 "$SRC_DIR/AnchorWave/anchorwave" "$ENV_BIN/anchorwave"
+    have anchorwave
+}
 
-    # Manta — structural variant and indel caller from paired-end reads
-    # Paper: Chen et al. (2016); doi:10.1093/bioinformatics/btv710
-    install_conda "manta"       "-c bioconda -c conda-forge"
-fi
+install_delly() {
+    if ! need delly; then ok "delly already on PATH"; return 0; fi
+    install_bcftools || return 1
+    require_cmd curl chmod || return 1
+    local version="v1.7.3"
+    curl -fsSL -o "$ENV_BIN/delly" "https://github.com/dellytools/delly/releases/download/${version}/delly-${version}-linux-amd64" || return 1
+    chmod +x "$ENV_BIN/delly"
+    have delly
+}
 
-# ---------------------------------------------------------------------------
-# 4. Long-reads SV comparators
-# ---------------------------------------------------------------------------
-if [[ "$MODE" =~ ^(all|sv-only)$ ]]; then
-    echo ""
-    echo -e "${YELLOW}[4] Long-reads SV comparators${NC}"
+install_manta() {
+    if ! need configManta.py; then ok "manta already on PATH"; return 0; fi
+    require_cmd curl tar ln || return 1
+    local version="1.6.0" tarball="$SRC_DIR/manta-${version}.tar.bz2" root="$SRC_DIR/manta-${version}.centos6_x86_64"
+    rm -rf "$root" "$tarball"
+    curl -fsSL -o "$tarball" "https://github.com/Illumina/manta/releases/download/v${version}/manta-${version}.centos6_x86_64.tar.bz2" || return 1
+    tar -xjf "$tarball" -C "$SRC_DIR" || return 1
+    [[ -x "$root/bin/configManta.py" ]] || return 1
+    ln -sf "$root/bin/configManta.py" "$ENV_BIN/configManta.py"
+    ln -sf "$root/bin/configManta.py" "$ENV_BIN/manta"
+    have configManta.py
+}
 
-    # SVIM — SV detection from long reads (ONT/PacBio)
-    # Paper: Heller & Vingron (2019); doi:10.1093/bioinformatics/btz041
-    install_conda "svim"        "-c bioconda -c conda-forge"
-
-    # Sniffles2 — SV detection from long reads with population support
-    # Paper: Sedlazeck et al. (2018); doi:10.1038/s41592-018-0001-7
-    install_conda "sniffles"    "-c bioconda -c conda-forge"
-
-    # cuteSV — sensitive SV detection from long reads
-    # Paper: Jiang et al. (2020); doi:10.1186/s13059-020-02107-y
-    install_conda "cutesv"      "-c bioconda -c conda-forge"
-fi
-
-# ---------------------------------------------------------------------------
-# 5. TE classification tools
-# ---------------------------------------------------------------------------
-if [[ "$MODE" =~ ^(all|te-only)$ ]]; then
-    echo ""
-    echo -e "${YELLOW}[5] TE classification tools${NC}"
-
-    # Python ML/DL dependencies shared by TE tools
-    install_pip "biopython>=1.81"
-    install_pip "pandas>=2.0"
-    install_pip "scikit-learn>=1.3"
-    install_pip "numpy>=1.24"
-
-    # DeepTE — CNN-based TE classifier (fungi/animal/plant)
-    # Paper: Yan et al. (2020); doi:10.1093/nar/gkaa323
-    # Requires TensorFlow
-    info "Installing TensorFlow (CPU) for DeepTE/CREATE..."
-    install_pip "tensorflow-cpu>=2.12"
-    if command -v pip3 &>/dev/null; then
-        info "Installing DeepTE via pip (GitHub)..."
-        python3 -m pip install -q \
-            "git+https://github.com/LiLabAtVT/DeepTE.git" 2>/dev/null \
-            || warn "DeepTE GitHub install failed — install manually from https://github.com/LiLabAtVT/DeepTE"
-    fi
-
-    # NeuralTE — transformer-based TE classifier (best fungal F1 in PanTEon)
-    # Paper: Han et al. (2024); doi:10.1093/nar/gkae009
-    # Requires PyTorch
-    info "Installing PyTorch (CPU) for NeuralTE/TERL/Terrier..."
-    install_pip "torch>=2.0 torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu"
-    python3 -m pip install -q \
-        "git+https://github.com/CSU-KangHu/NeuralTE.git" 2>/dev/null \
-        || warn "NeuralTE GitHub install failed — install from https://github.com/CSU-KangHu/NeuralTE"
-
-    # TERL — LSTM-based TE classifier
-    # Paper: Lopez-Escamilla et al. (2021); doi:10.1093/molbev/msab143
-    python3 -m pip install -q \
-        "git+https://github.com/simonorozcoarias/TERL.git" 2>/dev/null \
-        || warn "TERL GitHub install failed — install from https://github.com/simonorozcoarias/TERL"
-
-    # Terrier — k-mer-based TE classifier
-    # Paper: Ruiz et al. (2022); doi:10.1093/bioinformatics/btac274
-    python3 -m pip install -q terrier-te 2>/dev/null \
-        || warn "Terrier pip install failed — try: pip install terrier-te"
-
-    # ClassifyTE — SVM-based TE classifier
-    # Paper: Orozco-Arias et al. (2021); doi:10.1093/bioinformatics/btaa1101
-    python3 -m pip install -q \
-        "git+https://github.com/simonorozcoarias/ClassifyTE.git" 2>/dev/null \
-        || warn "ClassifyTE GitHub install failed — install from https://github.com/simonorozcoarias/ClassifyTE"
-
-    # CREATE — Random-forest TE classifier
-    # Paper: Orozco-Arias et al. (2022); doi:10.3390/genes13020239
-    python3 -m pip install -q \
-        "git+https://github.com/simonorozcoarias/create.git" 2>/dev/null \
-        || warn "CREATE GitHub install failed — install from https://github.com/simonorozcoarias/CREATE"
-
-    # TEClass2 — kNN/SVM hierarchical TE classifier
-    # Paper: Nicolás et al. (2021)
-    install_conda "teclass2"    "-c bioconda -c conda-forge" \
-        || python3 -m pip install -q teclass2 2>/dev/null \
-        || warn "TEClass2 install failed — install from https://github.com/HelixPG/TEClass2"
-fi
-
-# ---------------------------------------------------------------------------
-# 6. Build MycoSV binary
-# ---------------------------------------------------------------------------
-if [[ "$MODE" =~ ^(all|mycosv-only)$ ]]; then
-    echo ""
-    echo -e "${YELLOW}[6] Building MycoSV binary (fungi_graphsv_tol)${NC}"
-    BINARY="${SCRIPT_DIR}/fungi_graphsv_tol"
-
-    # Detect g++ from environment
-    GPP="$(command -v g++ 2>/dev/null || command -v c++ 2>/dev/null || echo "")"
-    if [[ -z "$GPP" ]]; then
-        fail "g++ not found — install via: conda install -c conda-forge gxx_linux-64"
-        exit 1
-    fi
-
-    info "Compiling with $GPP ..."
-    "${GPP}" -O2 -DNDEBUG -std=c++17 -pthread \
-        -I"${SCRIPT_DIR}" \
-        "${SCRIPT_DIR}/main.cpp" \
-        -o "${BINARY}" \
-        && ok "Built: ${BINARY}" \
-        || { fail "Build failed — check compiler errors above"; exit 1; }
-fi
-
-# ---------------------------------------------------------------------------
-# 7. Verification
-# ---------------------------------------------------------------------------
-echo ""
-echo -e "${YELLOW}[7] Verification${NC}"
-echo ""
-echo "=== MycoSV binary ==="
-check_tool "fungi_graphsv_tol" || check_tool "${SCRIPT_DIR}/fungi_graphsv_tol" || true
-echo ""
-
-if [[ "$MODE" =~ ^(all|sv-only)$ ]]; then
-    echo "=== Assembly SV tools ==="
-    check_tool minimap2 || true
-    check_tool syri     || true
-    check_tool minigraph|| true
-    check_tool gfatools  || true
-    check_tool pggb     || true
-    check_tool svim-asm || true
-    check_tool anchorwave|| true
-    echo ""
-    echo "=== Short-reads SV tools ==="
-    check_tool delly          || true
-    check_tool configManta.py || true
-    echo ""
-    echo "=== Long-reads SV tools ==="
-    check_tool svim     || true
-    check_tool sniffles || true
-    check_tool cuteSV   || true
-    echo ""
-fi
-
-if [[ "$MODE" =~ ^(all|te-only)$ ]]; then
-    echo "=== TE classification tools ==="
-    check_tool DeepTE.py   || true
-    check_tool NeuralTE.py || true
-    check_tool TERL.py     || true
-    check_tool terrier.py  || true
-    check_tool ClassifyTE.py|| true
-    check_tool CREATE.py   || true
-    check_tool TEClass2    || true
-    check_python_module tensorflow || true
-    check_python_module torch      || true
-    echo ""
-fi
-
-# ---------------------------------------------------------------------------
-# Summary
-# ---------------------------------------------------------------------------
-echo -e "${BLUE}========================================"
-echo "Install Summary"
-echo "========================================${NC}"
-echo "  Available: ${#AVAILABLE_TOOLS[@]}"
-echo "  Missing  : ${#MISSING_TOOLS[@]}"
-if [[ ${#MISSING_TOOLS[@]} -gt 0 ]]; then
-    echo ""
-    warn "The following tools could not be installed automatically:"
-    for t in "${MISSING_TOOLS[@]}"; do
-        echo "    - $t"
+write_apptainer_wrapper() {
+    local sif="$1"; shift
+    local tool
+    for tool in "$@"; do
+        cat > "$ENV_BIN/$tool" <<EOF2
+#!/usr/bin/env bash
+exec apptainer exec --bind /mnt --bind /tmp "$sif" "$tool" "\$@"
+EOF2
+        chmod +x "$ENV_BIN/$tool"
     done
-    echo ""
-    echo "To activate the environment and retry:"
-    echo "  conda activate ${ENV_NAME}"
-    echo "  bash install_tools.sh --check"
-fi
-echo ""
-echo "To activate the environment:"
-echo "  conda activate ${ENV_NAME}"
-echo ""
-echo "To run experiments:"
-echo "  bash run_all_experiments.sh --real"
-echo "  python3 run_te_benchmark.py --download-fungi-demo --out-dir te_results/"
-echo ""
-echo -e "${GREEN}Done.${NC}"
+}
+
+pull_apptainer_image() {
+    local sif="$1" image="$2"
+    require_cmd apptainer || return 1
+    if [[ ! -s "$sif" || "$FORCE" == "1" ]]; then
+        apptainer pull --force "$sif" "$image" || return 1
+    fi
+}
+
+install_pggb() {
+    if ! need pggb; then ok "pggb already on PATH"; return 0; fi
+    [[ "$USE_APPTAINER" == "1" ]] || { fail "pggb dependency stack requires Apptainer; set USE_APPTAINER=1"; return 1; }
+    require_cmd git || return 1
+    clone_fresh https://github.com/pangenome/pggb.git "$SRC_DIR/pggb-src" || info "pggb source clone failed (provenance only); continuing with apptainer image"
+    local sif="$SRC_DIR/pggb.sif"
+    pull_apptainer_image "$sif" docker://ghcr.io/pangenome/pggb:latest || return 1
+    write_apptainer_wrapper "$sif" pggb
+    have pggb
+}
+
+install_cactus_release() {
+    require_cmd curl tar ln || return 1
+    local version="3.1.4" tarball="$SRC_DIR/cactus-bin-v${version}.tar.gz" root="$SRC_DIR/cactus-bin-v${version}"
+    rm -rf "$root" "$tarball"
+    curl -fsSL -o "$tarball" "https://github.com/ComparativeGenomicsToolkit/cactus/releases/download/v${version}/cactus-bin-v${version}.tar.gz" || return 1
+    tar -xzf "$tarball" -C "$SRC_DIR" || return 1
+    if [[ -f "$root/setup.py" ]]; then
+        pip_install --no-build-isolation -U setuptools wheel 2>&1 | tail -5 || true
+        pip_install --no-build-isolation "$root" 2>&1 | tail -20 || true
+        [[ -f "$root/toil-requirement.txt" ]] && pip_install --no-build-isolation -r "$root/toil-requirement.txt" 2>&1 | tail -10 || true
+    fi
+    local f b
+    for f in "$root"/bin/*; do
+        [[ -e "$f" ]] || continue
+        b="$(basename "$f")"
+        ln -sf "$f" "$ENV_BIN/$b"
+    done
+    have cactus-pangenome
+}
+
+install_cactus-pangenome() {
+    if ! need cactus-pangenome; then ok "cactus-pangenome already on PATH"; return 0; fi
+    if [[ "$CACTUS_MODE" == "release" ]]; then
+        install_cactus_release && return 0
+        return 1
+    fi
+    [[ "$USE_APPTAINER" == "1" ]] || { fail "cactus container install requires USE_APPTAINER=1; or set CACTUS_MODE=release"; return 1; }
+    local sif="$SRC_DIR/cactus.sif"
+    pull_apptainer_image "$sif" docker://quay.io/comparative-genomics-toolkit/cactus:v3.1.4 || return 1
+    write_apptainer_wrapper "$sif" cactus cactus-pangenome cactus-prepare cactus-graphmap cactus-update-prepare
+    have cactus-pangenome
+}
+
+readonly COMPARATOR_TOOLS=(minimap2 paftools_js syri minigraph gfatools samtools bcftools svim-asm anchorwave pggb cactus-pangenome)
+readonly ALL_TOOLS=(minimap2 k8 paftools_js minigraph gfatools htslib samtools bcftools syri svim-asm anchorwave pggb cactus-pangenome svim sniffles cuteSV delly manta)
+readonly CHECK_TOOLS=(minimap2 paftools.js syri minigraph gfatools pggb cactus-pangenome svim-asm samtools bcftools anchorwave svim sniffles cuteSV delly configManta.py)
+
+normalize_tool() {
+    case "$1" in
+        cactus) echo cactus-pangenome ;;
+        paftools|paftools.js|paftools_js) echo paftools_js ;;
+        sniffles2) echo sniffles ;;
+        cutesv) echo cuteSV ;;
+        svim_asm) echo svim-asm ;;
+        all) echo __ALL__ ;;
+        comparators|benchmarking|preflight) echo __COMPARATORS__ ;;
+        *) echo "$1" ;;
+    esac
+}
+
+check_tools() {
+    hdr "Comparator/tool availability"
+    local missing=0 tool path
+    for tool in "${CHECK_TOOLS[@]}"; do
+        if have "$tool"; then
+            path="$(command -v "$tool")"
+            ok "$(printf '%-18s %s' "$tool" "$path")"
+        else
+            fail "$(printf '%-18s missing' "$tool")"
+            missing=$((missing + 1))
+        fi
+    done
+    echo
+    [[ "$missing" == 0 ]] && echo "All checked tools are present." || echo "Missing tools: $missing"
+}
+
+run_one() {
+    local tool fn
+    tool="$(normalize_tool "$1")"
+    fn="install_${tool}"
+    if ! declare -F "$fn" >/dev/null; then
+        fail "unknown tool: $1"
+        return 1
+    fi
+    hdr "$tool"
+    if "$fn"; then ok "$tool installed"; return 0; fi
+    fail "$tool install failed"
+    return 1
+}
+
+print_usage() { sed -n '1,31p' "$0" | sed 's/^# \{0,1\}//'; }
+
+main() {
+    if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then print_usage; exit 0; fi
+    activate_env || exit 1
+    if [[ "${1:-}" == "--check" || "${1:-}" == "check" ]]; then check_tools; exit 0; fi
+
+    local raw targets=() norm failed=0 t
+    if [[ "$#" -eq 0 ]]; then
+        targets=("${COMPARATOR_TOOLS[@]}")
+    else
+        for raw in "$@"; do
+            norm="$(normalize_tool "$raw")"
+            if [[ "$norm" == "__ALL__" ]]; then targets=("${ALL_TOOLS[@]}"); break; fi
+            if [[ "$norm" == "__COMPARATORS__" ]]; then targets=("${COMPARATOR_TOOLS[@]}"); break; fi
+            targets+=("$norm")
+        done
+    fi
+
+    hdr "Install plan"
+    echo "Env         : $ENV_PATH"
+    echo "Bin         : $ENV_BIN"
+    echo "Source/cache: $SRC_DIR"
+    echo "Threads     : $THREADS"
+    echo "Force       : $FORCE"
+    echo "Cactus mode : $CACTUS_MODE"
+    echo "Tools       : ${targets[*]}"
+
+    for t in "${targets[@]}"; do
+        run_one "$t" || failed=$((failed + 1))
+    done
+    check_tools
+    if [[ "$failed" -gt 0 ]]; then fail "$failed install stage(s) failed"; exit 1; fi
+}
+
+main "$@"

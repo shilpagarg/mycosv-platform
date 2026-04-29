@@ -10,11 +10,13 @@ import gzip
 import io
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
 import time
 import hashlib
+import urllib.error
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
@@ -73,6 +75,51 @@ PUBLIC_RESOURCE_LINKS: list[dict[str, str]] = [
         "label": "mycocosm",
         "url": "https://mycocosm.jgi.doe.gov/",
         "description": "JGI MycoCosm fungal genome portal",
+    },
+    # Gene/expression data sources used by analyze_new_biology_candidates.py
+    # when populating expression_supported / expression_log2_fc / expression_padj.
+    # Operators populate expression.tsv from these manually for now (no
+    # canonical species->experiment mapping for fungi), and prepare-step picks
+    # it up automatically as prepared_dir/expression.tsv on the next benchmark.
+    {
+        "label": "ensembl_fungi_rest",
+        "url": "https://rest.ensembl.org/documentation/info/lookup",
+        "description": "Ensembl Fungi REST: gene + ortholog metadata for annotated fungal species",
+    },
+    {
+        "label": "ensembl_fungi_ftp",
+        "url": "https://ftp.ensemblgenomes.org/pub/fungi/current/gff3/",
+        "description": "Ensembl Fungi current GFF3 dumps (fallback when NCBI has no GFF for an assembly)",
+    },
+    {
+        "label": "expression_atlas_baseline",
+        "url": "https://www.ebi.ac.uk/gxa/experiments?experimentType=baseline&kingdom=fungi",
+        "description": "EBI Expression Atlas baseline experiments (per-tissue/condition gene expression for fungi)",
+    },
+    {
+        "label": "expression_atlas_differential",
+        "url": "https://www.ebi.ac.uk/gxa/experiments?experimentType=differential&kingdom=fungi",
+        "description": "EBI Expression Atlas differential experiments (log2FC/padj across conditions; primary source for expression_log2_fc / expression_padj)",
+    },
+    {
+        "label": "ncbi_geo",
+        "url": "https://www.ncbi.nlm.nih.gov/geo/browse/?view=series&search=fungi",
+        "description": "NCBI GEO public RNA-seq / microarray series (use SRA/ENA for raw, recount3/Atlas for processed)",
+    },
+    {
+        "label": "fungidb",
+        "url": "https://fungidb.org/fungidb/app",
+        "description": "FungiDB / VEuPathDB: integrated genotype + phenotype + expression for pathogenic fungi",
+    },
+    {
+        "label": "phi_base",
+        "url": "http://www.phi-base.org/",
+        "description": "PHI-base: pathogen-host interaction phenotypes; gene-level pathogenicity calls",
+    },
+    {
+        "label": "fungaltraits",
+        "url": "https://github.com/traitlife/FungalTraits",
+        "description": "FungalTraits: curated genus-/species-level lifestyle and trait database (Polõme 2020)",
     },
 ]
 
@@ -330,6 +377,23 @@ def run_mycosv_command(cmd: list[str], cwd: Path | None = None) -> subprocess.Co
                 f"almost certainly a cgroup OOM kill (cgroup memory.max = "
                 f"{limit_str}). Re-run with more memory or fewer refs.\n"
             )
+        # The binary's stderr/stdout are otherwise lost because we capture
+        # them into the CompletedProcess.  Replay the tail to the script's
+        # stderr so the operator sees the actual failure mode (parse error,
+        # missing index, segfault stack, etc.) instead of a bare exit code.
+        for stream_name, stream in (("stderr", exc.stderr), ("stdout", exc.stdout)):
+            if not stream:
+                continue
+            tail = stream.splitlines()[-40:]
+            sys.stderr.write(f"[mycosv] binary {stream_name} (last {len(tail)} lines):\n")
+            for line in tail:
+                sys.stderr.write(f"  {line}\n")
+        raise
+    except subprocess.TimeoutExpired as exc:
+        sys.stderr.write(
+            f"[mycosv] binary timed out after {exc.timeout}s. Re-run with a "
+            f"longer --tool-timeout, fewer queries, or smaller --tol-max-clade-genomes.\n"
+        )
         raise
 
 
@@ -352,6 +416,43 @@ def normalize_name(raw: str) -> str:
     while "__" in cleaned:
         cleaned = cleaned.replace("__", "_")
     return cleaned or "unknown"
+
+
+_FALLBACK_ENV_BINS: tuple[Path, ...] = (
+    # Same default the install_tools.sh / Apptainer wrappers use. Looking here
+    # makes the comparator pre-flight see installed tools even when the user
+    # invoked python3 from a non-activated shell (e.g. via run_all_experiments.sh
+    # which does not source conda.sh). Honors $CONDA_PREFIX / $MYCOSV_ENV_PATH.
+    Path(os.environ.get("MYCOSV_ENV_PATH", os.environ.get("CONDA_PREFIX", "/dev/null"))) / "bin",
+    Path("/mnt/bmh01-rds/Shilpa_Group/2024/projects/fungi/tools/envs/envs/fungi_graph_sv/bin"),
+)
+
+
+def _prepend_env_bins_to_path() -> None:
+    """Prepend the project's known conda env bin to PATH (idempotent).
+
+    Comparator subprocess calls (`minimap2 ...`, `syri ...`, `delly ...`) use
+    bare tool names, so they require the binaries to be on PATH at exec time.
+    When run_all_experiments.sh launches python3 without activating conda, PATH
+    only contains system dirs and the comparators silently fail with FileNotFoundError.
+    Prepending here lets the operator skip `conda activate` and still get a full
+    comparator run.
+    """
+    current = os.environ.get("PATH", "").split(os.pathsep)
+    current_set = set(current)
+    additions: list[str] = []
+    for env_bin in _FALLBACK_ENV_BINS:
+        if not env_bin.is_dir():
+            continue
+        s = str(env_bin)
+        if s and s not in current_set:
+            additions.append(s)
+            current_set.add(s)
+    if additions:
+        os.environ["PATH"] = os.pathsep.join(additions + current)
+
+
+_prepend_env_bins_to_path()
 
 
 def tool_path(name: str) -> str | None:
@@ -413,6 +514,38 @@ def open_text_auto(path: Path):
     if path.suffix == ".gz":
         return gzip.open(path, "rt", encoding="utf-8")
     return path.open("r", encoding="utf-8")
+
+
+_FASTA_CONTIG_CACHE: dict[str, frozenset[str]] = {}
+
+
+def fasta_contig_names(fasta_path: Path) -> frozenset[str]:
+    """Return the set of sequence IDs in a (possibly gzipped) FASTA.
+
+    Used to scope MycoSV's reference-coordinate calls to a specific
+    benchmark reference per query, so precision/recall against pairwise
+    comparators (which only see one reference) is measured fairly.
+    """
+    key = str(fasta_path)
+    cached = _FASTA_CONTIG_CACHE.get(key)
+    if cached is not None:
+        return cached
+    contigs: set[str] = set()
+    if not fasta_path.exists():
+        _FASTA_CONTIG_CACHE[key] = frozenset()
+        return frozenset()
+    try:
+        with open_text_auto(fasta_path) as fh:
+            for line in fh:
+                if line.startswith(">"):
+                    contigs.add(line[1:].split()[0] if line[1:].strip() else "")
+    except OSError:
+        _FASTA_CONTIG_CACHE[key] = frozenset()
+        return frozenset()
+    contigs.discard("")
+    frozen = frozenset(contigs)
+    _FASTA_CONTIG_CACHE[key] = frozen
+    return frozen
 
 
 def write_public_resource_links(path: Path) -> None:
@@ -494,10 +627,30 @@ def species_group_key(row: dict[str, str]) -> str:
     return species_label_for_row(row).lower()
 
 
+# NCBI Taxonomy renames that have left panel presets out of sync. Each entry
+# maps a panel-preset species name to additional accepted names that NCBI's
+# assembly_summary may use today. Add bidirectionally so legacy and current
+# names both match. Sourced from the 2019–2023 Saccharomycetes reclassification
+# (Takashima & Sugita) and the 2024 ICTF list updates.
+SPECIES_ALIASES: dict[str, list[str]] = {
+    "candida glabrata": ["nakaseomyces glabratus", "nakaseomyces glabrata", "[candida] glabrata"],
+    "candida krusei": ["pichia kudriavzevii", "issatchenkia orientalis"],
+    "candida lusitaniae": ["clavispora lusitaniae"],
+    "candida guilliermondii": ["meyerozyma guilliermondii"],
+    "candida tropicalis": ["[candida] tropicalis"],
+    # Cryptococcus species complex split — keep both names recognised.
+    "cryptococcus neoformans": ["cryptococcus neoformans var. grubii", "cryptococcus deneoformans"],
+}
+
+
 def match_species(row: dict[str, str], species: str) -> bool:
     organism = (row.get("organism_name") or "").lower()
     target = species.strip().lower()
-    return organism.startswith(target) or f" {target} " in f" {organism} "
+    candidates = [target] + SPECIES_ALIASES.get(target, [])
+    for cand in candidates:
+        if organism.startswith(cand) or f" {cand} " in f" {organism} ":
+            return True
+    return False
 
 
 def select_species_rows(rows: list[dict[str, str]], species: str, max_n: int) -> list[dict[str, str]]:
@@ -581,6 +734,16 @@ _PHENOTYPE_ATTRS = {
 }
 
 
+_VALID_BIOSAMPLE_RE = re.compile(r"^SAM[NED][A-Z]?\d+$")
+
+
+def _is_valid_biosample_id(bid: str) -> bool:
+    # NCBI's assembly_summary populates missing fields with the literal "na".
+    # Sending those (or other placeholders) to efetch returns HTTP 400 and
+    # spams the operator log. Real BioSample accessions match SAMN/SAMEA/SAMD.
+    return bool(bid) and _VALID_BIOSAMPLE_RE.match(bid.strip()) is not None
+
+
 def fetch_ncbi_biosample_phenotypes(
     biosample_ids: list[str],
     cache_path: Path | None = None,
@@ -598,23 +761,44 @@ def fetch_ncbi_biosample_phenotypes(
         except Exception:
             cache = {}
 
-    wanted = [bid for bid in biosample_ids if bid and bid not in cache]
+    wanted = [bid for bid in biosample_ids if _is_valid_biosample_id(bid) and bid not in cache]
+    skipped = [bid for bid in biosample_ids if bid and not _is_valid_biosample_id(bid)]
+    if skipped:
+        sample = ", ".join(sorted(set(skipped))[:5])
+        sys.stderr.write(
+            f"[phenotype] skipping {len(skipped)} non-BioSample id(s) "
+            f"(e.g. {sample}); these are NCBI 'na' placeholders or non-conforming.\n"
+        )
     if not wanted:
         return cache
 
-    for start in range(0, len(wanted), 200):
-        batch = wanted[start : start + 200]
+    # Batch size: NCBI eutils tolerates up to ~500 IDs via GET, but BioSample
+    # accessions in this pipeline are sometimes mixed with sample-set IDs that
+    # individually expand to multi-record XML; large GET batches can hit the
+    # endpoint's per-request size cap and return HTTP 400. 100/batch is the
+    # documented safe value for efetch and stays well under URL limits.
+    for start in range(0, len(wanted), 100):
+        batch = wanted[start : start + 100]
         query = urllib.parse.urlencode({
             "db": "biosample",
             "id": ",".join(batch),
             "retmode": "xml",
+            # NCBI usage policy: identify the client. Without these, eutils
+            # silently throttles and occasionally responds with 400 instead
+            # of 429 when the upstream rejects the batch.
+            "tool": "mycosv-benchmark",
+            "email": "shilpa.garg2k7@gmail.com",
         })
         try:
             xml_text = http_get_text(
                 f"https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi?{query}"
             )
         except Exception as exc:
-            sys.stderr.write(f"[warn] BioSample phenotype fetch failed for batch: {exc}\n")
+            sys.stderr.write(
+                f"[warn] BioSample phenotype fetch failed for batch "
+                f"({len(batch)} ids, first={batch[0]!r}): "
+                f"{type(exc).__name__}: {exc}\n"
+            )
             continue
         try:
             root = ET.fromstring(xml_text)
@@ -681,6 +865,108 @@ def write_tsv(path: Path, rows: list[dict[str, Any]], fieldnames: list[str]) -> 
         writer.writerows(rows)
 
 
+_GFF_GENE_TYPES: frozenset[str] = frozenset({
+    # NCBI / Ensembl Fungi gene-level feature types we want to surface to the
+    # SV biology analyzer. ncRNA / tRNA / rRNA are deliberately excluded — the
+    # candidate scoring already discriminates protein-coding loci.
+    "gene", "protein_coding_gene", "pseudogene",
+})
+
+
+def _parse_gff_attributes(attr_field: str) -> dict[str, str]:
+    out: dict[str, str] = {}
+    for entry in attr_field.strip().split(";"):
+        entry = entry.strip()
+        if not entry or "=" not in entry:
+            continue
+        k, _, v = entry.partition("=")
+        out[k.strip().lower()] = urllib.parse.unquote(v.strip())
+    return out
+
+
+def gff_to_gene_annotations(gff_paths: list[tuple[str, Path]]) -> list[dict[str, Any]]:
+    """Convert a list of (asm_name, gff.gz path) tuples into the row schema
+    expected by analyze_new_biology_candidates.load_gene_annotations.
+
+    Output columns: query_asm, query_contig, gene_id, gene_name, start, end.
+    The asm_name is stored verbatim so the analyzer's per-(asm, contig) lookup
+    finds genes for either ref-coordinate or query-coordinate breakpoints
+    (the analyzer falls back to '.' when no asm-keyed row matches).
+    """
+    rows: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, str]] = set()
+    for asm_name, gff_path in gff_paths:
+        if not gff_path.exists():
+            continue
+        opener = gzip.open if gff_path.suffix == ".gz" else open
+        try:
+            with opener(gff_path, "rt", encoding="utf-8", errors="replace") as fh:
+                for line in fh:
+                    if not line or line.startswith("#"):
+                        continue
+                    parts = line.rstrip("\n").split("\t")
+                    if len(parts) < 9:
+                        continue
+                    contig, _src, ftype, start_s, end_s, _score, strand, _phase, attrs = parts[:9]
+                    if ftype.lower() not in _GFF_GENE_TYPES:
+                        continue
+                    try:
+                        start = int(start_s)
+                        end = int(end_s)
+                    except ValueError:
+                        continue
+                    if end < start:
+                        start, end = end, start
+                    parsed = _parse_gff_attributes(attrs)
+                    gene_id = (
+                        parsed.get("id")
+                        or parsed.get("locus_tag")
+                        or parsed.get("gene_id")
+                        or parsed.get("name")
+                        or ""
+                    )
+                    if not gene_id:
+                        continue
+                    key = (asm_name, contig, gene_id)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    rows.append({
+                        "query_asm": asm_name,
+                        "query_contig": contig,
+                        "gene_id": gene_id,
+                        "gene_name": parsed.get("name") or parsed.get("gene") or gene_id,
+                        "start": start,
+                        "end": end,
+                        "strand": strand if strand in {"+", "-"} else ".",
+                        "biotype": parsed.get("biotype") or parsed.get("gene_biotype") or ftype,
+                        "product": parsed.get("product", ""),
+                    })
+        except OSError as exc:
+            sys.stderr.write(f"[gene-annot] skip {gff_path}: {type(exc).__name__}: {exc}\n")
+            continue
+    return rows
+
+
+def write_gene_annotations_tsv(out_path: Path, gff_paths: list[tuple[str, Path]]) -> Path | None:
+    rows = gff_to_gene_annotations(gff_paths)
+    if not rows:
+        sys.stderr.write(
+            f"[gene-annot] no gene records parsed from {len(gff_paths)} GFF file(s); "
+            f"skipping {out_path.name}\n"
+        )
+        return None
+    write_tsv(
+        out_path,
+        rows,
+        ["query_asm", "query_contig", "gene_id", "gene_name", "start", "end", "strand", "biotype", "product"],
+    )
+    sys.stderr.write(
+        f"[gene-annot] wrote {len(rows)} gene records to {out_path}\n"
+    )
+    return out_path
+
+
 def parse_ena_filereport_text(text: str) -> list[dict[str, str]]:
     rows: list[dict[str, str]] = []
     if not text.strip():
@@ -708,16 +994,22 @@ def fetch_ena_read_runs(accession: str) -> list[dict[str, str]]:
 
 
 def ena_filereport_species_url(species: str, max_rows: int = 200) -> str:
-    """Build an ENA filereport URL that returns public read runs for a species.
+    """Build an ENA portal URL that returns public read runs for a species.
 
     Used by prepare_from_ncbi when --query-mode is short-reads or long-reads
-    and the panel presets only describe a species (no read accession). The
-    scientific_name filter works against any rank ENA stores, so a genus name
-    like 'Rhizophagus' also resolves — which is important for AMF where
+    and the panel presets only describe a species (no read accession).
+
+    Note: the ENA portal API splits filtering and accession-based lookup
+    across two endpoints. /filereport accepts a single ``accession=`` and
+    rejects ``query=`` with HTTP 400. Filter-by-name lives on /search, so
+    species lookups go through that endpoint.
+
+    The scientific_name filter works against any rank ENA stores, so a genus
+    name like 'Rhizophagus' also resolves — important for AMF where
     species-level assignments are patchy.
     """
     query = urllib.parse.urlencode({
-        # ENA portal needs this quoted exactly as: scientific_name="X"
+        # ENA portal expects this quoted exactly as: scientific_name="X"
         "query": f'scientific_name="{species}"',
         "result": "read_run",
         "fields": ",".join(ENA_FILEREPORT_FIELDS),
@@ -725,16 +1017,37 @@ def ena_filereport_species_url(species: str, max_rows: int = 200) -> str:
         "download": "false",
         "limit": str(max_rows),
     })
-    return f"https://www.ebi.ac.uk/ena/portal/api/filereport?{query}"
+    return f"https://www.ebi.ac.uk/ena/portal/api/search?{query}"
 
 
 def fetch_ena_read_runs_by_species(species: str, max_rows: int = 200) -> list[dict[str, str]]:
-    try:
-        return parse_ena_filereport_text(http_get_text(ena_filereport_species_url(species, max_rows)))
-    except Exception:
-        # ENA returns 204/404 for unknown species; treat as "no runs" rather
-        # than aborting the whole panel preparation.
-        return []
+    # Try the preset name first, then SPECIES_ALIASES (NCBI/ENA renames such as
+    # Candida glabrata -> Nakaseomyces glabratus). ENA's filereport keys on the
+    # current scientific_name, so a panel still using the legacy name otherwise
+    # silently returns 0 runs even though reads exist under the new genus.
+    candidates: list[str] = [species]
+    candidates.extend(SPECIES_ALIASES.get(species.strip().lower(), []))
+    seen: set[str] = set()
+    for cand in candidates:
+        key = cand.strip().lower()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        try:
+            rows = parse_ena_filereport_text(http_get_text(ena_filereport_species_url(cand, max_rows)))
+        except Exception as exc:
+            sys.stderr.write(
+                f"[reads-mode] ENA species lookup error for {cand!r}: "
+                f"{type(exc).__name__}: {exc}\n"
+            )
+            continue
+        if rows:
+            if cand != species:
+                sys.stderr.write(
+                    f"[reads-mode] resolved {species!r} -> {cand!r} via SPECIES_ALIASES\n"
+                )
+            return rows
+    return []
 
 
 def sequence_kind_from_name(name: str) -> str:
@@ -810,7 +1123,13 @@ def filter_ena_rows_for_mode(rows: list[dict[str, str]], query_mode: str) -> lis
     if not preferred:
         return rows
     matched = [row for row in rows if (row.get("instrument_platform") or "").upper() in preferred]
-    result = matched or rows
+    # Hard filter: an Illumina run must NOT be returned for long-reads mode (and
+    # vice versa). The previous `matched or rows` fallback caused species with
+    # no long-read submissions (e.g. L. kluyveri) to receive the same Illumina
+    # accessions for both short-reads and long-reads modes — the resulting
+    # files were byte-identical, mislabeled, and broke downstream platform
+    # detection in the SV callers.
+    result = matched
     # For long reads, rank so PacBio HiFi > ONT PromethION > ONT MinION > PacBio CLR.
     if query_mode == "long-reads":
         result = sorted(result, key=_long_read_platform_score, reverse=True)
@@ -1184,6 +1503,9 @@ def prepare_from_ncbi(args: argparse.Namespace) -> int:
     benchmark_map_rows: list[dict[str, str]] = []
     source_link_rows: list[dict[str, str]] = []
     species_benchmark_defaults: dict[str, dict[str, str]] = {}
+    # Per-ref (asm_name, gff.gz path) pairs for the GFF -> gene_annotations.tsv
+    # converter. Populated only when the GFF download succeeds for a given ref.
+    gff_pairs: list[tuple[str, Path]] = []
 
     by_species: dict[str, list[dict[str, str]]] = defaultdict(list)
     for row in selected_rows:
@@ -1215,13 +1537,31 @@ def prepare_from_ncbi(args: argparse.Namespace) -> int:
                 break
             asm_name = row.get("assembly_accession", "").replace(".", "_")
             downloaded_fasta: Path | None = None
+            downloaded_gff: Path | None = None
             for url, filename in ncbi_download_targets(row, include_gff=args.download_gff):
-                local = materialize_entry(url, refs_dir / filename, keep_gz=True)
+                is_gff = filename.endswith("_genomic.gff.gz")
+                try:
+                    local = materialize_entry(url, refs_dir / filename, keep_gz=True)
+                except urllib.error.HTTPError as exc:
+                    # NCBI hosts GFF only for annotated assemblies (mostly RefSeq +
+                    # some GenBank). 404 on GFF is common; skip it without aborting
+                    # the whole prepare. FASTA 404 is fatal — the assembly is unusable.
+                    if is_gff and getattr(exc, "code", None) == 404:
+                        sys.stderr.write(
+                            f"[gene-annot] no GFF available for {asm_name} "
+                            f"(NCBI returned 404); skipping annotation for this ref\n"
+                        )
+                        continue
+                    raise
                 if filename.endswith("_genomic.fna.gz"):
                     downloaded_fasta = local
+                elif is_gff:
+                    downloaded_gff = local
             if downloaded_fasta is None:
                 continue
             ref_downloads += 1
+            if downloaded_gff is not None:
+                gff_pairs.append((asm_name, downloaded_gff))
             if species_ref_local is None:
                 species_ref_local = downloaded_fasta
                 species_ref_asm = asm_name
@@ -1277,13 +1617,30 @@ def prepare_from_ncbi(args: argparse.Namespace) -> int:
                 break
             asm_name = row.get("assembly_accession", "").replace(".", "_")
             query_fasta: Path | None = None
-            for url, filename in ncbi_download_targets(row, include_gff=False):
-                local = materialize_entry(url, queries_dir / filename, keep_gz=True)
+            query_gff_local: Path | None = None
+            for url, filename in ncbi_download_targets(row, include_gff=args.download_gff):
+                is_gff = filename.endswith("_genomic.gff.gz")
+                try:
+                    local = materialize_entry(url, queries_dir / filename, keep_gz=True)
+                except urllib.error.HTTPError as exc:
+                    # Same soft-fail policy as refs: missing GFF is normal for
+                    # GenBank-only assemblies; missing FASTA is fatal.
+                    if is_gff and getattr(exc, "code", None) == 404:
+                        sys.stderr.write(
+                            f"[gene-annot] no GFF available for query {asm_name} "
+                            f"(NCBI returned 404)\n"
+                        )
+                        continue
+                    raise
                 if filename.endswith("_genomic.fna.gz"):
                     query_fasta = local
+                elif is_gff:
+                    query_gff_local = local
             if query_fasta is None:
                 continue
             query_downloads += 1
+            if query_gff_local is not None:
+                gff_pairs.append((asm_name, query_gff_local))
             query_rows.append({
                 "query_asm": asm_name,
                 "query_mode": "assembly",
@@ -1464,6 +1821,7 @@ def prepare_from_ncbi(args: argparse.Namespace) -> int:
             "query_asm", "query_mode", "path", "scenario", "lifestyle", "architecture",
             "benchmark_ref_asm", "benchmark_ref_fasta", "phylum", "class", "order",
             "family", "genus", "species", "source",
+            "instrument_platform", "library_layout", "run_accession",
         ],
     )
     write_tsv(out_dir / "benchmark_reference_map.tsv", benchmark_map_rows, ["query_asm", "benchmark_ref_asm", "benchmark_ref_fasta", "species"])
@@ -1482,6 +1840,81 @@ def prepare_from_ncbi(args: argparse.Namespace) -> int:
             phenotype_out.write_text(
                 json.dumps(phenotype_meta, indent=2, sort_keys=True), encoding="utf-8"
             )
+
+    # Auto-build prepared_dir/gene_annotations.tsv from any GFF.gz files we
+    # downloaded alongside ref FASTA. The benchmark step will pick this up
+    # automatically (no need for the caller to pass --gene-annotations-tsv).
+    #
+    # Indexing trick: the SV biology analyzer keys gene lookups by
+    # (query_asm, contig), but our GFFs come from refs. Ref-coordinate calls
+    # in calls.hits.tsv carry query_asm=<query asm name> and contig=<ref
+    # contig>, so we duplicate every gene row under every query_asm that
+    # uses that ref (per benchmark_map_rows). This makes (query_asm, ref_contig)
+    # lookups hit without forcing the analyzer to learn ref↔query joins.
+    gene_annotations_count = 0
+    if gff_pairs:
+        gene_annotations_path = out_dir / "gene_annotations.tsv"
+        # Build (asm_name -> [aliases...]) so each gene row is emitted under
+        # every form the analyzer might lookup against. Aliases include:
+        #   1. the prepared manifest's asm_name itself (GCA_000146045_2)
+        #   2. the FASTA basename without .gz (GCA_000146045.2_R64_genomic.fna)
+        #      because calls.hits.tsv writes query_asm as the FASTA filename
+        #   3. every query_asm that uses this ref as benchmark_ref_asm
+        # Without all three, ref-coord candidates from query X won't find
+        # genes annotated against ref Y, and the nearest_gene fallback is silent.
+        asm_aliases: dict[str, set[str]] = defaultdict(set)
+        for ref_row in ref_manifest_rows:
+            asm = ref_row.get("asm_name", "")
+            if not asm:
+                continue
+            asm_aliases[asm].add(asm)
+            fasta_path = ref_row.get("fasta_path", "")
+            if fasta_path:
+                basename = Path(fasta_path).name
+                if basename.endswith(".gz"):
+                    basename = basename[:-3]
+                asm_aliases[asm].add(basename)
+        for q_row in query_rows:
+            q_asm = q_row.get("query_asm", "")
+            q_path = q_row.get("path", "")
+            if q_asm and q_path:
+                basename = Path(q_path).name
+                if basename.endswith(".gz"):
+                    basename = basename[:-3]
+                asm_aliases[q_asm].add(q_asm)
+                asm_aliases[q_asm].add(basename)
+        ref_to_queries: dict[str, list[str]] = defaultdict(list)
+        for bm in benchmark_map_rows:
+            ref_asm = bm.get("benchmark_ref_asm", "")
+            q_asm = bm.get("query_asm", "")
+            if ref_asm and q_asm:
+                ref_to_queries[ref_asm].append(q_asm)
+        ref_rows = gff_to_gene_annotations(gff_pairs)
+        all_rows: list[dict[str, Any]] = []
+        seen: set[tuple[str, str, str]] = set()
+        for ref_row in ref_rows:
+            owners = set(asm_aliases.get(ref_row["query_asm"], {ref_row["query_asm"]}))
+            for q_asm in ref_to_queries.get(ref_row["query_asm"], []):
+                owners.update(asm_aliases.get(q_asm, {q_asm}))
+            for owner in owners:
+                key = (owner, ref_row["query_contig"], ref_row["gene_id"])
+                if key in seen:
+                    continue
+                seen.add(key)
+                duped = dict(ref_row)
+                duped["query_asm"] = owner
+                all_rows.append(duped)
+        if all_rows:
+            write_tsv(
+                gene_annotations_path,
+                all_rows,
+                ["query_asm", "query_contig", "gene_id", "gene_name", "start", "end", "strand", "biotype", "product"],
+            )
+            sys.stderr.write(
+                f"[gene-annot] wrote {len(all_rows)} gene records "
+                f"(ref-keyed + per-query / FASTA-basename aliases) to {gene_annotations_path}\n"
+            )
+            gene_annotations_count = len(all_rows)
 
     with (out_dir / "prepare_summary.json").open("w", encoding="utf-8") as fh:
         json.dump(
@@ -1686,6 +2119,32 @@ def load_syri_query_calls(path: Path, query_asm: str) -> list[NormalizedCall]:
     return rows
 
 
+_REF_VCF_MIN_SV_BP = 30  # paftools/anchorwave emit single-bp variants too; skip <30 bp.
+
+
+def _infer_svtype_from_alleles(ref_allele: str, alt_allele: str) -> tuple[str | None, int]:
+    """Derive (svtype, svlen) from REF/ALT when SVTYPE INFO is absent.
+
+    Used for VCFs emitted by paftools.js (AnchorWave pipeline) and svim-asm
+    in non-symbolic mode, which represent INS/DEL with explicit allele
+    sequences rather than `<INS>` / `<DEL>` symbolic ALT.
+    """
+    if not ref_allele or not alt_allele or alt_allele in {".", "*"}:
+        return None, 0
+    # BND notation: ALT contains breakend brackets.
+    if "[" in alt_allele or "]" in alt_allele:
+        return "TRA", 0
+    # Symbolic ALT (e.g. <INS>, <DEL>) — already handled by caller; bail.
+    if alt_allele.startswith("<"):
+        return None, 0
+    diff = len(alt_allele) - len(ref_allele)
+    if diff > 0:
+        return "INS", diff
+    if diff < 0:
+        return "DEL", -diff
+    return None, 0  # SNV or MNV — not an SV.
+
+
 def load_reference_vcf_calls(path: Path, label: str, query_asm: str) -> list[NormalizedCall]:
     rows: list[NormalizedCall] = []
     if not path.exists():
@@ -1698,9 +2157,17 @@ def load_reference_vcf_calls(path: Path, label: str, query_asm: str) -> list[Nor
             if len(fields) < 8:
                 continue
             info = parse_info_field(fields[7])
-            svtype = TYPE_CANON.get((info.get("SVTYPE") or fields[4].strip("<>")).upper())
+            ref_allele = fields[3]
+            alt_allele = fields[4]
+            svtype = TYPE_CANON.get((info.get("SVTYPE") or alt_allele.strip("<>")).upper())
+            inferred_svlen: int | None = None
             if not svtype:
-                continue
+                # paftools.js / svim-asm non-symbolic VCFs do not set SVTYPE
+                # and use explicit allele sequences. Derive from REF/ALT so
+                # those callers contribute to the comparator truth set.
+                svtype, inferred_svlen = _infer_svtype_from_alleles(ref_allele, alt_allele)
+                if not svtype:
+                    continue
             pos = int(fields[1])
             # BND records don't carry END; fall back to pos.
             end_raw = info.get("END", "")
@@ -1710,11 +2177,23 @@ def load_reference_vcf_calls(path: Path, label: str, query_asm: str) -> list[Nor
                 end = pos
             svlen_raw = info.get("SVLEN", "")
             try:
-                svlen = abs(int(svlen_raw)) if svlen_raw else max(1, end - pos + 1)
+                svlen = abs(int(svlen_raw)) if svlen_raw else 0
             except ValueError:
+                svlen = 0
+            if svlen == 0 and inferred_svlen is not None:
+                svlen = inferred_svlen
+            if svlen == 0:
                 svlen = max(1, end - pos + 1)
-            if svlen <= 0:
-                svlen = max(1, end - pos + 1)
+            # For DEL inferred from alleles, set END = pos + svlen so that
+            # downstream reference-coord matching has a meaningful interval.
+            if inferred_svlen is not None and end_raw == "":
+                if svtype == "DEL":
+                    end = pos + svlen
+                else:
+                    end = pos
+            # Skip sub-SV-size events (paftools emits SNV/MNV-like rows too).
+            if svtype in {"INS", "DEL", "DUP", "INV"} and svlen < _REF_VCF_MIN_SV_BP:
+                continue
             rows.append(NormalizedCall(
                 query_asm=query_asm,
                 query_contig=".",
@@ -1832,6 +2311,57 @@ def call_distance(truth: NormalizedCall, pred: NormalizedCall) -> int:
     return abs(truth.pos - pred.pos) + abs(abs(truth.svlen) - abs(pred.svlen))
 
 
+def build_consensus_truth(
+    callsets: list[list[NormalizedCall]],
+    *,
+    min_support: int = 2,
+) -> list[NormalizedCall]:
+    """Return SV calls supported by at least min_support of the input callsets.
+
+    Two calls "support" each other iff calls_compatible() — same coord space,
+    same canonical SV type, position within DEFAULT_TOL_BP, length within
+    DEFAULT_TOL_LEN_FRAC. The returned set has one representative per cluster
+    (the earliest-encountered call), so |consensus| <= |smallest input|.
+    """
+    if min_support < 1 or not callsets:
+        return []
+    flat: list[tuple[int, NormalizedCall]] = []
+    for src_idx, calls in enumerate(callsets):
+        for c in calls:
+            flat.append((src_idx, c))
+    if not flat:
+        return []
+    n = len(flat)
+    parent = list(range(n))
+
+    def find(i: int) -> int:
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    def union(i: int, j: int) -> None:
+        a, b = find(i), find(j)
+        if a != b:
+            parent[a] = b
+
+    for i in range(n):
+        for j in range(i + 1, n):
+            if calls_compatible(flat[i][1], flat[j][1]):
+                union(i, j)
+
+    clusters: dict[int, list[tuple[int, NormalizedCall]]] = defaultdict(list)
+    for i, item in enumerate(flat):
+        clusters[find(i)].append(item)
+
+    out: list[NormalizedCall] = []
+    for members in clusters.values():
+        sources = {src for src, _ in members}
+        if len(sources) >= min_support:
+            out.append(members[0][1])
+    return out
+
+
 def match_calls(truth_calls: list[NormalizedCall], pred_calls: list[NormalizedCall]) -> tuple[set[int], list[int]]:
     used: set[int] = set()
     missed_truth: list[int] = []
@@ -1934,7 +2464,7 @@ def run_mycosv(
     *,
     query_list_override: Path | None = None,
     threads: int = 8,
-    max_clade_genomes: int = 32,
+    max_clade_genomes: int = 8,
 ) -> dict[str, str]:
     mycosv_dir = out_dir / "mycosv"
     mycosv_dir.mkdir(parents=True, exist_ok=True)
@@ -2004,7 +2534,12 @@ def run_mycosv(
 
 
 def write_prefixed_fasta_records(src: Path, prefix: str, out_fh: io.TextIOBase) -> None:
-    with src.open(encoding="utf-8") as fh:
+    if str(src).endswith(".gz"):
+        import gzip as _gzip
+        fh_ctx = _gzip.open(str(src), "rt", encoding="utf-8")
+    else:
+        fh_ctx = src.open(encoding="utf-8")
+    with fh_ctx as fh:
         header = ""
         seq_lines: list[str] = []
         for line in fh:
@@ -2045,18 +2580,34 @@ def run_syri_for_query(query_row: dict[str, str], out_dir: Path, threads: int) -
     ref_fa = Path(ref_fasta).resolve()
     work_dir = out_dir / "comparators" / "syri" / query_asm
     work_dir.mkdir(parents=True, exist_ok=True)
+    # SyRI calls into pysam.FastaFile and refuses gzipped refs; same for the
+    # query when it's piped from .gz. Decompress both into the work dir.
+    ref_fa_plain = _ensure_plain_fasta(ref_fa, work_dir)
+    if ref_fa_plain is None:
+        return None
+    query_fa_plain = _ensure_plain_fasta(query_fa, work_dir)
+    if query_fa_plain is None:
+        return None
     sam_path = work_dir / "query_vs_ref.sam"
     prefix = str(work_dir / "syri_")
     with sam_path.open("w", encoding="utf-8") as sam_out:
         subprocess.run(
-            ["minimap2", "-ax", "asm5", "--eqx", "-t", str(threads), str(ref_fa), str(query_fa)],
+            ["minimap2", "-ax", "asm5", "--eqx", "-t", str(threads), str(ref_fa_plain), str(query_fa_plain)],
             stdout=sam_out,
             stderr=subprocess.PIPE,
             text=True,
             check=True,
             timeout=_TOOL_TIMEOUT,
         )
-    run(["syri", "-c", str(sam_path), "-r", str(ref_fa), "-q", str(query_fa), "-k", "-F", "S", "--prefix", prefix], cwd=ROOT)
+    try:
+        run(["syri", "-c", str(sam_path), "-r", str(ref_fa_plain), "-q", str(query_fa_plain),
+             "-k", "-F", "S", "--prefix", prefix], cwd=ROOT)
+    except subprocess.CalledProcessError as exc:
+        # SyRI rejects highly divergent pairs (e.g. cross-genus assemblies)
+        # with a non-zero exit. Treat as "no comparator output" rather than
+        # propagating the failure up to abort the whole panel.
+        sys.stderr.write(f"[warn] syri rejected {query_asm} (likely too divergent): {exc}\n")
+        return None
     syri_tsv = work_dir / "syri_syri.out"
     if not syri_tsv.exists():
         candidates = sorted(work_dir.glob("*syri.out"))
@@ -2194,14 +2745,21 @@ def _minimap2_align_reads(
     if not reads_path.exists():
         return None
     work_dir.mkdir(parents=True, exist_ok=True)
+    # SVIM/Sniffles/cuteSV/Delly/Manta all use pysam.FastaFile (or bcftools)
+    # which cannot open .fna.gz directly. Hand them a plain copy materialised
+    # next to the BAM, so the downstream caller invocations succeed.
+    ref_fa_plain = _ensure_plain_fasta(ref_fa, work_dir)
+    if ref_fa_plain is None:
+        return None
 
     sam_path = work_dir / "aln.sam"
     bam_sorted = work_dir / "aln.sorted.bam"
 
-    # minimap2 -> SAM
+    # minimap2 -> SAM (minimap2 itself accepts .gz, but we feed the plain
+    # file so the BAM @SQ matches what the SV caller will index later).
     with sam_path.open("w", encoding="utf-8") as sam_out:
         subprocess.run(
-            ["minimap2", "-ax", preset, "-t", str(threads), str(ref_fa), str(reads_path)],
+            ["minimap2", "-ax", preset, "-t", str(threads), str(ref_fa_plain), str(reads_path)],
             stdout=sam_out,
             stderr=subprocess.PIPE,
             timeout=_TOOL_TIMEOUT,
@@ -2216,9 +2774,9 @@ def _minimap2_align_reads(
     # samtools index
     run(["samtools", "index", str(bam_sorted)], cwd=ROOT)
     # Reference needs a .fai for downstream callers (Delly/Manta especially).
-    if not (ref_fa.parent / (ref_fa.name + ".fai")).exists():
+    if not (ref_fa_plain.parent / (ref_fa_plain.name + ".fai")).exists():
         try:
-            run(["samtools", "faidx", str(ref_fa)], cwd=ROOT)
+            run(["samtools", "faidx", str(ref_fa_plain)], cwd=ROOT)
         except subprocess.CalledProcessError:
             pass
     # Drop the giant intermediate SAM once the BAM exists.
@@ -2226,7 +2784,7 @@ def _minimap2_align_reads(
         sam_path.unlink()
     except OSError:
         pass
-    return bam_sorted, ref_fa
+    return bam_sorted, ref_fa_plain
 
 
 def _long_read_preset(query_row: dict[str, str]) -> str:
@@ -2534,6 +3092,26 @@ def run_cactus_for_query(
     return None
 
 
+def _ensure_plain_fasta(ref_fa: Path, work_dir: Path) -> Path | None:
+    """svim-asm and a few other tools rely on pysam.FastaFile, which cannot
+    open bgzipped or plain-gzipped FASTA without a `.gzi` companion. We
+    materialise a plain-text copy in the comparator's work directory so the
+    rest of the pipeline keeps working with .gz refs in the data cache.
+    """
+    if ref_fa.suffix != ".gz":
+        return ref_fa
+    plain = work_dir / ref_fa.with_suffix("").name
+    if plain.exists() and plain.stat().st_size > 0:
+        return plain
+    try:
+        with gzip.open(ref_fa, "rb") as src, plain.open("wb") as dst:
+            shutil.copyfileobj(src, dst)
+    except OSError as exc:
+        sys.stderr.write(f"[warn] could not decompress {ref_fa}: {exc}\n")
+        return None
+    return plain
+
+
 def run_svim_asm_for_query(query_row: dict[str, str], out_dir: Path, threads: int) -> dict[str, str] | None:
     """
     SVIM-asm haploid mode: minimap2 -ax asm5 query -> ref, sort+index, then
@@ -2556,11 +3134,16 @@ def run_svim_asm_for_query(query_row: dict[str, str], out_dir: Path, threads: in
     work_dir = out_dir / "comparators" / "svim_asm" / query_asm
     work_dir.mkdir(parents=True, exist_ok=True)
 
+    # svim-asm uses pysam.FastaFile which cannot open .fna.gz; ensure plain.
+    ref_fa_plain = _ensure_plain_fasta(ref_fa, work_dir)
+    if ref_fa_plain is None:
+        return None
+
     sam_path = work_dir / "query_vs_ref.sam"
     bam_sorted = work_dir / "query_vs_ref.sorted.bam"
     with sam_path.open("w", encoding="utf-8") as sam_out:
         subprocess.run(
-            ["minimap2", "-ax", "asm5", "-t", str(threads), str(ref_fa), str(query_fa)],
+            ["minimap2", "-ax", "asm5", "-t", str(threads), str(ref_fa_plain), str(query_fa)],
             stdout=sam_out, stderr=subprocess.PIPE, text=True, check=True,
             timeout=_TOOL_TIMEOUT,
         )
@@ -2581,7 +3164,7 @@ def run_svim_asm_for_query(query_row: dict[str, str], out_dir: Path, threads: in
     svim_out.mkdir(parents=True, exist_ok=True)
     try:
         run(
-            ["svim-asm", "haploid", str(svim_out), str(bam_sorted), str(ref_fa)],
+            ["svim-asm", "haploid", str(svim_out), str(bam_sorted), str(ref_fa_plain)],
             cwd=ROOT,
         )
     except subprocess.CalledProcessError:
@@ -2630,6 +3213,10 @@ def run_anchorwave_for_query(query_row: dict[str, str], out_dir: Path, threads: 
     query_asm = query_row["query_asm"]
     work_dir = out_dir / "comparators" / "anchorwave" / query_asm
     work_dir.mkdir(parents=True, exist_ok=True)
+    # paftools.js call wants a plain reference for sequence retrieval.
+    ref_fa_plain = _ensure_plain_fasta(ref_fa, work_dir)
+    if ref_fa_plain is None:
+        return None
 
     sam_path = work_dir / "q2r.sam"
     paf_path = work_dir / "q2r.paf"
@@ -2639,7 +3226,7 @@ def run_anchorwave_for_query(query_row: dict[str, str], out_dir: Path, threads: 
     # Step 1: minimap2 asm5 alignment as AnchorWave input seeds.
     with sam_path.open("w", encoding="utf-8") as sam_out:
         subprocess.run(
-            ["minimap2", "-ax", "asm5", "--cs", "-t", str(threads), str(ref_fa), str(query_fa)],
+            ["minimap2", "-ax", "asm5", "--cs", "-t", str(threads), str(ref_fa_plain), str(query_fa)],
             stdout=sam_out, stderr=subprocess.PIPE, text=True, check=True,
             timeout=_TOOL_TIMEOUT,
         )
@@ -2671,7 +3258,7 @@ def run_anchorwave_for_query(query_row: dict[str, str], out_dir: Path, threads: 
     try:
         with vcf_path.open("w", encoding="utf-8") as vcf_out:
             subprocess.run(
-                [paftools, "call", "-f", str(ref_fa), "-L", "50", str(sorted_paf)],
+                [paftools, "call", "-f", str(ref_fa_plain), "-L", "50", str(sorted_paf)],
                 stdout=vcf_out, stderr=subprocess.PIPE, text=True, check=True,
                 timeout=_TOOL_TIMEOUT,
             )
@@ -2801,40 +3388,72 @@ def _report_comparator_status(args: argparse.Namespace, out_dir: Path) -> None:
                            "conda install -c bioconda cutesv samtools"),
     }
 
-    available: list[str] = []
-    missing: list[tuple[str, list[str], str]] = []  # (flag, binaries, hint)
+    # Categorize every comparator in three buckets so the file is informative
+    # even when no --run-X flag was passed (previously the file was just a
+    # header). The buckets are: (1) requested + available -> actually ran,
+    # (2) requested + missing binaries -> silently skipped, (3) not requested
+    # but binaries are present -> available, just not enabled.
+    requested_running: list[tuple[str, list[str]]] = []
+    requested_missing: list[tuple[str, list[str], str]] = []
+    not_requested: list[tuple[str, list[str], list[str]]] = []  # (name, present, absent)
 
     for flag, (binaries, hint) in _TOOL_HINTS.items():
-        if not getattr(args, flag, False):
-            continue
         absent = [b for b in binaries if not tool_path(b)]
-        if absent:
-            missing.append((flag, absent, hint))
+        present = [b for b in binaries if tool_path(b)]
+        tool_name = flag.replace("run_", "")
+        if getattr(args, flag, False):
+            if absent:
+                requested_missing.append((flag, absent, hint))
+            else:
+                requested_running.append((tool_name, binaries))
         else:
-            available.append(flag.replace("run_", ""))
+            not_requested.append((tool_name, present, absent))
 
     lines: list[str] = []
-    lines.append("=== Comparator Pre-flight Check ===\n")
-    if available:
-        lines.append("AVAILABLE (will run):\n")
-        for name in available:
-            lines.append(f"  ✓ {name}\n")
+    lines.append("=== Comparator Pre-flight Check ===\n\n")
+    lines.append(f"Mode: {getattr(args, 'mode', '?')}\n\n")
+
+    if requested_running:
+        lines.append("AVAILABLE AND ENABLED (will run):\n")
+        for name, binaries in requested_running:
+            lines.append(f"  [run] {name}  (binaries: {', '.join(binaries)})\n")
         lines.append("\n")
 
-    if missing:
-        lines.append("MISSING (will be silently skipped):\n")
-        for flag, absent, hint in missing:
+    if requested_missing:
+        lines.append("REQUESTED BUT MISSING (silently skipped):\n")
+        for flag, absent, hint in requested_missing:
             tool_name = flag.replace("run_", "")
-            lines.append(f"  ✗ {tool_name}: {', '.join(absent)} not found on PATH\n")
-            lines.append(f"    Install: {hint}\n")
+            lines.append(f"  [skip] {tool_name}: missing {', '.join(absent)}\n")
+            lines.append(f"         Install: {hint}\n")
         lines.append("\n")
-        lines.append("To install all missing tools at once:\n")
+
+    if not_requested:
+        lines.append("NOT REQUESTED (pass the corresponding --run-X flag to enable):\n")
+        for name, present, absent in not_requested:
+            flag_hint = f"--run-{name.replace('_', '-')}"
+            if absent:
+                lines.append(
+                    f"  [off] {name}  (would also need: {', '.join(absent)}; "
+                    f"{flag_hint} to enable)\n"
+                )
+            else:
+                lines.append(
+                    f"  [off] {name}  (binaries OK; pass {flag_hint} to enable)\n"
+                )
+        lines.append("\n")
+
+    if requested_missing or any(absent for _, _, absent in not_requested):
+        lines.append("Install all missing comparator binaries with:\n")
         lines.append(f"  bash {Path(__file__).parent / 'install_tools.sh'}\n")
-        lines.append("  # or: bash install_tools.sh --check  (to see what is missing)\n")
+        lines.append("  bash install_tools.sh --check  (lists per-tool availability)\n")
 
     status_text = "".join(lines)
     status_file = out_dir / "COMPARATORS_STATUS.txt"
     status_file.write_text(status_text, encoding="utf-8")
+
+    # Aliases for the legacy two-bucket caller below.
+    available = [name for name, _ in requested_running]
+    missing = requested_missing
 
     if missing:
         sys.stderr.write("\n[warn] The following requested comparators are missing and will "
@@ -2853,10 +3472,63 @@ def _report_comparator_status(args: argparse.Namespace, out_dir: Path) -> None:
         sys.stderr.write(f"       Install script: bash {Path(__file__).parent / 'install_tools.sh'}\n")
 
 
+_COMPARATOR_FLAG_BY_MODE: dict[str, list[tuple[str, list[str]]]] = {
+    # (run_X attr, required binaries); used to auto-enable comparators by mode.
+    "assembly":    [("run_syri", ["minimap2", "syri"]),
+                    ("run_minigraph", ["minigraph", "gfatools"]),
+                    ("run_pggb", ["pggb"]),
+                    ("run_cactus", ["cactus-pangenome"]),
+                    ("run_svim_asm", ["svim-asm", "minimap2", "samtools"]),
+                    ("run_anchorwave", ["anchorwave", "minimap2", "samtools"])],
+    "short-reads": [("run_delly", ["delly", "bcftools"]),
+                    ("run_manta", ["configManta.py", "samtools"])],
+    "long-reads":  [("run_svim", ["svim"]),
+                    ("run_sniffles", ["sniffles"]),
+                    ("run_cutesv", ["cuteSV", "samtools"])],
+}
+
+
+def _auto_enable_comparators(args: argparse.Namespace) -> None:
+    """Toggle every --run-X flag whose binaries are detected, scoped to the
+    benchmark mode. Prints the resolved list to stderr so the operator sees
+    exactly which comparators will run for this invocation.
+    """
+    mode = getattr(args, "mode", "assembly")
+    candidates = _COMPARATOR_FLAG_BY_MODE.get(mode, [])
+    enabled: list[str] = []
+    skipped: list[tuple[str, list[str]]] = []
+    for flag, binaries in candidates:
+        absent = [b for b in binaries if not tool_path(b)]
+        if absent:
+            skipped.append((flag.replace("run_", ""), absent))
+            continue
+        if not getattr(args, flag, False):
+            setattr(args, flag, True)
+        enabled.append(flag.replace("run_", ""))
+    if enabled:
+        sys.stderr.write(
+            f"[comparators] --run-all-comparators auto-enabled for mode={mode}: "
+            f"{', '.join(enabled)}\n"
+        )
+    if skipped:
+        for tool_name, absent in skipped:
+            sys.stderr.write(
+                f"[comparators] {tool_name}: missing {', '.join(absent)} — "
+                f"run install_tools.sh to install\n"
+            )
+    if not enabled:
+        sys.stderr.write(
+            f"[comparators] --run-all-comparators: no comparator binaries "
+            f"detected for mode={mode}; will produce no_comparator placeholder rows\n"
+        )
+
+
 def benchmark_real_data(args: argparse.Namespace) -> int:
     prepared_dir = args.prepared_dir.resolve()
     out_dir = args.out_dir.resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
+    if getattr(args, "run_all_comparators", False):
+        _auto_enable_comparators(args)
     full_manifest = load_query_manifest(prepared_dir / "query_manifest.tsv")
     if not full_manifest:
         raise ValueError("Prepared directory does not contain query_manifest.tsv entries")
@@ -2901,10 +3573,45 @@ def benchmark_real_data(args: argparse.Namespace) -> int:
     )
 
     compile_binary_if_needed(args.binary_path.resolve(), force=args.force_rebuild)
-    mycosv_paths = run_mycosv(
-        prepared_dir, out_dir, args.binary_path.resolve(), args.mode, args.mycosv_arg,
-        query_list_override=mode_query_list,
-    )
+    mycosv_failed = False
+    try:
+        mycosv_paths = run_mycosv(
+            prepared_dir, out_dir, args.binary_path.resolve(), args.mode, args.mycosv_arg,
+            query_list_override=mode_query_list,
+            threads=args.threads,
+            max_clade_genomes=args.max_clade_genomes,
+        )
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+        # Don't abort the whole panel/mode pipeline when the binary crashes
+        # (e.g. cgroup OOM kill mid-write produces a 0-byte calls.vcf, then
+        # the bare exception bubbles to main and skips downstream report
+        # writes).  Mark the failure on disk, then carry on with an empty
+        # prediction set so per-query placeholder rows and the comparator
+        # status still get written for the visualization report.
+        mycosv_failed = True
+        out_prefix = out_dir / "mycosv" / "calls"
+        out_prefix.parent.mkdir(parents=True, exist_ok=True)
+        for ext in (".vcf", ".hits.tsv", ".gfa"):
+            out_prefix.with_suffix(ext).touch(exist_ok=True)
+        mycosv_paths = {
+            "vcf": str(out_prefix.with_suffix(".vcf")),
+            "hits": str(out_prefix.with_suffix(".hits.tsv")),
+            "gfa": str(out_prefix.with_suffix(".gfa")),
+        }
+        rc = getattr(exc, "returncode", "timeout")
+        marker = out_dir / "MYCOSV_FAILED.txt"
+        marker.write_text(
+            f"MycoSV binary failed (rc={rc}). Continuing benchmark with an "
+            f"empty prediction set so panel-level reports still render.\n"
+            f"Common causes: cgroup OOM kill (see [mycosv] line above), "
+            f"missing index files, or unreadable FASTA.\n",
+            encoding="utf-8",
+        )
+        sys.stderr.write(
+            f"[benchmark] mycosv failed for mode={args.mode!r}; continuing "
+            f"with empty calls so the comparator-only outputs still get "
+            f"written. Marker: {marker}\n"
+        )
 
     # Materialize a multi-sample sibling of calls.vcf so spot-checks see one
     # column per query asm (the binary writes a single SAMPLE column with
@@ -2941,15 +3648,28 @@ def benchmark_real_data(args: argparse.Namespace) -> int:
             query_asm = query_row["query_asm"]
             truth_sets[query_asm][("reference", label)] = load_reference_vcf_calls(path, label, query_asm)
 
+    # SyRI / minigraph / pggb produce truth sets when they succeed; any tool
+    # failure on a single query (SyRI's CalledProcessError on weak alignments,
+    # minigraph crashes on huge gaps, pggb timeouts) is captured here so it
+    # does not abort the entire benchmark — surviving comparators still
+    # contribute to exact_benchmark_summary.tsv.
     if args.run_syri and args.mode == "assembly":
         for query_row in query_manifest:
-            result = run_syri_for_query(query_row, out_dir, args.threads)
+            try:
+                result = run_syri_for_query(query_row, out_dir, args.threads)
+            except Exception as exc:  # pragma: no cover - defensive
+                sys.stderr.write(f"[warn] syri failed for {query_row['query_asm']}: {exc}\n")
+                continue
             if result:
                 truth_sets[query_row["query_asm"]][("query", "syri")] = load_syri_query_calls(Path(result["normalized_tsv"]), query_row["query_asm"])
 
     if args.run_minigraph and args.mode == "assembly":
         for query_row in query_manifest:
-            result = run_minigraph_for_query(query_row, out_dir, args.threads, args.minigraph_arg)
+            try:
+                result = run_minigraph_for_query(query_row, out_dir, args.threads, args.minigraph_arg)
+            except Exception as exc:  # pragma: no cover - defensive
+                sys.stderr.write(f"[warn] minigraph failed for {query_row['query_asm']}: {exc}\n")
+                continue
             if result:
                 truth_sets[query_row["query_asm"]][("reference", "minigraph")] = load_minigraph_bubble_calls(
                     Path(result["bubble_bed"]),
@@ -2959,14 +3679,18 @@ def benchmark_real_data(args: argparse.Namespace) -> int:
 
     if args.run_pggb and args.mode == "assembly":
         for query_row in query_manifest:
-            result = run_pggb_for_query(
-                query_row,
-                out_dir,
-                args.threads,
-                args.pggb_identity,
-                args.pggb_segment_len,
-                args.pggb_arg,
-            )
+            try:
+                result = run_pggb_for_query(
+                    query_row,
+                    out_dir,
+                    args.threads,
+                    args.pggb_identity,
+                    args.pggb_segment_len,
+                    args.pggb_arg,
+                )
+            except Exception as exc:  # pragma: no cover - defensive
+                sys.stderr.write(f"[warn] pggb failed for {query_row['query_asm']}: {exc}\n")
+                continue
             if result:
                 truth_sets[query_row["query_asm"]][("reference", "pggb")] = load_reference_vcf_calls(
                     Path(result["vcf"]),
@@ -3072,15 +3796,46 @@ def benchmark_real_data(args: argparse.Namespace) -> int:
     for query_row in query_manifest:
         query_asm = query_row["query_asm"]
         mycosv_query_calls = mycosv_calls_by_query.get(query_asm, {}).get("query", [])
-        mycosv_ref_calls = mycosv_calls_by_query.get(query_asm, {}).get("reference", [])
+        mycosv_ref_calls_all = mycosv_calls_by_query.get(query_asm, {}).get("reference", [])
+        # MycoSV's pangenomic routing picks the closest clade per query region
+        # and reports REFCONTIG for that clade, so its reference-coord calls
+        # span multiple reference assemblies. Single-reference comparators
+        # (minigraph, syri, svim-asm, anchorwave, …) only see one reference.
+        # For a fair pairwise PR comparison, restrict MycoSV's reference calls
+        # to those whose REFCONTIG belongs to this query's benchmark_ref_fasta.
+        bench_ref = query_row.get("benchmark_ref_fasta") or "."
+        bench_contigs: frozenset[str] = frozenset()
+        if bench_ref not in {"", "."}:
+            bench_contigs = fasta_contig_names(Path(bench_ref))
+        if bench_contigs:
+            mycosv_ref_calls = [c for c in mycosv_ref_calls_all if c.ref_contig in bench_contigs]
+        else:
+            mycosv_ref_calls = mycosv_ref_calls_all
+        # Count OFF_REF events that exist in the query-coord set but are
+        # un-matchable (no REFPOS, so they were dropped from the ref-coord set).
+        # These are real predictions that the single-reference truth callers
+        # can't represent, so reporting them separately stops them from being
+        # silently invisible in exact_benchmark_summary.tsv.
+        mycosv_off_ref_dropped = sum(
+            1 for c in mycosv_query_calls if c.svtype == "OFF_REF"
+        )
+        # Misrouted: ref-coord calls whose REFCONTIG is from a sibling clade,
+        # not the benchmark target. They're discarded by the bench_contigs
+        # filter but counted here so the operator sees the routing penalty.
+        mycosv_misrouted = max(0, len(mycosv_ref_calls_all) - len(mycosv_ref_calls))
         summary_json["queries"][query_asm] = {
             "mycosv_calls": {
                 "query": len(mycosv_query_calls),
                 "reference": len(mycosv_ref_calls),
+                "reference_total": len(mycosv_ref_calls_all),
+                "benchmark_ref_contigs": len(bench_contigs),
+                "off_ref_dropped": mycosv_off_ref_dropped,
+                "misrouted_to_sibling_clade": mycosv_misrouted,
             },
-            "exact_benchmarks": {"query": {}, "reference": {}},
+            "exact_benchmarks": {"query": {}, "reference": {}, "reference_any_clade": {}},
         }
-        for (coord_space, label), truth_calls in truth_sets.get(query_asm, {}).items():
+        truth_for_query = truth_sets.get(query_asm, {})
+        for (coord_space, label), truth_calls in truth_for_query.items():
             pred_calls = mycosv_ref_calls if coord_space == "reference" else mycosv_query_calls
             metrics = score_callsets(truth_calls, pred_calls)
             agreement_rows.append({
@@ -3107,6 +3862,76 @@ def benchmark_real_data(args: argparse.Namespace) -> int:
                     support_by_key[call_key(pred_calls[idx])].append(label)
             summary_json["queries"][query_asm]["exact_benchmarks"][coord_space][label] = metrics
 
+        # Fix B: "any-clade" rows — score every reference-space comparator
+        # against the *unfiltered* mycosv ref-coord set so the operator can
+        # tell apart "mycosv called the wrong thing" from "mycosv called the
+        # right thing on the wrong reference clade". Same truth, different
+        # predictions; only emitted in reference space.
+        for (coord_space, label), truth_calls in truth_for_query.items():
+            if coord_space != "reference":
+                continue
+            metrics_any = score_callsets(truth_calls, mycosv_ref_calls_all)
+            agreement_rows.append({
+                "query_asm": query_asm,
+                "coordinate_space": "reference_any_clade",
+                "truth_label": label,
+                "method": "mycosv",
+                "truth_calls": len(truth_calls),
+                "pred_calls": len(mycosv_ref_calls_all),
+                "tp": metrics_any["tp"],
+                "fp": metrics_any["fp"],
+                "fn": metrics_any["fn"],
+                "precision": metrics_any["precision"],
+                "recall": metrics_any["recall"],
+                "f1": metrics_any["f1"],
+                "prec_lo95": metrics_any["precision_ci95"][0],
+                "prec_hi95": metrics_any["precision_ci95"][1],
+                "rec_lo95": metrics_any["recall_ci95"][0],
+                "rec_hi95": metrics_any["recall_ci95"][1],
+            })
+            summary_json["queries"][query_asm]["exact_benchmarks"]["reference_any_clade"][label] = metrics_any
+
+        # Fix C: consensus truth set per coord_space — a truth call is in the
+        # consensus iff it is supported by >=2 comparators (calls_compatible
+        # across position+length+type tolerance). This dilutes single-tool
+        # bias (e.g. minigraph's bubble-extraction conservatism, svim_asm's
+        # alt-allele preference) by keeping only events that ≥2 independent
+        # callers agree on, then scores mycosv against that consensus.
+        for coord_space in ("query", "reference"):
+            ref_labels = [
+                lbl for (cs, lbl) in truth_for_query.keys()
+                if cs == coord_space and lbl != "consensus_2of_n"
+            ]
+            if len(ref_labels) < 2:
+                continue
+            consensus_calls = build_consensus_truth(
+                [truth_for_query[(coord_space, lbl)] for lbl in ref_labels],
+                min_support=2,
+            )
+            pred_calls = mycosv_ref_calls if coord_space == "reference" else mycosv_query_calls
+            metrics_c = score_callsets(consensus_calls, pred_calls)
+            agreement_rows.append({
+                "query_asm": query_asm,
+                "coordinate_space": coord_space,
+                "truth_label": f"consensus_2of_{len(ref_labels)}",
+                "method": "mycosv",
+                "truth_calls": len(consensus_calls),
+                "pred_calls": len(pred_calls),
+                "tp": metrics_c["tp"],
+                "fp": metrics_c["fp"],
+                "fn": metrics_c["fn"],
+                "precision": metrics_c["precision"],
+                "recall": metrics_c["recall"],
+                "f1": metrics_c["f1"],
+                "prec_lo95": metrics_c["precision_ci95"][0],
+                "prec_hi95": metrics_c["precision_ci95"][1],
+                "rec_lo95": metrics_c["recall_ci95"][0],
+                "rec_hi95": metrics_c["recall_ci95"][1],
+            })
+            summary_json["queries"][query_asm]["exact_benchmarks"][coord_space][
+                f"consensus_2of_{len(ref_labels)}"
+            ] = metrics_c
+
     # If no comparator was available (e.g. all of pggb/minigraph/syri/svim_asm
     # missing on this host) the per-query exact benchmarks above produce zero
     # rows, leaving exact_benchmark_summary.tsv header-only and the merged
@@ -3124,16 +3949,21 @@ def benchmark_real_data(args: argparse.Namespace) -> int:
             query_asm = query_row["query_asm"]
             for coord_space, calls_key in (("query", "query"), ("reference", "reference")):
                 preds = mycosv_calls_by_query.get(query_asm, {}).get(calls_key, [])
+                # Without a comparator there is no ground truth, so tp / fp / fn
+                # are undefined — emitting 0/0/0 alongside pred_calls=N broke
+                # the invariant tp+fp == pred_calls and made downstream plots
+                # show "0 FP for 34 predictions". Use NaN to match the already
+                # NaN precision/recall and signal "no truth to score against".
                 agreement_rows.append({
                     "query_asm": query_asm,
                     "coordinate_space": coord_space,
                     "truth_label": "no_comparator",
                     "method": "mycosv",
-                    "truth_calls": 0,
+                    "truth_calls": float("nan"),
                     "pred_calls": len(preds),
-                    "tp": 0,
-                    "fp": 0,
-                    "fn": 0,
+                    "tp": float("nan"),
+                    "fp": float("nan"),
+                    "fn": float("nan"),
                     "precision": float("nan"),
                     "recall": float("nan"),
                     "f1": float("nan"),
@@ -3172,14 +4002,32 @@ def benchmark_real_data(args: argparse.Namespace) -> int:
 
     phyla = sorted({row.get("phylum", ".") for row in query_manifest if row.get("phylum") not in {"", "."}})
     phylum_label = phyla[0] if len(phyla) == 1 else "mixed_fungi"
+
+    # Auto-pickup of gene annotations and expression: if the operator did not
+    # pass --gene-annotations-tsv / --expression-tsv explicitly, look for the
+    # files prepare wrote next to the manifests. Lets the biology analyzer
+    # populate expression_gene / expression_distance_bp without manual flags.
+    gene_annotations_tsv = args.gene_annotations_tsv
+    if gene_annotations_tsv is None:
+        candidate = prepared_dir / "gene_annotations.tsv"
+        if candidate.exists():
+            gene_annotations_tsv = candidate
+            sys.stderr.write(f"[gene-annot] using {candidate}\n")
+    expression_tsv = args.expression_tsv
+    if expression_tsv is None:
+        candidate = prepared_dir / "expression.tsv"
+        if candidate.exists():
+            expression_tsv = candidate
+            sys.stderr.write(f"[expression] using {candidate}\n")
+
     candidates_tsv, _ = maybe_run_candidate_analysis(
         out_dir,
         mycosv_paths,
         prepared_dir,
         args.mode,
         phylum_label,
-        args.expression_tsv,
-        args.gene_annotations_tsv,
+        expression_tsv,
+        gene_annotations_tsv,
         args.ancestral_tsv,
     )
     join_biology_findings(candidates_tsv, all_mycosv_calls, support_by_key, out_dir / "biology_findings.tsv")
@@ -3414,7 +4262,15 @@ def build_parser() -> argparse.ArgumentParser:
     spp.add_argument("--max-ref-downloads", type=int, default=0, help="Optional cap on downloaded reference assemblies; 0 means no cap.")
     spp.add_argument("--max-query-downloads", type=int, default=0, help="Optional cap on downloaded held-out assembly queries; 0 means no cap.")
     spp.add_argument("--allow-no-queries", action="store_true", help="Allow index-only preparation when no held-out queries are available or desired.")
-    spp.add_argument("--download-gff", action="store_true")
+    # GFF defaults to ON so that downstream gene-near-breakpoint analysis has
+    # something to join to without a second `prepare` round-trip. NCBI hosts
+    # GFF.gz next to FASTA.gz at the same FTP path, so the marginal cost is
+    # small. Pass --no-download-gff to skip when bandwidth-constrained.
+    spp.add_argument("--download-gff", dest="download_gff", action="store_true", default=True,
+                     help="Download GFF annotations alongside reference FASTA "
+                          "(default: on; used to build gene_annotations.tsv).")
+    spp.add_argument("--no-download-gff", dest="download_gff", action="store_false",
+                     help="Skip GFF download (disables auto gene_annotations.tsv).")
     spp.add_argument("--catalog-only", action="store_true")
     spp.add_argument("--default-scenario", default="real_data_panel")
     spp.add_argument("--default-lifestyle", default=".")
@@ -3434,6 +4290,16 @@ def build_parser() -> argparse.ArgumentParser:
     sb.add_argument("--force-rebuild", action="store_true")
     sb.add_argument("--mode", default="assembly", choices=["assembly", "short-reads", "long-reads", "auto"])
     sb.add_argument("--threads", type=int, default=32)
+    # Lower than the millon-real default of 32: hot clades with many genomes
+    # can spike the binary's per-clade graph build past a 12 GiB cgroup. 8 is
+    # safe for 12 GiB; raise on larger nodes via --max-clade-genomes.
+    sb.add_argument("--max-clade-genomes", type=int, default=8,
+                    help="Per-clade cap on genomes loaded into RAM by the MycoSV binary "
+                         "during the hierarchical index build (default: 8, safe for ~12 GiB).")
+    sb.add_argument("--run-all-comparators", action="store_true",
+                    help="Auto-enable every --run-X flag whose tool binaries are detected on PATH "
+                         "(or in the project conda env). The most robust way to get truth-set rows "
+                         "in exact_benchmark_summary.tsv without naming each comparator individually.")
     sb.add_argument("--run-syri", action="store_true", help="For assembly-mode queries, run SyRI and use query-coordinate TSV output as proxy truth.")
     sb.add_argument("--run-minigraph", action="store_true", help="For assembly-mode queries, run a pairwise minigraph + gfatools bubble baseline (reference-space, strongest for INS/DEL/INV).")
     sb.add_argument("--run-pggb", action="store_true", help="For assembly-mode queries, run a pairwise pggb build and parse its reference-space VCF output.")

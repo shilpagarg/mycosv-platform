@@ -190,14 +190,23 @@ if [[ "$EXPERIMENT_TYPE" == "all" || "$EXPERIMENT_TYPE" == "real" ]]; then
     mkdir -p "${PANEL_DIR}"
 
     echo "    - Preparing real data (mixed: assembly + short-reads + long-reads)..."
+    # Reference and per-species caps are sized for a 12 GiB cgroup. The
+    # MycoSV binary loads multiple references into RAM when building the
+    # routing index; with REAL_MAX_REF_DOWNLOADS=6 / max-assemblies-per-species=3
+    # the index build peaks well below 12 GiB. Override with env vars when
+    # running on a larger node (e.g. REAL_MAX_REF_DOWNLOADS=20 on >=24 GiB).
+    REAL_MAX_REF_DOWNLOADS="${REAL_MAX_REF_DOWNLOADS:-6}"
+    REAL_MAX_ASMS_PER_SPECIES="${REAL_MAX_ASMS_PER_SPECIES:-3}"
+    REAL_QUERIES_PER_SPECIES="${REAL_QUERIES_PER_SPECIES:-3}"
+    REAL_MAX_QUERY_DOWNLOADS="${REAL_MAX_QUERY_DOWNLOADS:-6}"
     if python3 run_real_fungal_benchmark.py prepare \
         --out-dir "${PANEL_DIR}/prepared" \
         --panel "${panel}" \
         --source ncbi-genbank \
-        --max-assemblies-per-species 20 \
-        --querys-per-species 5 \
-        --max-ref-downloads 20 \
-        --max-query-downloads 10 \
+        --max-assemblies-per-species "${REAL_MAX_ASMS_PER_SPECIES}" \
+        --querys-per-species "${REAL_QUERIES_PER_SPECIES}" \
+        --max-ref-downloads "${REAL_MAX_REF_DOWNLOADS}" \
+        --max-query-downloads "${REAL_MAX_QUERY_DOWNLOADS}" \
         --query-mode mixed \
         --read-accessions-per-species 2 \
         --allow-no-queries \
@@ -231,25 +240,22 @@ if [[ "$EXPERIMENT_TYPE" == "all" || "$EXPERIMENT_TYPE" == "real" ]]; then
       echo "    - Benchmarking mode: ${mode}..."
       mkdir -p "${PANEL_DIR}/benchmark_${mode}"
 
-      comparator_flags=()
-      case "${mode}" in
-        assembly)
-          comparator_flags+=(--run-syri --run-minigraph --run-pggb)
-          comparator_flags+=(--run-cactus --run-svim-asm --run-anchorwave)
-          ;;
-        short-reads)
-          comparator_flags+=(--run-delly --run-manta)
-          ;;
-        long-reads)
-          comparator_flags+=(--run-svim --run-sniffles --run-cutesv)
-          ;;
-      esac
+      # Auto-enable every comparator whose binaries are detected for this mode.
+      # Prefer this over hard-listing flags so a missing tool is reported and
+      # skipped instead of crashing the whole panel/mode. The benchmark itself
+      # prepends the project conda env bin to PATH at startup, so the operator
+      # does not need to `conda activate` first.
+      comparator_flags=(--run-all-comparators)
 
+      # Per-clade RAM cap for the MycoSV index build. Default 8 fits
+      # comfortably in a 12 GiB cgroup; raise on larger nodes.
+      REAL_MAX_CLADE_GENOMES="${REAL_MAX_CLADE_GENOMES:-8}"
       if python3 run_real_fungal_benchmark.py benchmark \
           --prepared-dir "${PANEL_DIR}/prepared" \
           --mode "${mode}" \
           --out-dir "${PANEL_DIR}/benchmark_${mode}" \
           --threads "${THREADS}" \
+          --max-clade-genomes "${REAL_MAX_CLADE_GENOMES}" \
           "${comparator_flags[@]}" \
           2>&1 | tee "${PANEL_DIR}/benchmark_${mode}.log"; then
         mark_success "real.${panel}.${mode}"
