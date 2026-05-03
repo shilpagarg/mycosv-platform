@@ -42,6 +42,24 @@ MILLION_REAL_TARGET_CENTROIDS="${MILLION_REAL_TARGET_CENTROIDS:-1000000}"
 #   Delly (OMP_NUM_THREADS), Manta (-j), minigraph (-t), pggb (-t).
 THREADS="${THREADS:-32}"
 
+# Per-panel/per-mode wall-clock budget. A single benchmark invocation that
+# overruns this limit is killed and the next mode/panel still runs — without
+# it, one slow panel (typically AMF assembly mode where cactus chews on
+# ~1 Gbp Rhizophagus genomes) consumes the SLURM time budget and starves
+# every subsequent panel in the matrix. Defaults: 4h for assembly mode,
+# 2h for read modes. Override via env var when running on long-walltime
+# partitions. Set to 0 to disable the cap.
+BENCHMARK_TIMEOUT_ASSEMBLY="${BENCHMARK_TIMEOUT_ASSEMBLY:-4h}"
+BENCHMARK_TIMEOUT_READS="${BENCHMARK_TIMEOUT_READS:-2h}"
+
+# Comma-separated list of panel names whose assembly-mode benchmark should
+# skip cactus / pggb / anchorwave. These three are the heaviest comparators
+# on multi-Gbp inputs (AMF panel, te_rich_pathogen for Puccinia ~80 Mbp);
+# skipping them cuts wall time enough that the matrix completes within
+# typical SLURM time limits while still leaving syri / minigraph / svim_asm
+# as truth comparators. Override or extend via env var.
+HEAVY_COMPARATOR_SKIP_PANELS="${HEAVY_COMPARATOR_SKIP_PANELS:-amf_large,te_rich_pathogen}"
+
 # Long-read platform used for both simulated and real experiments.
 #   hifi    PacBio HiFi CCS (Revio / Sequel IIe) — 15 kb reads, ≥Q20 accuracy.
 #           minimap2 map-hifi → sniffles2 / cuteSV (HiFi params) / SVIM.
@@ -247,20 +265,50 @@ if [[ "$EXPERIMENT_TYPE" == "all" || "$EXPERIMENT_TYPE" == "real" ]]; then
       # does not need to `conda activate` first.
       comparator_flags=(--run-all-comparators)
 
+      # Override for assembly mode on heavy panels: skip cactus/pggb/anchorwave
+      # (the multi-Gbp killers) and instead enable only the lighter comparators
+      # explicitly. Without this carve-out a single AMF assembly run consumed
+      # the entire SLURM time budget in the previous matrix run.
+      if [[ "${mode}" == "assembly" ]] && [[ ",${HEAVY_COMPARATOR_SKIP_PANELS}," == *",${panel},"* ]]; then
+        comparator_flags=(--run-syri --run-minigraph --run-svim-asm)
+        echo "      [skip] heavy comparators (cactus/pggb/anchorwave) for ${panel} (HEAVY_COMPARATOR_SKIP_PANELS)"
+      fi
+
       # Per-clade RAM cap for the MycoSV index build. Default 8 fits
       # comfortably in a 12 GiB cgroup; raise on larger nodes.
       REAL_MAX_CLADE_GENOMES="${REAL_MAX_CLADE_GENOMES:-8}"
-      if python3 run_real_fungal_benchmark.py benchmark \
-          --prepared-dir "${PANEL_DIR}/prepared" \
-          --mode "${mode}" \
-          --out-dir "${PANEL_DIR}/benchmark_${mode}" \
-          --threads "${THREADS}" \
-          --max-clade-genomes "${REAL_MAX_CLADE_GENOMES}" \
-          "${comparator_flags[@]}" \
-          2>&1 | tee "${PANEL_DIR}/benchmark_${mode}.log"; then
+
+      # Wrap the benchmark invocation in `timeout` so a single slow panel
+      # (e.g. cactus on AMF-scale genomes) cannot consume the SLURM time
+      # budget and starve every subsequent panel. Long-form duration suffixes
+      # (e.g. "4h", "30m") are passed straight through to GNU `timeout`.
+      if [[ "${mode}" == "assembly" ]]; then
+        bench_timeout="${BENCHMARK_TIMEOUT_ASSEMBLY}"
+      else
+        bench_timeout="${BENCHMARK_TIMEOUT_READS}"
+      fi
+      bench_cmd=(python3 run_real_fungal_benchmark.py benchmark
+        --prepared-dir "${PANEL_DIR}/prepared"
+        --mode "${mode}"
+        --out-dir "${PANEL_DIR}/benchmark_${mode}"
+        --threads "${THREADS}"
+        --max-clade-genomes "${REAL_MAX_CLADE_GENOMES}"
+        "${comparator_flags[@]}")
+      if [[ -n "${bench_timeout}" && "${bench_timeout}" != "0" ]] && command -v timeout >/dev/null; then
+        bench_cmd=(timeout --signal=TERM --kill-after=60 "${bench_timeout}" "${bench_cmd[@]}")
+      fi
+      if "${bench_cmd[@]}" 2>&1 | tee "${PANEL_DIR}/benchmark_${mode}.log"; then
         mark_success "real.${panel}.${mode}"
       else
-        mark_failure "real.${panel}.${mode}"
+        rc=${PIPESTATUS[0]}
+        # GNU `timeout` exits 124 on TERM and 137 on KILL — surface that as
+        # a structured failure tag so the summary makes the bottleneck
+        # obvious instead of just printing "stage failed".
+        if [[ "${rc}" == "124" || "${rc}" == "137" ]]; then
+          mark_failure "real.${panel}.${mode}.timeout(${bench_timeout})"
+        else
+          mark_failure "real.${panel}.${mode}"
+        fi
       fi
     done
   done
@@ -296,8 +344,10 @@ if [[ "$EXPERIMENT_TYPE" == "all" || "$EXPERIMENT_TYPE" == "simulated" || "$EXPE
 
   REAL_RESULTS="${REPORT_DIR}/real_merged.tsv"
   BIO_RESULTS="${REPORT_DIR}/biology_merged.tsv"
+  NOVEL_RESULTS="${REPORT_DIR}/novel_merged.tsv"
   : > "${REAL_RESULTS}"
   : > "${BIO_RESULTS}"
+  : > "${NOVEL_RESULTS}"
 
   # Schema-aware merge: input TSVs may have different (but overlapping) headers.
   # We union all columns, then emit one merged TSV with empty fills for columns
@@ -354,17 +404,24 @@ PY
       -name "*pathway*.tsv" \
     \) 2>/dev/null | sort)
 
+  mapfile -t NOVEL_TSVS < <(find "${REAL_DIR}" -type f \
+      -name "novel_mycosv_calls.tsv" 2>/dev/null | sort)
+
   if [[ ${#REAL_TSVS[@]} -gt 0 ]]; then
     merge_tsv_group "${REAL_RESULTS}" "${REAL_TSVS[@]}"
   fi
   if [[ ${#BIO_TSVS[@]} -gt 0 ]]; then
     merge_tsv_group "${BIO_RESULTS}" "${BIO_TSVS[@]}"
   fi
+  if [[ ${#NOVEL_TSVS[@]} -gt 0 ]]; then
+    merge_tsv_group "${NOVEL_RESULTS}" "${NOVEL_TSVS[@]}"
+  fi
 
   report_cmd=(python3 sv_visualization_report.py --outdir "${REPORT_DIR}" --title "MycoSV comprehensive report (${TIMESTAMP})")
   [[ -n "${SIM_RESULTS}" ]] && report_cmd+=(--simulated "${SIM_RESULTS}")
   [[ -s "${REAL_RESULTS}" ]] && report_cmd+=(--real "${REAL_RESULTS}")
   [[ -s "${BIO_RESULTS}" ]] && report_cmd+=(--biology "${BIO_RESULTS}")
+  [[ -s "${NOVEL_RESULTS}" ]] && report_cmd+=(--novel "${NOVEL_RESULTS}")
 
   if [[ -f "${WORK_DIR}/sv_visualization_report.py" ]]; then
     if "${report_cmd[@]}" 2>&1 | tee "${REPORT_DIR}/report.log"; then

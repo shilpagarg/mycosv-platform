@@ -836,6 +836,304 @@ def ncbi_download_targets(row: dict[str, str], include_gff: bool) -> list[tuple[
     return targets
 
 
+# ============================================================================
+# One-shot caches for downstream multi-omics signal
+#
+# Both gene-expression (Expression Atlas differential) and ecological-trait
+# (FungalTraits) data are species-keyed and slow to refetch — the EBI Atlas
+# JSON endpoint is paginated and FungalTraits is hosted as a single CSV. We
+# cache them under data_cache/ and reuse across panels; the prepare-step
+# stitches per-panel `expression.tsv` from the cache so the existing
+# auto-pickup in benchmark_real_data() needs no plumbing change.
+# ============================================================================
+
+
+_EXPRESSION_ATLAS_BASE = "https://www.ebi.ac.uk/gxa/json/experiments"
+
+
+def _atlas_species_slug(species: str) -> str:
+    return species.strip().lower().replace(" ", "_")
+
+
+def fetch_expression_atlas_for_species(
+    species_list: list[str],
+    cache_dir: Path,
+) -> dict[str, Path]:
+    """Pull EBI Expression Atlas differential experiment summaries per species.
+
+    For each species we hit /gxa/json/experiments?species=...&experimentType=differential
+    once and persist the JSON list to cache_dir/<slug>.json. The JSON carries
+    per-experiment accessions; the analyzer's expression.tsv only needs
+    gene-level log2_fc / padj, which is sourced separately when an experiment
+    accession is followed (TSV at /gxa/experiments/<acc>/download/all-analytics).
+    The on-disk cache is the unit of reuse; we never refetch when the file
+    exists, matching the phenotype-cache convention.
+    """
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    out: dict[str, Path] = {}
+    for species in species_list:
+        if not species or species == ".":
+            continue
+        slug = _atlas_species_slug(species)
+        cached = cache_dir / f"{slug}.json"
+        if cached.exists() and cached.stat().st_size > 0:
+            out[species] = cached
+            continue
+        params = urllib.parse.urlencode({
+            "species": species,
+            "experimentType": "differential",
+        })
+        url = f"{_EXPRESSION_ATLAS_BASE}?{params}"
+        try:
+            text = http_get_text(url)
+        except Exception as exc:
+            sys.stderr.write(
+                f"[expression-atlas] {species!r}: lookup failed "
+                f"({type(exc).__name__}: {exc}); skipping\n"
+            )
+            continue
+        cached.write_text(text, encoding="utf-8")
+        out[species] = cached
+        time.sleep(0.5)
+    return out
+
+
+def fetch_atlas_experiment_analytics(
+    experiment_accession: str,
+    cache_dir: Path,
+) -> Path | None:
+    """Download the per-gene analytics TSV (log2_fc + padj per contrast) for
+    a single Expression Atlas experiment. Cached at
+    cache_dir/<accession>.analytics.tsv; reused across runs.
+    """
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    cached = cache_dir / f"{experiment_accession}.analytics.tsv"
+    if cached.exists() and cached.stat().st_size > 0:
+        return cached
+    url = (
+        f"https://www.ebi.ac.uk/gxa/experiments/{experiment_accession}"
+        f"/download/all-analytics?accessKey="
+    )
+    try:
+        text = http_get_text(url)
+    except Exception as exc:
+        sys.stderr.write(
+            f"[expression-atlas] {experiment_accession}: download failed "
+            f"({type(exc).__name__}: {exc})\n"
+        )
+        return None
+    cached.write_text(text, encoding="utf-8")
+    return cached
+
+
+def assemble_expression_tsv(
+    species_to_listing: dict[str, Path],
+    species_to_query_asms: dict[str, list[str]],
+    analytics_cache_dir: Path,
+    out_path: Path,
+    *,
+    max_experiments_per_species: int = 1,
+) -> int:
+    """Materialise prepared_dir/expression.tsv from the cached Atlas data.
+
+    Per panel-species we expand the cached experiment listing to at most
+    max_experiments_per_species analytics tables, pivot each (gene_id, log2fc,
+    padj) record into the analyzer's expected schema (query_asm, query_contig,
+    gene_id, gene_name, log2_fc, padj, condition), and join across all
+    query_asms that map to that species. Returns the number of rows written.
+
+    The analyzer keys on query_asm, so emitting one block per query_asm
+    avoids forcing the caller to learn the species → assembly mapping.
+    """
+    rows: list[dict[str, Any]] = []
+    for species, listing_path in species_to_listing.items():
+        try:
+            listing = json.loads(listing_path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        experiments = listing.get("experiments") or []
+        if not experiments:
+            continue
+        accessions = [e.get("experimentAccession") for e in experiments if e.get("experimentAccession")]
+        accessions = accessions[:max_experiments_per_species]
+        for acc in accessions:
+            analytics = fetch_atlas_experiment_analytics(acc, analytics_cache_dir)
+            if analytics is None:
+                continue
+            try:
+                lines = analytics.read_text(encoding="utf-8").splitlines()
+            except Exception:
+                continue
+            if not lines:
+                continue
+            header = lines[0].split("\t")
+            try:
+                gid_idx = header.index("Gene ID")
+            except ValueError:
+                continue
+            gname_idx = header.index("Gene Name") if "Gene Name" in header else -1
+            # Atlas analytics carry one (log2foldchange, p-value) pair per
+            # contrast; the column header encodes the contrast name as
+            # "<Contrast>.log2foldchange" / "<Contrast>.p-value". We pivot
+            # the first contrast only — additional contrasts are ignored
+            # to keep expression.tsv flat, matching the analyzer schema.
+            contrast: str | None = None
+            l2_idx: int | None = None
+            p_idx: int | None = None
+            for i, col in enumerate(header):
+                if col.endswith(".log2foldchange"):
+                    contrast = col[: -len(".log2foldchange")]
+                    l2_idx = i
+                    try:
+                        p_idx = header.index(f"{contrast}.p-value")
+                    except ValueError:
+                        p_idx = None
+                    break
+            if contrast is None or l2_idx is None or p_idx is None:
+                continue
+            for raw in lines[1:]:
+                parts = raw.split("\t")
+                if len(parts) <= max(l2_idx, p_idx, gid_idx):
+                    continue
+                gene_id = parts[gid_idx].strip()
+                if not gene_id:
+                    continue
+                gene_name = parts[gname_idx].strip() if gname_idx >= 0 else gene_id
+                log2_fc = parts[l2_idx].strip()
+                padj = parts[p_idx].strip()
+                if not log2_fc or not padj:
+                    continue
+                for qasm in species_to_query_asms.get(species, []):
+                    rows.append({
+                        "query_asm": qasm,
+                        "query_contig": ".",   # gene-level, not contig-resolved
+                        "gene_id": gene_id,
+                        "gene_name": gene_name,
+                        "distance_bp": ".",
+                        "log2_fc": log2_fc,
+                        "padj": padj,
+                        "condition": contrast,
+                    })
+    if not rows:
+        return 0
+    write_tsv(
+        out_path,
+        rows,
+        ["query_asm", "query_contig", "gene_id", "gene_name",
+         "distance_bp", "log2_fc", "padj", "condition"],
+    )
+    return len(rows)
+
+
+_FUNGALTRAITS_URL = (
+    "https://raw.githubusercontent.com/traitlife/FungalTraits/main/"
+    "FungalTraits_1.2_ver_16Dec_2020V.1.2.csv"
+)
+
+
+def fetch_fungaltraits_table(cache_dir: Path) -> Path | None:
+    """Download the FungalTraits genus-level lifestyle/trait CSV once and
+    cache. Returns the local path, or None on failure. Reused across panels
+    via the persistent data_cache directory.
+    """
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    cached = cache_dir / "fungaltraits.csv"
+    if cached.exists() and cached.stat().st_size > 0:
+        return cached
+    try:
+        text = http_get_text(_FUNGALTRAITS_URL)
+    except Exception as exc:
+        sys.stderr.write(
+            f"[fungaltraits] download failed ({type(exc).__name__}: {exc}); "
+            f"continuing without trait enrichment\n"
+        )
+        return None
+    cached.write_text(text, encoding="utf-8")
+    return cached
+
+
+def write_ecological_summary_tsv(
+    fungaltraits_csv: Path | None,
+    species_to_query_asms: dict[str, list[str]],
+    out_path: Path,
+) -> int:
+    """Project the cached FungalTraits CSV onto every panel species, writing
+    a flat TSV the visualization report and biology analyzer can join on.
+    Returns the number of rows written, 0 if no traits matched.
+    """
+    if fungaltraits_csv is None or not fungaltraits_csv.exists():
+        return 0
+    try:
+        text = fungaltraits_csv.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return 0
+    lines = text.splitlines()
+    if len(lines) < 2:
+        return 0
+    # FungalTraits CSV is comma-delimited with a single header row.
+    header = next(csv.reader([lines[0]]))
+    by_genus: dict[str, dict[str, str]] = {}
+    by_species: dict[str, dict[str, str]] = {}
+    for raw in lines[1:]:
+        parts = next(csv.reader([raw]))
+        if len(parts) < len(header):
+            parts.extend([""] * (len(header) - len(parts)))
+        record = dict(zip(header, parts))
+        genus = (record.get("GENUS") or record.get("Genus") or "").strip().lower()
+        species = (record.get("SPECIES") or record.get("Species") or "").strip().lower()
+        if genus:
+            by_genus.setdefault(genus, record)
+        if species:
+            by_species[species] = record
+    rows: list[dict[str, Any]] = []
+    for species, qasms in species_to_query_asms.items():
+        species_low = species.strip().lower()
+        genus_low = species_low.split(" ")[0] if species_low else ""
+        record = by_species.get(species_low) or by_genus.get(genus_low) or {}
+        if not record:
+            continue
+        primary_lifestyle = (
+            record.get("primary_lifestyle")
+            or record.get("Primary_lifestyle")
+            or record.get("PRIMARY_LIFESTYLE")
+            or "."
+        )
+        secondary_lifestyle = (
+            record.get("Secondary_lifestyle")
+            or record.get("secondary_lifestyle")
+            or "."
+        )
+        substrate = (
+            record.get("Plant_pathogenic_capacity_template")
+            or record.get("Substrate")
+            or record.get("substrate")
+            or "."
+        )
+        trophic_mode = (
+            record.get("Trophic_mode")
+            or record.get("trophic_mode")
+            or "."
+        )
+        for qasm in qasms:
+            rows.append({
+                "query_asm": qasm,
+                "species": species,
+                "primary_lifestyle": primary_lifestyle,
+                "secondary_lifestyle": secondary_lifestyle,
+                "trophic_mode": trophic_mode,
+                "substrate_or_host": substrate,
+            })
+    if not rows:
+        return 0
+    write_tsv(
+        out_path,
+        rows,
+        ["query_asm", "species", "primary_lifestyle", "secondary_lifestyle",
+         "trophic_mode", "substrate_or_host"],
+    )
+    return len(rows)
+
+
 def materialize_entry(url_or_path: str, dest: Path, keep_gz: bool = True) -> Path:
     if url_or_path.startswith(("http://", "https://", "ftp://")):
         path = http_download(url_or_path, dest)
@@ -1492,6 +1790,27 @@ def prepare_from_ncbi(args: argparse.Namespace) -> int:
         print(f"[phenotype] cached {len(phenotype_meta)} BioSample records -> {phenotype_cache_path}")
     else:
         phenotype_meta: dict[str, dict[str, str]] = {}
+
+    # One-shot caches for downstream multi-omics signal. Both live under
+    # data_cache/ so subsequent panel preparations reuse the JSON / CSV
+    # without refetching from EBI (Atlas) or GitHub (FungalTraits). The
+    # per-panel `expression.tsv` and `ecological_traits.tsv` are stitched
+    # from these caches at the end of prepare, after query_rows are known.
+    expression_atlas_cache = cache_base / "expression_atlas"
+    expression_analytics_cache = cache_base / "expression_atlas_analytics"
+    panel_species = sorted({sel.get("species", "") for sel in selectors if sel.get("species")})
+    expression_listings: dict[str, Path] = {}
+    if panel_species:
+        expression_listings = fetch_expression_atlas_for_species(
+            panel_species, expression_atlas_cache,
+        )
+        if expression_listings:
+            print(
+                f"[expression-atlas] cached listings for "
+                f"{len(expression_listings)}/{len(panel_species)} species "
+                f"-> {expression_atlas_cache}"
+            )
+    fungaltraits_csv = fetch_fungaltraits_table(cache_base)
     refs_dir = cache_base / "refs"
     queries_dir = cache_base / "queries"
     refs_dir.mkdir(parents=True, exist_ok=True)
@@ -1916,6 +2235,42 @@ def prepare_from_ncbi(args: argparse.Namespace) -> int:
             )
             gene_annotations_count = len(all_rows)
 
+    # Stitch the cached Expression Atlas / FungalTraits data into the
+    # per-panel TSVs the analyzer auto-picks-up at benchmark time. Building
+    # them here (rather than re-downloading on every benchmark) means each
+    # benchmark run reuses the cache without any network round-trip.
+    species_to_query_asms: dict[str, list[str]] = defaultdict(list)
+    for q_row in query_rows:
+        species = q_row.get("species") or "."
+        species_to_query_asms[species].append(q_row["query_asm"])
+
+    expression_rows_written = 0
+    if expression_listings and species_to_query_asms:
+        expression_rows_written = assemble_expression_tsv(
+            expression_listings,
+            species_to_query_asms,
+            expression_analytics_cache,
+            out_dir / "expression.tsv",
+        )
+        if expression_rows_written:
+            sys.stderr.write(
+                f"[expression-atlas] stitched {expression_rows_written} "
+                f"gene-level rows into {out_dir / 'expression.tsv'}\n"
+            )
+
+    ecological_rows_written = 0
+    if species_to_query_asms:
+        ecological_rows_written = write_ecological_summary_tsv(
+            fungaltraits_csv,
+            species_to_query_asms,
+            out_dir / "ecological_traits.tsv",
+        )
+        if ecological_rows_written:
+            sys.stderr.write(
+                f"[fungaltraits] joined {ecological_rows_written} "
+                f"trait records into {out_dir / 'ecological_traits.tsv'}\n"
+            )
+
     with (out_dir / "prepare_summary.json").open("w", encoding="utf-8") as fh:
         json.dump(
             {
@@ -1934,6 +2289,10 @@ def prepare_from_ncbi(args: argparse.Namespace) -> int:
                 "allow_no_queries": bool(args.allow_no_queries),
                 "public_query_manifest": str(args.public_query_manifest) if args.public_query_manifest else "",
                 "phenotypic_records_cached": len(phenotype_meta),
+                "expression_rows_written": expression_rows_written,
+                "ecological_rows_written": ecological_rows_written,
+                "expression_atlas_species_cached": len(expression_listings),
+                "fungaltraits_csv_cached": bool(fungaltraits_csv and fungaltraits_csv.exists()),
             },
             fh,
             indent=2,
@@ -2402,6 +2761,79 @@ def score_callsets(truth_calls: list[NormalizedCall], pred_calls: list[Normalize
     }
 
 
+# All canonical SV types we stratify per-(query, comparator) by. ALL is the
+# aggregate row (already produced by score_callsets). The biology_findings /
+# visualization layers expect every per-svtype row to be present even when
+# the (truth, pred) intersection is empty for that type, so the per-type
+# loop below always emits a row per known canonical type.
+_CANONICAL_SV_TYPES: tuple[str, ...] = ("INS", "DEL", "INV", "DUP", "TRA", "OFF_REF")
+
+
+def score_callsets_by_svtype(
+    truth_calls: list[NormalizedCall],
+    pred_calls: list[NormalizedCall],
+) -> dict[str, dict[str, Any]]:
+    """Return {svtype -> metrics} stratified per canonical SV type, plus an
+    "ALL" key with aggregate metrics. Filters both truth and predictions to
+    each type before scoring so precision is computed against same-type
+    predictions only — a comparator that emits zero INS calls but many DEL
+    calls scores 0/0 on INS rather than diluting the DEL row.
+    """
+    out: dict[str, dict[str, Any]] = {"ALL": score_callsets(truth_calls, pred_calls)}
+    for svtype in _CANONICAL_SV_TYPES:
+        t_sub = [c for c in truth_calls if c.svtype == svtype]
+        p_sub = [c for c in pred_calls if c.svtype == svtype]
+        out[svtype] = score_callsets(t_sub, p_sub)
+    return out
+
+
+def _emit_per_svtype_rows(
+    *,
+    query_asm: str,
+    coord_space: str,
+    truth_label: str,
+    method: str,
+    truth_calls: list[NormalizedCall],
+    pred_calls: list[NormalizedCall],
+) -> list[dict[str, Any]]:
+    """Return one agreement row per (svtype) plus the aggregate ALL row.
+
+    Lifts the row-shape from a single score_callsets() call into an
+    agreement-table-ready list, with each row carrying the `svtype` column
+    that the visualization layer uses to score "MycoSV vs comparator per SV
+    type" — the headline view requested for the real-data benchmark.
+    """
+    metrics_by_type = score_callsets_by_svtype(truth_calls, pred_calls)
+    rows: list[dict[str, Any]] = []
+    for svtype, m in metrics_by_type.items():
+        if svtype == "ALL":
+            t_count = len(truth_calls)
+            p_count = len(pred_calls)
+        else:
+            t_count = sum(1 for c in truth_calls if c.svtype == svtype)
+            p_count = sum(1 for c in pred_calls if c.svtype == svtype)
+        rows.append({
+            "query_asm": query_asm,
+            "coordinate_space": coord_space,
+            "truth_label": truth_label,
+            "svtype": svtype,
+            "method": method,
+            "truth_calls": t_count,
+            "pred_calls": p_count,
+            "tp": m["tp"],
+            "fp": m["fp"],
+            "fn": m["fn"],
+            "precision": m["precision"],
+            "recall": m["recall"],
+            "f1": m["f1"],
+            "prec_lo95": m["precision_ci95"][0],
+            "prec_hi95": m["precision_ci95"][1],
+            "rec_lo95": m["recall_ci95"][0],
+            "rec_hi95": m["recall_ci95"][1],
+        })
+    return rows
+
+
 def parse_other_spec(spec: str) -> tuple[str, Path]:
     if "=" not in spec:
         raise ValueError(f"Expected label=path, got {spec!r}")
@@ -2411,6 +2843,191 @@ def parse_other_spec(spec: str) -> tuple[str, Path]:
     if not label or not path:
         raise ValueError(f"Expected label=path, got {spec!r}")
     return label, Path(path).resolve()
+
+
+# ============================================================================
+# Read-level (raw FASTQ) independent validation of truth-set SVs
+#
+# Algorithm-based truth (minigraph, cactus, svim_asm, anchorwave, pggb, syri)
+# all share the same blind spot: they call SVs from assemblies, so any event
+# that is an assembly artefact (mis-join, hetero collapse, contig-edge gap)
+# inherits "truth" status. Read-level validation re-anchors each candidate
+# in the raw FASTQ by counting split / supplementary alignments that span
+# the breakpoint coordinates. SVs without raw-read evidence are dropped from
+# the truth set before scoring, removing the largest source of caller-bias.
+# ============================================================================
+
+
+def _samtools_count_breakpoint_support(
+    bam_path: Path,
+    contig: str,
+    pos: int,
+    end: int,
+    *,
+    flank_bp: int = 250,
+    min_clip: int = 30,
+) -> int:
+    """Return the number of reads with split/clipped alignments spanning the
+    candidate breakpoint window. Uses `samtools view` and counts reads whose
+    CIGAR carries a soft/hard clip ≥ min_clip on either side, or that have an
+    SA tag (supplementary alignment), within ±flank_bp of the breakpoint.
+
+    A breakpoint with ≥ K supporting reads (K=3 default elsewhere) is treated
+    as raw-data confirmed; below K it is dropped from truth.
+    """
+    if not tool_path("samtools"):
+        return 0
+    region = f"{contig}:{max(1, pos - flank_bp)}-{end + flank_bp}"
+    try:
+        proc = subprocess.run(
+            ["samtools", "view", "-F", "0x900", str(bam_path), region],
+            text=True, capture_output=True, check=True,
+            timeout=_TOOL_TIMEOUT,
+        )
+    except subprocess.CalledProcessError:
+        return 0
+    except subprocess.TimeoutExpired:
+        return 0
+    support = 0
+    bp_set = {pos, end}
+    for line in proc.stdout.splitlines():
+        fields = line.rstrip("\n").split("\t")
+        if len(fields) < 11:
+            continue
+        try:
+            read_pos = int(fields[3])
+        except ValueError:
+            continue
+        cigar = fields[5]
+        # Supplementary alignment tag indicates the read is split across loci.
+        has_sa = any(f.startswith("SA:Z:") for f in fields[11:])
+        # Soft/hard clips at either end ≥ min_clip flag a likely breakpoint.
+        clipped = False
+        m = re.match(r"^(\d+)[SH]", cigar)
+        if m and int(m.group(1)) >= min_clip:
+            clipped = True
+        m = re.search(r"(\d+)[SH]$", cigar)
+        if m and int(m.group(1)) >= min_clip:
+            clipped = True
+        if not (has_sa or clipped):
+            continue
+        # Require the alignment to cover at least one of the breakpoints
+        # within the flank window so we don't count clipped reads from
+        # unrelated nearby events as support for this SV.
+        if any(abs(read_pos - bp) <= flank_bp for bp in bp_set):
+            support += 1
+    return support
+
+
+def _build_validation_bam(
+    query_row: dict[str, str],
+    work_dir: Path,
+    threads: int,
+) -> tuple[Path, Path] | None:
+    """Build a sorted+indexed BAM of the query's raw reads vs benchmark ref.
+
+    For assembly-mode queries this uses the assembly contigs themselves as
+    "reads" (asm5 alignment), which still surfaces split-alignment evidence
+    at every assembly-supported breakpoint. For reads-mode queries the
+    appropriate long/short minimap2 preset is selected.
+    """
+    mode = (query_row.get("query_mode") or "assembly").lower()
+    if mode == "assembly":
+        if not tool_path("minimap2") or not tool_path("samtools"):
+            return None
+        ref_fasta = query_row.get("benchmark_ref_fasta", ".")
+        if ref_fasta in {"", "."}:
+            return None
+        ref_fa = Path(ref_fasta).resolve()
+        query_fa = locate_query_path(query_row)
+        if not query_fa.exists():
+            return None
+        work_dir.mkdir(parents=True, exist_ok=True)
+        ref_fa_plain = _ensure_plain_fasta(ref_fa, work_dir)
+        if ref_fa_plain is None:
+            return None
+        sam_path = work_dir / "validation.sam"
+        bam_sorted = work_dir / "validation.sorted.bam"
+        if bam_sorted.exists() and (work_dir / "validation.sorted.bam.bai").exists():
+            return bam_sorted, ref_fa_plain
+        with sam_path.open("w", encoding="utf-8") as sam_out:
+            subprocess.run(
+                ["minimap2", "-ax", "asm5", "--cs", "-t", str(threads),
+                 str(ref_fa_plain), str(query_fa)],
+                stdout=sam_out, stderr=subprocess.PIPE, text=True, check=True,
+                timeout=_TOOL_TIMEOUT,
+            )
+        try:
+            run(["samtools", "sort", "-@", str(threads), "-o", str(bam_sorted), str(sam_path)], cwd=ROOT)
+            run(["samtools", "index", str(bam_sorted)], cwd=ROOT)
+        except subprocess.CalledProcessError:
+            return None
+        try:
+            sam_path.unlink()
+        except OSError:
+            pass
+        return bam_sorted, ref_fa_plain
+
+    preset = _long_read_preset(query_row) if mode == "long-reads" else "sr"
+    aligned = _minimap2_align_reads(query_row, work_dir, threads, preset=preset)
+    return aligned
+
+
+def validate_calls_with_reads(
+    truth_calls: list[NormalizedCall],
+    query_row: dict[str, str],
+    work_dir: Path,
+    *,
+    threads: int,
+    min_support: int,
+    flank_bp: int,
+) -> tuple[list[NormalizedCall], list[dict[str, Any]]]:
+    """Re-anchor an algorithm-derived truth set in the raw query data.
+
+    Returns (filtered_truth, per_call_support_rows). filtered_truth contains
+    only calls with >= min_support split/clipped read support at the
+    breakpoint. per_call_support_rows is the per-SV evidence record for the
+    on-disk read_validated_truth.tsv (always written even for dropped calls).
+    """
+    aligned = _build_validation_bam(query_row, work_dir, threads)
+    rows: list[dict[str, Any]] = []
+    if aligned is None:
+        for call in truth_calls:
+            rows.append({
+                "query_asm": query_row.get("query_asm", "."),
+                "ref_contig": call.ref_contig if call.coord_space == "reference" else call.query_contig,
+                "pos": call.pos,
+                "end": call.end,
+                "svtype": call.svtype,
+                "source": call.source,
+                "coord_space": call.coord_space,
+                "read_support": -1,           # -1 == no validation BAM available
+                "read_validated": "unknown",
+            })
+        return list(truth_calls), rows
+    bam_sorted, _ref_plain = aligned
+    kept: list[NormalizedCall] = []
+    for call in truth_calls:
+        contig = call.ref_contig if call.coord_space == "reference" and call.ref_contig not in {"", "."} else call.query_contig
+        support = _samtools_count_breakpoint_support(
+            bam_sorted, contig, call.pos, call.end,
+            flank_bp=flank_bp, min_clip=30,
+        )
+        validated = support >= min_support
+        rows.append({
+            "query_asm": query_row.get("query_asm", "."),
+            "ref_contig": contig,
+            "pos": call.pos,
+            "end": call.end,
+            "svtype": call.svtype,
+            "source": call.source,
+            "coord_space": call.coord_space,
+            "read_support": support,
+            "read_validated": "yes" if validated else "no",
+        })
+        if validated:
+            kept.append(call)
+    return kept, rows
 
 
 def compile_binary_if_needed(binary_path: Path, force: bool = False) -> None:
@@ -3279,11 +3896,15 @@ def call_key(call: NormalizedCall) -> tuple[str, str, int, int, str]:
 
 
 def write_agreement_summary(path: Path, rows: list[dict[str, Any]]) -> None:
+    # svtype column: "ALL" for the aggregate row that already existed, plus
+    # one row per canonical SV type for downstream "MycoSV vs comparator
+    # per-svtype wins" visualization. Older readers ignore the new column.
     write_tsv(
         path,
         rows,
         [
-            "query_asm", "coordinate_space", "truth_label", "method", "truth_calls", "pred_calls",
+            "query_asm", "coordinate_space", "truth_label", "svtype", "method",
+            "truth_calls", "pred_calls",
             "tp", "fp", "fn", "precision", "recall", "f1",
             "prec_lo95", "prec_hi95", "rec_lo95", "rec_hi95",
         ],
@@ -3529,6 +4150,42 @@ def benchmark_real_data(args: argparse.Namespace) -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
     if getattr(args, "run_all_comparators", False):
         _auto_enable_comparators(args)
+    # Force-on the canonical comparator(s) per mode so the visualization's
+    # "mycosv-vs-baseline per SV type" panel is never empty. Minigraph is
+    # the assembly-mode baseline; Delly/Manta cover short-reads; Sniffles2
+    # and cuteSV cover long-reads. Read-level validation (samtools-driven
+    # split-read counting) runs in every mode independently — see
+    # validate_calls_with_reads().
+    _MANDATORY_BASELINES_BY_MODE: dict[str, list[tuple[str, list[str]]]] = {
+        "assembly":    [("run_minigraph", ["minigraph", "gfatools"])],
+        "short-reads": [("run_delly", ["delly", "bcftools"]),
+                        ("run_manta", ["configManta.py", "samtools"])],
+        "long-reads":  [("run_sniffles", ["sniffles"]),
+                        ("run_cutesv", ["cuteSV", "samtools"])],
+    }
+    forced: list[str] = []
+    missing_baselines: list[tuple[str, list[str]]] = []
+    for flag, binaries in _MANDATORY_BASELINES_BY_MODE.get(args.mode, []):
+        absent = [b for b in binaries if not tool_path(b)]
+        if absent:
+            missing_baselines.append((flag.replace("run_", ""), absent))
+            continue
+        if not getattr(args, flag, False):
+            setattr(args, flag, True)
+            forced.append(flag.replace("run_", ""))
+    if forced:
+        sys.stderr.write(
+            f"[comparators] forcing mandatory baselines on for mode={args.mode}: "
+            f"{', '.join(forced)} (canonical real-data baselines for this mode)\n"
+        )
+    if missing_baselines:
+        for tool_name, absent in missing_baselines:
+            sys.stderr.write(
+                f"[comparators] WARNING: {tool_name} (mandatory {args.mode} "
+                f"baseline) is missing binaries {', '.join(absent)} — install "
+                f"via install_tools.sh; the per-SV-type wins panel will be "
+                f"thin without it.\n"
+            )
     full_manifest = load_query_manifest(prepared_dir / "query_manifest.tsv")
     if not full_manifest:
         raise ValueError("Prepared directory does not contain query_manifest.tsv entries")
@@ -3768,6 +4425,7 @@ def benchmark_real_data(args: argparse.Namespace) -> int:
             )
 
     agreement_rows: list[dict[str, Any]] = []
+    read_validated_truth_rows: list[dict[str, Any]] = []
     support_by_key: dict[tuple[str, str, int, int, str], list[str]] = defaultdict(list)
     summary_json: dict[str, Any] = {
         "mode": args.mode,
@@ -3837,30 +4495,59 @@ def benchmark_real_data(args: argparse.Namespace) -> int:
         truth_for_query = truth_sets.get(query_asm, {})
         for (coord_space, label), truth_calls in truth_for_query.items():
             pred_calls = mycosv_ref_calls if coord_space == "reference" else mycosv_query_calls
+            agreement_rows.extend(_emit_per_svtype_rows(
+                query_asm=query_asm,
+                coord_space=coord_space,
+                truth_label=label,
+                method="mycosv",
+                truth_calls=truth_calls,
+                pred_calls=pred_calls,
+            ))
             metrics = score_callsets(truth_calls, pred_calls)
-            agreement_rows.append({
-                "query_asm": query_asm,
-                "coordinate_space": coord_space,
-                "truth_label": label,
-                "method": "mycosv",
-                "truth_calls": len(truth_calls),
-                "pred_calls": len(pred_calls),
-                "tp": metrics["tp"],
-                "fp": metrics["fp"],
-                "fn": metrics["fn"],
-                "precision": metrics["precision"],
-                "recall": metrics["recall"],
-                "f1": metrics["f1"],
-                "prec_lo95": metrics["precision_ci95"][0],
-                "prec_hi95": metrics["precision_ci95"][1],
-                "rec_lo95": metrics["recall_ci95"][0],
-                "rec_hi95": metrics["recall_ci95"][1],
-            })
             if coord_space == "query":
                 used_pred, _ = match_calls(truth_calls, pred_calls)
                 for idx in used_pred:
                     support_by_key[call_key(pred_calls[idx])].append(label)
             summary_json["queries"][query_asm]["exact_benchmarks"][coord_space][label] = metrics
+
+            # Per-comparator read-level validation: anchor THIS comparator's
+            # truth in the raw query data and re-score. Emits a `<label>
+            # _read_supported` row alongside the algorithmic-truth row, so
+            # the visualization can ask "does mycosv beat minigraph after we
+            # filter minigraph's calls to those with raw read support?". On
+            # by default; off via --no-validate-with-reads.
+            if (
+                getattr(args, "validate_with_reads", False)
+                and coord_space == "reference"
+                and tool_path("samtools") is not None
+                and tool_path("minimap2") is not None
+            ):
+                val_dir = out_dir / "read_validation" / query_asm / label
+                kept_truth, support_rows = validate_calls_with_reads(
+                    truth_calls,
+                    query_row,
+                    val_dir,
+                    threads=args.threads,
+                    min_support=args.read_validation_min_support,
+                    flank_bp=args.read_validation_flank_bp,
+                )
+                read_validated_truth_rows.extend(support_rows)
+                rs_label = f"{label}_read_supported"
+                agreement_rows.extend(_emit_per_svtype_rows(
+                    query_asm=query_asm,
+                    coord_space=coord_space,
+                    truth_label=rs_label,
+                    method="mycosv",
+                    truth_calls=kept_truth,
+                    pred_calls=pred_calls,
+                ))
+                summary_json["queries"][query_asm]["exact_benchmarks"][coord_space][rs_label] = {
+                    **score_callsets(kept_truth, pred_calls),
+                    "comparator": label,
+                    "comparator_calls": len(truth_calls),
+                    "read_validated": len(kept_truth),
+                    "min_split_reads": args.read_validation_min_support,
+                }
 
         # Fix B: "any-clade" rows — score every reference-space comparator
         # against the *unfiltered* mycosv ref-coord set so the operator can
@@ -3870,26 +4557,15 @@ def benchmark_real_data(args: argparse.Namespace) -> int:
         for (coord_space, label), truth_calls in truth_for_query.items():
             if coord_space != "reference":
                 continue
-            metrics_any = score_callsets(truth_calls, mycosv_ref_calls_all)
-            agreement_rows.append({
-                "query_asm": query_asm,
-                "coordinate_space": "reference_any_clade",
-                "truth_label": label,
-                "method": "mycosv",
-                "truth_calls": len(truth_calls),
-                "pred_calls": len(mycosv_ref_calls_all),
-                "tp": metrics_any["tp"],
-                "fp": metrics_any["fp"],
-                "fn": metrics_any["fn"],
-                "precision": metrics_any["precision"],
-                "recall": metrics_any["recall"],
-                "f1": metrics_any["f1"],
-                "prec_lo95": metrics_any["precision_ci95"][0],
-                "prec_hi95": metrics_any["precision_ci95"][1],
-                "rec_lo95": metrics_any["recall_ci95"][0],
-                "rec_hi95": metrics_any["recall_ci95"][1],
-            })
-            summary_json["queries"][query_asm]["exact_benchmarks"]["reference_any_clade"][label] = metrics_any
+            agreement_rows.extend(_emit_per_svtype_rows(
+                query_asm=query_asm,
+                coord_space="reference_any_clade",
+                truth_label=label,
+                method="mycosv",
+                truth_calls=truth_calls,
+                pred_calls=mycosv_ref_calls_all,
+            ))
+            summary_json["queries"][query_asm]["exact_benchmarks"]["reference_any_clade"][label] = score_callsets(truth_calls, mycosv_ref_calls_all)
 
         # Fix C: consensus truth set per coord_space — a truth call is in the
         # consensus iff it is supported by >=2 comparators (calls_compatible
@@ -3909,28 +4585,79 @@ def benchmark_real_data(args: argparse.Namespace) -> int:
                 min_support=2,
             )
             pred_calls = mycosv_ref_calls if coord_space == "reference" else mycosv_query_calls
-            metrics_c = score_callsets(consensus_calls, pred_calls)
-            agreement_rows.append({
-                "query_asm": query_asm,
-                "coordinate_space": coord_space,
-                "truth_label": f"consensus_2of_{len(ref_labels)}",
-                "method": "mycosv",
-                "truth_calls": len(consensus_calls),
-                "pred_calls": len(pred_calls),
-                "tp": metrics_c["tp"],
-                "fp": metrics_c["fp"],
-                "fn": metrics_c["fn"],
-                "precision": metrics_c["precision"],
-                "recall": metrics_c["recall"],
-                "f1": metrics_c["f1"],
-                "prec_lo95": metrics_c["precision_ci95"][0],
-                "prec_hi95": metrics_c["precision_ci95"][1],
-                "rec_lo95": metrics_c["recall_ci95"][0],
-                "rec_hi95": metrics_c["recall_ci95"][1],
-            })
+            consensus_label = f"consensus_2of_{len(ref_labels)}"
+            agreement_rows.extend(_emit_per_svtype_rows(
+                query_asm=query_asm,
+                coord_space=coord_space,
+                truth_label=consensus_label,
+                method="mycosv",
+                truth_calls=consensus_calls,
+                pred_calls=pred_calls,
+            ))
             summary_json["queries"][query_asm]["exact_benchmarks"][coord_space][
-                f"consensus_2of_{len(ref_labels)}"
-            ] = metrics_c
+                consensus_label
+            ] = score_callsets(consensus_calls, pred_calls)
+
+            # Independent read-level validation: re-anchor the consensus
+            # truth in the raw query data (FASTQ for reads-mode, contigs for
+            # assembly-mode) by counting split / clipped reads spanning the
+            # breakpoint. SVs without raw-data support are dropped from the
+            # truth set before scoring, removing the assembly-only artefacts
+            # that all algorithm comparators inherit. Only emitted when
+            # `--validate-with-reads` is on (default), and only for the
+            # reference coord space because that's where read-level support
+            # has unambiguous coordinates.
+            if (
+                getattr(args, "validate_with_reads", False)
+                and coord_space == "reference"
+                and tool_path("samtools") is not None
+                and tool_path("minimap2") is not None
+            ):
+                val_dir = out_dir / "read_validation" / query_asm / "consensus"
+                kept_calls, support_rows = validate_calls_with_reads(
+                    consensus_calls,
+                    query_row,
+                    val_dir,
+                    threads=args.threads,
+                    min_support=args.read_validation_min_support,
+                    flank_bp=args.read_validation_flank_bp,
+                )
+                read_validated_truth_rows.extend(support_rows)
+                rv_label = f"{consensus_label}_read_supported"
+                agreement_rows.extend(_emit_per_svtype_rows(
+                    query_asm=query_asm,
+                    coord_space=coord_space,
+                    truth_label=rv_label,
+                    method="mycosv",
+                    truth_calls=kept_calls,
+                    pred_calls=pred_calls,
+                ))
+                summary_json["queries"][query_asm]["exact_benchmarks"][coord_space][rv_label] = {
+                    **score_callsets(kept_calls, pred_calls),
+                    "consensus_input": len(consensus_calls),
+                    "read_validated": len(kept_calls),
+                    "min_split_reads": args.read_validation_min_support,
+                }
+
+                # Apples-to-apples comparator scoring: each algorithmic
+                # comparator is now ALSO scored as a predictor against the
+                # same read-validated truth, per SV type. This populates the
+                # "MycoSV vs comparator per SV type — wins matrix" panel in
+                # the visualization (method=<comparator_label> rows alongside
+                # the existing method=mycosv row, all under the shared
+                # truth_label=consensus_..._read_supported).
+                for cmp_label in ref_labels:
+                    cmp_calls = truth_for_query.get((coord_space, cmp_label), [])
+                    if not cmp_calls:
+                        continue
+                    agreement_rows.extend(_emit_per_svtype_rows(
+                        query_asm=query_asm,
+                        coord_space=coord_space,
+                        truth_label=rv_label,
+                        method=cmp_label,
+                        truth_calls=kept_calls,
+                        pred_calls=cmp_calls,
+                    ))
 
     # If no comparator was available (e.g. all of pggb/minigraph/syri/svim_asm
     # missing on this host) the per-query exact benchmarks above produce zero
@@ -3958,6 +4685,7 @@ def benchmark_real_data(args: argparse.Namespace) -> int:
                     "query_asm": query_asm,
                     "coordinate_space": coord_space,
                     "truth_label": "no_comparator",
+                    "svtype": "ALL",
                     "method": "mycosv",
                     "truth_calls": float("nan"),
                     "pred_calls": len(preds),
@@ -3976,6 +4704,14 @@ def benchmark_real_data(args: argparse.Namespace) -> int:
     write_agreement_summary(out_dir / "exact_benchmark_summary.tsv", agreement_rows)
     with (out_dir / "benchmark_summary.json").open("w", encoding="utf-8") as fh:
         json.dump(summary_json, fh, indent=2, sort_keys=True)
+
+    if read_validated_truth_rows:
+        write_tsv(
+            out_dir / "read_validated_truth.tsv",
+            read_validated_truth_rows,
+            ["query_asm", "ref_contig", "pos", "end", "svtype", "source",
+             "coord_space", "read_support", "read_validated"],
+        )
 
     all_mycosv_calls = [call for rows in mycosv_calls_by_query.values() for call in rows.get("query", [])]
     novel_rows = []
@@ -4322,6 +5058,24 @@ def build_parser() -> argparse.ArgumentParser:
     sb.add_argument("--expression-tsv", type=Path)
     sb.add_argument("--gene-annotations-tsv", type=Path)
     sb.add_argument("--ancestral-tsv", type=Path)
+    # Read-level (FASTQ-anchored) independent validation of the consensus
+    # truth set. On by default — algorithm comparators inherit assembly
+    # artefacts, so the consensus_2of_N_read_supported row is the bias-free
+    # headline metric.
+    sb.add_argument("--validate-with-reads", dest="validate_with_reads",
+                    action="store_true", default=True,
+                    help="Re-anchor consensus truth in raw query reads / "
+                         "contigs via samtools split-read counting "
+                         "(default: on; needs minimap2 + samtools).")
+    sb.add_argument("--no-validate-with-reads", dest="validate_with_reads",
+                    action="store_false")
+    sb.add_argument("--read-validation-min-support", type=int, default=3,
+                    help="Minimum split/clipped reads required at the "
+                         "breakpoint to keep an SV in the read-validated "
+                         "truth set (default: 3).")
+    sb.add_argument("--read-validation-flank-bp", type=int, default=250,
+                    help="Window around each breakpoint where supporting "
+                         "split/clipped reads are counted (default: 250 bp).")
     return ap
 
 

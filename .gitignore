@@ -8,6 +8,7 @@ experiments/
 logs/
 
 # 🔹 Large files
+slum*
 *.csv
 *.nfs*
 *.tsv

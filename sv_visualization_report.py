@@ -657,6 +657,229 @@ def plot_hgt_propagation(df: pd.DataFrame, outdir: Path) -> Optional[FigureRecor
     )
 
 
+_WINS_TRUTH_LABEL_PREFIXES = (
+    "consensus_",        # consensus_2of_N and consensus_2of_N_read_supported
+    "minigraph_read_supported",
+    "delly_read_supported",
+    "manta_read_supported",
+    "sniffles_read_supported",
+    "cutesv_read_supported",
+    "svim_read_supported",
+)
+
+
+def _select_wins_subset(real_df: pd.DataFrame) -> pd.DataFrame:
+    """Slice real_merged.tsv to the rows that drive the wins-matrix panel.
+
+    We want per-(query, svtype, method) F1 scored against a *bias-free*
+    truth — that is: anything that ends with _read_supported, plus the
+    consensus_2of_N rows themselves so the operator can see how much the
+    read-level filter changed the verdict. We exclude the per-comparator
+    aggregate rows (where method=mycosv against a single algorithm — those
+    are the "mycosv vs comparator-as-truth" view, not the apples-to-apples
+    view we want here).
+    """
+    if real_df is None or real_df.empty:
+        return pd.DataFrame()
+    needed = {"truth_label", "method", "svtype", "f1"}
+    if not needed.issubset(real_df.columns):
+        return pd.DataFrame()
+    label = real_df["truth_label"].astype(str)
+    keep = label.str.startswith(("consensus_",)) & ~label.eq("no_comparator")
+    keep |= label.str.endswith("_read_supported")
+    return real_df[keep].copy()
+
+
+def plot_wins_matrix(real_df: pd.DataFrame, outdir: Path) -> List[FigureRecord]:
+    """Render the per-SV-type wins matrix: for each comparator-as-method row,
+    is MycoSV's F1 ≥ that comparator's F1 on the same read-validated truth?
+
+    Outputs three figure cards:
+      A. F1 heatmap, rows=method (mycosv + each comparator), cols=svtype.
+         Cell value = mean F1 across queries.
+      B. Wins bar: per (svtype, comparator), fraction of queries where
+         mycosv F1 ≥ comparator F1 on the read-validated consensus truth.
+      C. Per-query F1 scatter: mycosv vs each comparator, one panel per
+         comparator, dot per (query × svtype).
+    Always anchored on the `_read_supported` truth so we never rank against
+    an algorithm-only baseline.
+    """
+    figs: List[FigureRecord] = []
+    subset = _select_wins_subset(real_df)
+    if subset.empty:
+        return figs
+    rs = subset[subset["truth_label"].astype(str).str.endswith("_read_supported")].copy()
+    if rs.empty:
+        return figs
+    rs["f1"] = pd.to_numeric(rs["f1"], errors="coerce")
+    rs["svtype"] = rs["svtype"].astype(str)
+    rs["method"] = rs["method"].astype(str)
+
+    # ── (A) F1 heatmap, mean across queries ─────────────────────────────
+    pivot = rs.pivot_table(
+        index="method", columns="svtype", values="f1", aggfunc="mean",
+    ).fillna(0.0)
+    if not pivot.empty:
+        # Put mycosv at the top so the eye reads it as "the method we are
+        # testing"; sort the rest alphabetically so panels are stable across
+        # runs even when comparator availability changes.
+        ordered = ["mycosv"] + sorted(m for m in pivot.index if m != "mycosv")
+        pivot = pivot.reindex([m for m in ordered if m in pivot.index])
+        sv_order = [s for s in ("ALL", "INS", "DEL", "INV", "DUP", "TRA", "OFF_REF") if s in pivot.columns]
+        if sv_order:
+            pivot = pivot[sv_order]
+        fig, ax = plt.subplots(figsize=(max(6, 0.9 * len(pivot.columns) + 4), max(3, 0.5 * len(pivot.index) + 2)))
+        im = ax.imshow(pivot.values, aspect="auto", cmap="viridis", vmin=0.0, vmax=1.0)
+        ax.set_xticks(range(len(pivot.columns)))
+        ax.set_xticklabels(pivot.columns, rotation=0)
+        ax.set_yticks(range(len(pivot.index)))
+        ax.set_yticklabels(pivot.index)
+        for i in range(pivot.shape[0]):
+            for j in range(pivot.shape[1]):
+                v = float(pivot.values[i, j])
+                ax.text(j, i, f"{v:.2f}", ha="center", va="center",
+                        color=("white" if v < 0.55 else "black"), fontsize=9)
+        ax.set_title("Mean F1 vs read-validated truth (by method × SV type)")
+        fig.colorbar(im, ax=ax, label="F1")
+        fig.tight_layout()
+        encoded = write_figure(fig, outdir / "wins_f1_heatmap.png")
+        save_df(pivot.reset_index(), outdir / "wins_f1_heatmap.tsv")
+        figs.append(FigureRecord(
+            title="Mean F1 by method × SV type (read-validated truth)",
+            filename="wins_f1_heatmap.png",
+            encoded_png=encoded,
+            caption=(
+                "Each cell is the mean F1 across queries when scoring "
+                "<method> against the consensus_2of_N_read_supported truth "
+                "for that SV type. mycosv row is pinned to the top. "
+                "wins_f1_heatmap.tsv carries the underlying numbers."
+            ),
+        ))
+
+    # ── (B) Wins bar: % queries where mycosv ≥ comparator ───────────────
+    if "query_asm" in rs.columns:
+        wide = rs.pivot_table(
+            index=["query_asm", "svtype"], columns="method",
+            values="f1", aggfunc="mean",
+        )
+        if "mycosv" in wide.columns:
+            wins_rows = []
+            for cmp in [c for c in wide.columns if c != "mycosv"]:
+                pair = wide[["mycosv", cmp]].dropna()
+                if pair.empty:
+                    continue
+                for sv in sorted({sv for (_, sv) in pair.index}):
+                    sub = pair.xs(sv, level="svtype", drop_level=False)
+                    if sub.empty:
+                        continue
+                    n = len(sub)
+                    wins = int((sub["mycosv"] >= sub[cmp]).sum())
+                    wins_rows.append({
+                        "comparator": cmp,
+                        "svtype": sv,
+                        "queries": n,
+                        "mycosv_wins": wins,
+                        "win_rate": wins / n if n else 0.0,
+                    })
+            if wins_rows:
+                wins_df = pd.DataFrame(wins_rows)
+                pivot_wins = wins_df.pivot_table(
+                    index="svtype", columns="comparator", values="win_rate",
+                ).fillna(0.0)
+                sv_order = [s for s in ("ALL", "INS", "DEL", "INV", "DUP", "TRA", "OFF_REF") if s in pivot_wins.index]
+                if sv_order:
+                    pivot_wins = pivot_wins.reindex(sv_order)
+                fig, ax = plt.subplots(figsize=(10, 5))
+                pivot_wins.plot(kind="bar", ax=ax)
+                ax.axhline(0.5, color="grey", linestyle="--", linewidth=0.8)
+                ax.set_ylim(0.0, 1.05)
+                ax.set_ylabel("MycoSV win rate (F1 ≥ comparator)")
+                ax.set_xlabel("SV type")
+                ax.set_title("Per-(SV type, comparator) win rate of MycoSV (read-validated truth)")
+                ax.legend(title="comparator", bbox_to_anchor=(1.02, 1), loc="upper left")
+                fig.tight_layout()
+                encoded = write_figure(fig, outdir / "wins_rate.png")
+                save_df(wins_df, outdir / "wins_rate.tsv")
+                figs.append(FigureRecord(
+                    title="MycoSV win rate vs each comparator",
+                    filename="wins_rate.png",
+                    encoded_png=encoded,
+                    caption=(
+                        "Per (SV type, comparator), the fraction of queries "
+                        "where MycoSV F1 ≥ that comparator's F1 on the "
+                        "read-validated consensus truth. Dashed line at 0.5 "
+                        "is parity. wins_rate.tsv lists every (query, "
+                        "svtype, comparator) cell."
+                    ),
+                ))
+
+            # ── (C) Per-query F1 scatter: mycosv vs each comparator ────
+            cmps = [c for c in wide.columns if c != "mycosv"]
+            if cmps:
+                ncols = min(3, len(cmps))
+                nrows = math.ceil(len(cmps) / ncols)
+                fig, axes = plt.subplots(nrows, ncols, figsize=(5 * ncols, 4 * nrows), squeeze=False)
+                for idx, cmp in enumerate(cmps):
+                    ax = axes[idx // ncols][idx % ncols]
+                    pair = wide[["mycosv", cmp]].dropna().reset_index()
+                    if pair.empty:
+                        ax.axis("off")
+                        continue
+                    for sv, group in pair.groupby("svtype"):
+                        ax.scatter(group[cmp], group["mycosv"], label=sv, alpha=0.7)
+                    ax.plot([0, 1], [0, 1], color="grey", linestyle="--", linewidth=0.8)
+                    ax.set_xlim(0, 1.02); ax.set_ylim(0, 1.02)
+                    ax.set_xlabel(f"{cmp} F1")
+                    ax.set_ylabel("mycosv F1")
+                    ax.set_title(f"mycosv vs {cmp}")
+                    ax.legend(loc="lower right", fontsize=7)
+                # Hide unused panes.
+                for j in range(len(cmps), nrows * ncols):
+                    axes[j // ncols][j % ncols].axis("off")
+                fig.tight_layout()
+                encoded = write_figure(fig, outdir / "wins_scatter.png")
+                figs.append(FigureRecord(
+                    title="Per-query F1 scatter: MycoSV vs each comparator",
+                    filename="wins_scatter.png",
+                    encoded_png=encoded,
+                    caption=(
+                        "Each panel: dot per (query × SV type), x-axis is "
+                        "the comparator F1, y-axis is MycoSV F1, grey "
+                        "diagonal is parity. Dots above the diagonal are "
+                        "MycoSV wins."
+                    ),
+                ))
+    return figs
+
+
+def build_wins_matrix_section(
+    real_df: Optional[pd.DataFrame],
+    outdir: Path,
+) -> Tuple[str, List[FigureRecord], List[pd.DataFrame]]:
+    if real_df is None or real_df.empty:
+        return ("<p>No real-data PR table provided — wins matrix skipped.</p>", [], [])
+    df = real_df.copy()
+    # Don't run real_df through harmonize_columns: the wins matrix needs the
+    # raw `truth_label`, `svtype`, `method`, `f1`, and `query_asm` columns
+    # written by run_real_fungal_benchmark.write_agreement_summary, and
+    # harmonize_columns aliases `svtype` → `sv_type` which would break the
+    # downstream filter.
+    figs = plot_wins_matrix(df, outdir)
+    if not figs:
+        return ("<p>No read-validated PR rows found in the real-data table — "
+                "wins matrix skipped.</p>", [], [])
+    html = (
+        "<p>Apples-to-apples comparison: every method (MycoSV + each "
+        "algorithmic comparator) is scored as a predictor against the "
+        "<code>consensus_2of_N_read_supported</code> truth — i.e. SVs that "
+        "≥2 algorithm comparators agreed on AND the raw query reads "
+        "support via split / clipped alignments. Per SV type and per "
+        "comparator, the panels below show whether MycoSV beats the "
+        "comparator on bias-free ground truth.</p>"
+    )
+    return html, figs, []
+
+
 def build_clade_te_hgt_section(
     real_df: Optional[pd.DataFrame],
     bio_df: Optional[pd.DataFrame],
@@ -690,6 +913,278 @@ def build_clade_te_hgt_section(
 
     html = "<p>Clade-stratified SV landscape, TE family architecture, and HGT novelty propagation across fungal lineages.</p>"
     return html, figs, tables
+
+
+# -----------------------------
+# Novel-SV biological-question section
+#
+# Three questions, scored over MycoSV-only (mycosv_unique=yes) calls joined
+# to the biology candidate annotations:
+#   Q1. Which novel SVs are HGT/Starship cargo crossing clade boundaries?
+#   Q2. Which novel SVs sit in two-speed accessory / TE-rich architecture?
+#   Q3. Which novel SVs have direct expression evidence at a nearby gene?
+# -----------------------------
+
+
+_TE_ELEMENT_CLASSES = {
+    "TE", "TE_LTR", "TE_TIR", "TE_LINE", "TE_SINE",
+    "LTR_GYPSY", "LTR_COPIA", "LINE", "SINE",
+    "DNA_TIR", "HELITRON", "MITE", "RIP", "REPEAT",
+}
+_HGT_ELEMENT_CLASSES = {"HGT", "STARSHIP"}
+
+
+def _join_novel_to_biology(
+    novel_df: pd.DataFrame,
+    bio_df: Optional[pd.DataFrame],
+) -> pd.DataFrame:
+    if novel_df is None or novel_df.empty:
+        return pd.DataFrame()
+    novel_only = novel_df.copy()
+    if "mycosv_unique" in novel_only.columns:
+        novel_only = novel_only[novel_only["mycosv_unique"].astype(str).str.lower() == "yes"]
+    if bio_df is None or bio_df.empty:
+        return novel_only.copy()
+    bio = bio_df.copy()
+    # harmonize_columns() may have renamed the join keys: query_asm → sample,
+    # query_contig → chrom, pos → start, svtype → sv_type. Try both the
+    # original and the harmonized names so the join works in both code paths.
+    candidate_keys = [
+        "query_asm", "sample",
+        "query_contig", "chrom",
+        "pos", "start",
+        "end",
+        "svtype", "sv_type",
+    ]
+    join_cols = [
+        c for c in candidate_keys
+        if c in novel_only.columns and c in bio.columns
+    ]
+    # De-dupe while preserving order (preserves "sample, chrom, start, end, sv_type"
+    # ordering when both column-name conventions match the same logical key).
+    seen: set = set()
+    join_cols = [c for c in join_cols if not (c in seen or seen.add(c))]
+    if not join_cols:
+        return novel_only
+    # Coerce numeric join keys to consistent types so the merge is order-stable.
+    for col in ("pos", "start", "end"):
+        if col in novel_only.columns:
+            novel_only[col] = pd.to_numeric(novel_only[col], errors="coerce").astype("Int64")
+        if col in bio.columns:
+            bio[col] = pd.to_numeric(bio[col], errors="coerce").astype("Int64")
+    return novel_only.merge(bio, on=join_cols, how="left", suffixes=("", "_bio"))
+
+
+def _novel_q1_hgt(joined: pd.DataFrame, outdir: Path) -> Optional[FigureRecord]:
+    """Q1: novel SVs with HGT/Starship cargo across clade or phylum boundaries."""
+    if joined.empty:
+        return None
+    # element_class is aliased to "effect" by harmonize_columns; check both.
+    ec_col = next(
+        (c for c in ("element_class", "effect", "element_class_bio", "effect_bio") if c in joined.columns),
+        None,
+    )
+    if ec_col is None:
+        return None
+    df = joined[joined[ec_col].astype(str).isin(_HGT_ELEMENT_CLASSES)].copy()
+    # Translocations / off-reference also surface HGT-style breakpoints when
+    # the element_class is missing on the row but the call-type indicates a
+    # cross-locus event flagged NOVEL by the routing layer. svtype and
+    # annotation are aliased to sv_type and pathway by harmonize_columns().
+    sv_col = "sv_type" if "sv_type" in joined.columns else ("svtype" if "svtype" in joined.columns else None)
+    annot_col = "pathway" if "pathway" in joined.columns else ("annotation" if "annotation" in joined.columns else None)
+    if sv_col is not None and annot_col is not None:
+        annot_lower = joined[annot_col].astype(str).str.upper()
+        df_extra = joined[
+            joined[sv_col].astype(str).isin({"TRA", "OFF_REF"})
+            & annot_lower.isin({"NOVEL", "NOVEL_WEAK"})
+        ]
+        df = pd.concat([df, df_extra], ignore_index=True).drop_duplicates()
+    if df.empty:
+        return None
+    # phylum is aliased to "clade" by harmonize_columns; pick whichever exists.
+    phylum_col = next(
+        (c for c in ("phylum", "clade", "query_asm") if c in df.columns),
+        None,
+    )
+    by_phylum = (
+        df[phylum_col].fillna("unknown").astype(str).value_counts().head(15)
+        if phylum_col is not None
+        else pd.Series(dtype="int64")
+    )
+    if by_phylum.empty:
+        return None
+    fig, ax = plt.subplots(figsize=(10, 5))
+    by_phylum.plot(kind="bar", ax=ax, color="#b04a3a")
+    ax.set_title("Q1. Novel HGT / Starship-cargo SV candidates per clade")
+    ax.set_xlabel("Clade / phylum / query_asm")
+    ax.set_ylabel("Novel HGT-class SV count")
+    ax.tick_params(axis="x", rotation=45)
+    fig.tight_layout()
+    encoded = write_figure(fig, outdir / "novel_q1_hgt_cargo.png")
+    df.to_csv(outdir / "novel_q1_hgt_cargo.tsv", sep="\t", index=False)
+    return FigureRecord(
+        title="Q1. HGT / Starship cargo (novel)",
+        filename="novel_q1_hgt_cargo.png",
+        encoded_png=encoded,
+        caption=(
+            "Novel MycoSV-only SVs whose element_class is HGT or STARSHIP, "
+            "or cross-locus TRA/OFF_REF flagged NOVEL by the routing layer. "
+            "Bars show count per clade. Per-row table: "
+            "novel_q1_hgt_cargo.tsv."
+        ),
+    )
+
+
+def _novel_q2_two_speed(joined: pd.DataFrame, outdir: Path) -> Optional[FigureRecord]:
+    """Q2: novel SVs in two-speed / TE-rich accessory architecture."""
+    if joined.empty:
+        return None
+    ec_col = next(
+        (c for c in ("element_class", "effect", "element_class_bio", "effect_bio") if c in joined.columns),
+        None,
+    )
+    if ec_col is None:
+        return None
+    df = joined[joined[ec_col].astype(str).isin(_TE_ELEMENT_CLASSES)].copy()
+    if df.empty:
+        return None
+    # Stratify by architecture (two_speed, te_rich, smut_pathogen, …) when
+    # the metadata column is present; otherwise fall back to scenario or to
+    # the harmonized "phenotype" column (architecture/scenario/lifestyle all
+    # map to phenotype via COLUMN_ALIASES).
+    arch_col = next(
+        (c for c in ("architecture", "scenario", "lifestyle", "phenotype") if c in df.columns),
+        None,
+    )
+    if arch_col is None:
+        return None
+    by_arch = (
+        df[arch_col]
+        .fillna("unknown")
+        .astype(str)
+        .value_counts()
+        .head(12)
+    )
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+    by_arch.plot(kind="bar", ax=axes[0], color="#3a6db0")
+    axes[0].set_title(f"Q2. Novel TE-class SVs by {arch_col}")
+    axes[0].set_xlabel(arch_col)
+    axes[0].set_ylabel("Novel TE-class SV count")
+    axes[0].tick_params(axis="x", rotation=45)
+    by_class = df[ec_col].fillna("NONE").astype(str).value_counts().head(12)
+    by_class.plot(kind="barh", ax=axes[1], color="#3a6db0")
+    axes[1].set_title("Q2. TE element-class composition")
+    axes[1].set_xlabel("Count")
+    axes[1].set_ylabel("element_class")
+    fig.tight_layout()
+    encoded = write_figure(fig, outdir / "novel_q2_two_speed.png")
+    df.to_csv(outdir / "novel_q2_two_speed.tsv", sep="\t", index=False)
+    return FigureRecord(
+        title="Q2. Two-speed / TE-rich accessory architecture (novel)",
+        filename="novel_q2_two_speed.png",
+        encoded_png=encoded,
+        caption=(
+            "Novel MycoSV-only SVs sitting in TE-class sequence (LTRs, DNA "
+            "transposons, helitrons, repeat-rich regions, RIP). Left: count "
+            "per architecture/scenario, exposing two-speed / TE-rich "
+            "compartments. Right: TE element_class composition. Per-row "
+            "table: novel_q2_two_speed.tsv."
+        ),
+    )
+
+
+def _novel_q3_expression(joined: pd.DataFrame, outdir: Path) -> Optional[FigureRecord]:
+    """Q3: novel SVs with direct gene-expression support at a nearby gene."""
+    if joined.empty:
+        return None
+    es_col = next((c for c in ("expression_supported", "expression_supported_bio") if c in joined.columns), None)
+    if es_col is None:
+        return None
+    df = joined[joined[es_col].astype(str).str.lower() == "yes"].copy()
+    if df.empty:
+        return None
+    # Plot the log2_fc / -log10(padj) "volcano" of the expression-supported
+    # nearby genes for these novel SVs, plus a top-gene bar.
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+    log2_col = next((c for c in ("expression_log2_fc", "log2_fc", "expression") if c in df.columns), None)
+    padj_col = next((c for c in ("expression_padj", "padj") if c in df.columns), None)
+    if log2_col and padj_col:
+        x = pd.to_numeric(df[log2_col], errors="coerce")
+        p = pd.to_numeric(df[padj_col], errors="coerce").clip(lower=1e-300)
+        y = -np.log10(p)
+        axes[0].scatter(x, y, alpha=0.7, color="#2e8b57")
+        axes[0].axhline(-math.log10(0.05), color="grey", linestyle="--", linewidth=0.8)
+        axes[0].set_xlabel(f"{log2_col}")
+        axes[0].set_ylabel(f"-log10({padj_col})")
+        axes[0].set_title("Q3. Volcano of expression-supported novel SVs")
+    else:
+        axes[0].axis("off")
+    gene_col = next((c for c in ("expression_gene", "gene") if c in df.columns), None)
+    if gene_col is not None:
+        top = df[gene_col].fillna("unknown").astype(str).value_counts().head(15)
+        top.plot(kind="barh", ax=axes[1], color="#2e8b57")
+        axes[1].set_title("Q3. Top genes near novel expression-supported SVs")
+        axes[1].set_xlabel("Novel SV count")
+        axes[1].set_ylabel("Gene")
+    else:
+        axes[1].axis("off")
+    fig.tight_layout()
+    encoded = write_figure(fig, outdir / "novel_q3_expression.png")
+    df.to_csv(outdir / "novel_q3_expression.tsv", sep="\t", index=False)
+    return FigureRecord(
+        title="Q3. Direct gene-expression-supported novel SVs",
+        filename="novel_q3_expression.png",
+        encoded_png=encoded,
+        caption=(
+            "Novel MycoSV-only SVs where the analyzer flagged a "
+            "differentially-expressed gene within the expression window. "
+            "Left: volcano of nearby genes. Right: top recurrent genes "
+            "across novel events. Per-row table: novel_q3_expression.tsv."
+        ),
+    )
+
+
+def build_novel_questions_section(
+    novel_df: Optional[pd.DataFrame],
+    bio_df: Optional[pd.DataFrame],
+    outdir: Path,
+) -> Tuple[str, List[FigureRecord], List[pd.DataFrame]]:
+    if novel_df is None or novel_df.empty:
+        return "<p>No novel-SV table provided (--novel novel_mycosv_calls.tsv).</p>", [], []
+    novel_df = harmonize_columns(novel_df)
+    bio_df_h = harmonize_columns(bio_df) if bio_df is not None else None
+    joined = _join_novel_to_biology(novel_df, bio_df_h)
+    if joined.empty:
+        return "<p>No MycoSV-unique novel SVs to highlight.</p>", [], []
+
+    figs: List[FigureRecord] = []
+    for builder in (_novel_q1_hgt, _novel_q2_two_speed, _novel_q3_expression):
+        try:
+            rec = builder(joined, outdir)
+        except Exception as exc:
+            sys.stderr.write(
+                f"[novel-questions] {builder.__name__} failed: "
+                f"{type(exc).__name__}: {exc}\n"
+            )
+            rec = None
+        if rec is not None:
+            figs.append(rec)
+
+    save_df(joined, outdir / "novel_questions_joined.tsv")
+    html_intro = (
+        "<p>Three biological questions over the MycoSV-unique (novel) SV set, "
+        "joined to <code>biology_findings.tsv</code> for element_class, "
+        "phylum / scenario / architecture metadata, and expression evidence:</p>"
+        "<ol>"
+        "<li><b>Q1.</b> Which novel SVs are HGT / Starship cargo crossing clade boundaries?</li>"
+        "<li><b>Q2.</b> Which novel SVs sit in two-speed accessory / TE-rich architecture?</li>"
+        "<li><b>Q3.</b> Which novel SVs have direct nearby-gene expression support?</li>"
+        "</ol>"
+    )
+    if not figs:
+        html_intro += "<p><i>No rows matched any of the three questions; nothing to plot.</i></p>"
+    return html_intro, figs, []
 
 
 # -----------------------------
@@ -760,9 +1255,17 @@ def build_html_report(
     bio_figs: List[FigureRecord],
     clade_html: str = "",
     clade_figs: Optional[List[FigureRecord]] = None,
+    novel_html: str = "",
+    novel_figs: Optional[List[FigureRecord]] = None,
+    wins_html: str = "",
+    wins_figs: Optional[List[FigureRecord]] = None,
 ) -> str:
     if clade_figs is None:
         clade_figs = []
+    if novel_figs is None:
+        novel_figs = []
+    if wins_figs is None:
+        wins_figs = []
     return f"""
 <!doctype html>
 <html lang=\"en\">
@@ -812,6 +1315,12 @@ def build_html_report(
     </div>
 
     <div class=\"section\">
+      <h2>2b. MycoSV vs comparators per SV type &mdash; read-validated wins matrix</h2>
+      {wins_html}
+      <div class=\"grid\">{render_figure_cards(wins_figs)}</div>
+    </div>
+
+    <div class=\"section\">
       <h2>3. Biological findings</h2>
       {bio_html}
       <div class=\"grid\">{render_figure_cards(bio_figs)}</div>
@@ -821,6 +1330,12 @@ def build_html_report(
       <h2>4. Clade-SV landscape, TE architecture &amp; HGT propagation</h2>
       {clade_html}
       <div class=\"grid\">{render_figure_cards(clade_figs)}</div>
+    </div>
+
+    <div class=\"section\">
+      <h2>5. Novel SVs &mdash; three biological questions</h2>
+      {novel_html}
+      <div class=\"grid\">{render_figure_cards(novel_figs)}</div>
     </div>
   </div>
 </body>
@@ -839,6 +1354,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--real", type=str, default=None, help="Real-data SV calls CSV/TSV")
     parser.add_argument("--biology", type=str, default=None, help="Biological findings CSV/TSV")
     parser.add_argument("--metadata", type=str, default=None, help="Optional sample metadata CSV/TSV")
+    parser.add_argument("--novel", type=str, default=None,
+                        help="novel_mycosv_calls.tsv from a benchmark run; "
+                             "powers the three biological-question section.")
     parser.add_argument("--outdir", type=str, required=True, help="Output directory")
     parser.add_argument("--title", type=str, default="SV visualization report", help="Report title")
     return parser.parse_args()
@@ -854,11 +1372,16 @@ def main() -> None:
     real_df = read_table(args.real)
     bio_df = read_table(args.biology)
     metadata_df = read_table(args.metadata)
+    novel_df = read_table(args.novel)
 
     sim_html, sim_figs, _ = build_simulated_section(sim_df, outdir)
     real_html, real_figs, _ = build_real_section(real_df, metadata_df, outdir)
     bio_html, bio_figs, _ = build_biology_section(bio_df, outdir)
     clade_html, clade_figs, _ = build_clade_te_hgt_section(real_df, bio_df, outdir)
+    novel_html, novel_figs, _ = build_novel_questions_section(novel_df, bio_df, outdir)
+    # Wins matrix runs on the *raw* real_df (pre-harmonization) so the
+    # `truth_label`, `svtype`, `method` columns survive.
+    wins_html, wins_figs, _ = build_wins_matrix_section(real_df, outdir)
 
     stats = summary_stats(sim_df, real_df, bio_df)
     html = build_html_report(
@@ -867,6 +1390,8 @@ def main() -> None:
         real_html, real_figs,
         bio_html, bio_figs,
         clade_html, clade_figs,
+        novel_html, novel_figs,
+        wins_html, wins_figs,
     )
 
     report_path = outdir / "sv_visualization_report.html"
