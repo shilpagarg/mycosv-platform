@@ -3082,6 +3082,8 @@ def run_mycosv(
     query_list_override: Path | None = None,
     threads: int = 8,
     max_clade_genomes: int = 8,
+    reuse_index_dir: Path | None = None,
+    reuse_registry_dir: Path | None = None,
 ) -> dict[str, str]:
     mycosv_dir = out_dir / "mycosv"
     mycosv_dir.mkdir(parents=True, exist_ok=True)
@@ -3103,24 +3105,41 @@ def run_mycosv(
     # try to load all refs into a flat graph and produce 0 calls across phyla).
     hierarchy_manifest = prepared_dir / "hierarchy_manifest.tsv"
     if hierarchy_manifest.exists() and (prepared_dir / "ref_list.txt").stat().st_size > 0:
-        idx_dir = mycosv_dir / "idx"
-        reg_dir = mycosv_dir / "reg"
-        idx_dir.mkdir(parents=True, exist_ok=True)
-        reg_dir.mkdir(parents=True, exist_ok=True)
-        # Build index only if not already present.
-        if not (idx_dir / "routing_manifest.tsv").exists():
-            build_cmd = [
-                str(binary_path.resolve()),
-                "--tol-hierarchical",
-                "--tol-build-index", str(hierarchy_manifest.resolve()),
-                "--tol-index-dir", str(idx_dir.resolve()),
-                "--tol-registry-dir", str(reg_dir.resolve()),
-                "--tol-multi-rank",
-                "--tol-base-graph-build",
-                "--tol-max-clade-genomes", str(max_clade_genomes),
-                "--tol-index-threads", str(threads),
-            ]
-            run_mycosv_command(build_cmd, cwd=ROOT)
+        # If the caller passed a pre-built index (e.g. from
+        # prepare-million-real), point the binary at it directly instead of
+        # rebuilding. Saves the multi-hour rebuild on the million-real flow,
+        # where the index has already been written next to the prepared dir.
+        if reuse_index_dir is not None:
+            idx_dir = reuse_index_dir.resolve()
+            if not (idx_dir / "routing_manifest.tsv").exists():
+                raise FileNotFoundError(
+                    f"--reuse-index-dir {idx_dir} does not contain routing_manifest.tsv"
+                )
+            reg_dir = (reuse_registry_dir.resolve() if reuse_registry_dir
+                       else (idx_dir.parent / "registry").resolve())
+            sys.stderr.write(
+                f"[mycosv] reusing pre-built routing index at {idx_dir} "
+                f"(registry={reg_dir})\n"
+            )
+        else:
+            idx_dir = mycosv_dir / "idx"
+            reg_dir = mycosv_dir / "reg"
+            idx_dir.mkdir(parents=True, exist_ok=True)
+            reg_dir.mkdir(parents=True, exist_ok=True)
+            # Build index only if not already present.
+            if not (idx_dir / "routing_manifest.tsv").exists():
+                build_cmd = [
+                    str(binary_path.resolve()),
+                    "--tol-hierarchical",
+                    "--tol-build-index", str(hierarchy_manifest.resolve()),
+                    "--tol-index-dir", str(idx_dir.resolve()),
+                    "--tol-registry-dir", str(reg_dir.resolve()),
+                    "--tol-multi-rank",
+                    "--tol-base-graph-build",
+                    "--tol-max-clade-genomes", str(max_clade_genomes),
+                    "--tol-index-threads", str(threads),
+                ]
+                run_mycosv_command(build_cmd, cwd=ROOT)
         cmd = [
             str(binary_path.resolve()),
             "--tol-hierarchical",
@@ -4148,14 +4167,16 @@ def benchmark_real_data(args: argparse.Namespace) -> int:
     prepared_dir = args.prepared_dir.resolve()
     out_dir = args.out_dir.resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
-    if getattr(args, "run_all_comparators", False):
+    mycosv_only = bool(getattr(args, "mycosv_only", False))
+    if getattr(args, "run_all_comparators", False) and not mycosv_only:
         _auto_enable_comparators(args)
     # Force-on the canonical comparator(s) per mode so the visualization's
     # "mycosv-vs-baseline per SV type" panel is never empty. Minigraph is
     # the assembly-mode baseline; Delly/Manta cover short-reads; Sniffles2
     # and cuteSV cover long-reads. Read-level validation (samtools-driven
     # split-read counting) runs in every mode independently — see
-    # validate_calls_with_reads().
+    # validate_calls_with_reads(). --mycosv-only disables this forcing for
+    # the million-real flow where comparators are out of scope.
     _MANDATORY_BASELINES_BY_MODE: dict[str, list[tuple[str, list[str]]]] = {
         "assembly":    [("run_minigraph", ["minigraph", "gfatools"])],
         "short-reads": [("run_delly", ["delly", "bcftools"]),
@@ -4165,27 +4186,45 @@ def benchmark_real_data(args: argparse.Namespace) -> int:
     }
     forced: list[str] = []
     missing_baselines: list[tuple[str, list[str]]] = []
-    for flag, binaries in _MANDATORY_BASELINES_BY_MODE.get(args.mode, []):
-        absent = [b for b in binaries if not tool_path(b)]
-        if absent:
-            missing_baselines.append((flag.replace("run_", ""), absent))
-            continue
-        if not getattr(args, flag, False):
-            setattr(args, flag, True)
-            forced.append(flag.replace("run_", ""))
-    if forced:
-        sys.stderr.write(
-            f"[comparators] forcing mandatory baselines on for mode={args.mode}: "
-            f"{', '.join(forced)} (canonical real-data baselines for this mode)\n"
-        )
-    if missing_baselines:
-        for tool_name, absent in missing_baselines:
+    if not mycosv_only:
+        for flag, binaries in _MANDATORY_BASELINES_BY_MODE.get(args.mode, []):
+            absent = [b for b in binaries if not tool_path(b)]
+            if absent:
+                missing_baselines.append((flag.replace("run_", ""), absent))
+                continue
+            if not getattr(args, flag, False):
+                setattr(args, flag, True)
+                forced.append(flag.replace("run_", ""))
+        if forced:
             sys.stderr.write(
-                f"[comparators] WARNING: {tool_name} (mandatory {args.mode} "
-                f"baseline) is missing binaries {', '.join(absent)} — install "
-                f"via install_tools.sh; the per-SV-type wins panel will be "
-                f"thin without it.\n"
+                f"[comparators] forcing mandatory baselines on for mode={args.mode}: "
+                f"{', '.join(forced)} (canonical real-data baselines for this mode)\n"
             )
+        if missing_baselines:
+            for tool_name, absent in missing_baselines:
+                sys.stderr.write(
+                    f"[comparators] WARNING: {tool_name} (mandatory {args.mode} "
+                    f"baseline) is missing binaries {', '.join(absent)} — install "
+                    f"via install_tools.sh; the per-SV-type wins panel will be "
+                    f"thin without it.\n"
+                )
+    else:
+        # In mycosv-only mode, hard-disable every --run-X flag in case the
+        # caller mixed flags. This makes the no-comparator path explicit.
+        for flag in (
+            "run_syri", "run_minigraph", "run_pggb", "run_cactus",
+            "run_svim_asm", "run_anchorwave",
+            "run_svim", "run_sniffles", "run_cutesv",
+            "run_delly", "run_manta",
+        ):
+            if hasattr(args, flag):
+                setattr(args, flag, False)
+        sys.stderr.write(
+            "[comparators] --mycosv-only: skipping every algorithmic comparator. "
+            "exact_benchmark_summary.tsv will use no_comparator placeholder rows; "
+            "biology_findings.tsv / novel_mycosv_calls.tsv / TE classification "
+            "still flow through.\n"
+        )
     full_manifest = load_query_manifest(prepared_dir / "query_manifest.tsv")
     if not full_manifest:
         raise ValueError("Prepared directory does not contain query_manifest.tsv entries")
@@ -4237,6 +4276,8 @@ def benchmark_real_data(args: argparse.Namespace) -> int:
             query_list_override=mode_query_list,
             threads=args.threads,
             max_clade_genomes=args.max_clade_genomes,
+            reuse_index_dir=getattr(args, "reuse_index_dir", None),
+            reuse_registry_dir=getattr(args, "reuse_registry_dir", None),
         )
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
         # Don't abort the whole panel/mode pipeline when the binary crashes
@@ -4795,10 +4836,14 @@ def prepare_million_real(args: argparse.Namespace) -> int:
     # Step 1: pull the NCBI assembly summary and select up to --max-assemblies
     # fungal rows. We reuse select_all_public_rows so the quality/sorting
     # behavior matches the `prepare --all-public-assemblies` path.
+    # flush=True on every progress print: when stdout is piped through `tee`
+    # (run_all_experiments.sh does this), it switches from line- to block-
+    # buffered, so per-100 download progress was hidden for hours and made
+    # the step look frozen even when it was making real progress.
     summary_url = NCBI_ASSEMBLY_SUMMARY[args.source]
-    print(f"[1/4] Fetching NCBI assembly summary: {summary_url}")
+    print(f"[1/4] Fetching NCBI assembly summary: {summary_url}", flush=True)
     all_rows = parse_assembly_summary(http_get_text(summary_url))
-    print(f"      parsed {len(all_rows)} rows from {args.source}")
+    print(f"      parsed {len(all_rows)} rows from {args.source}", flush=True)
 
     selected = select_all_public_rows(
         all_rows,
@@ -4808,21 +4853,30 @@ def prepare_million_real(args: argparse.Namespace) -> int:
     )
     if not selected:
         raise ValueError(f"No fungal assemblies matched the selection filters in {args.source}")
-    print(f"      selected {len(selected)} assemblies for real-data indexing")
+    print(f"      selected {len(selected)} assemblies for real-data indexing", flush=True)
 
     # Step 2: resolve taxonomy lineages for all selected rows.
-    print("[2/4] Resolving NCBI taxonomy lineages...")
+    print("[2/4] Resolving NCBI taxonomy lineages...", flush=True)
     taxids = sorted({row.get("taxid", "") for row in selected if row.get("taxid")})
     taxonomy_cache = fetch_taxonomy_lineages(taxids, cache_path=out_dir / "taxonomy_cache.json")
 
     # Step 3: download each assembly FASTA (or re-use existing on disk) and
     # build the hierarchy manifest the MycoSV binary consumes.
-    print(f"[3/4] Downloading up to {len(selected)} assemblies -> {refs_dir}")
+    # Tighter progress reporting + per-row time budget: with ~10000 assemblies
+    # and a shared cache, most rows are no-op cache hits but a single hung
+    # download (NCBI 5xx, slow mirror) used to silently stall the whole loop.
+    # Emit one progress line every 200 examined rows + one every 60 s of wall
+    # clock so the operator can tell the difference between "downloading" and
+    # "stuck", and bail individual rows that exceed _HTTP_TIMEOUT.
+    print(f"[3/4] Downloading up to {len(selected)} assemblies -> {refs_dir}", flush=True)
     ref_manifest_rows: list[dict[str, str]] = []
     ref_list_paths: list[str] = []
     source_link_rows: list[dict[str, str]] = []
     download_count = 0
+    examined = 0
+    last_progress_t = time.monotonic()
     for row in selected:
+        examined += 1
         asm_name = row.get("assembly_accession", "").replace(".", "_")
         if not asm_name:
             continue
@@ -4836,6 +4890,7 @@ def prepare_million_real(args: argparse.Namespace) -> int:
                 fasta_path = materialize_entry(url, dest, keep_gz=True)
             except Exception as exc:
                 sys.stderr.write(f"[warn] download failed for {asm_name}: {exc}\n")
+                sys.stderr.flush()
                 fasta_path = None
             break
         if fasta_path is None or not fasta_path.exists():
@@ -4864,12 +4919,91 @@ def prepare_million_real(args: argparse.Namespace) -> int:
             "local_path": str(fasta_path),
             "species": species,
         })
-        if download_count % 100 == 0:
-            print(f"      ... downloaded {download_count}/{len(selected)}")
+        now = time.monotonic()
+        if download_count % 200 == 0 or (now - last_progress_t) >= 60.0:
+            print(
+                f"      ... examined {examined}/{len(selected)} "
+                f"available={download_count}",
+                flush=True,
+            )
+            last_progress_t = now
 
     if not ref_manifest_rows:
         raise RuntimeError("No assemblies were successfully downloaded — aborting indexing.")
-    print(f"      downloaded {download_count} assemblies")
+    print(f"      downloaded/cached {download_count} assemblies (examined {examined})", flush=True)
+
+    # ── Hold out a small subset as MycoSV-only benchmark queries ─────────────
+    # The downstream `benchmark` sub-command is fed by query_manifest.tsv +
+    # ref_list.txt; without these, the million-real artifact is just an index
+    # with no end-to-end SV-call/biology/visualization payload. Reserve K
+    # assemblies as queries (sampled stride-uniformly across phyla so we get
+    # taxonomic diversity even when --max-assemblies is small), and exclude
+    # them from the index manifest. Per-query benchmark_ref_fasta is the
+    # closest sibling in the same genus → family → phylum, falling back to
+    # the first ref so read-level validation has SOMETHING to align against.
+    n_queries = max(0, int(getattr(args, "million_real_queries", 0) or 0))
+    n_queries = min(n_queries, max(0, len(ref_manifest_rows) - 1))
+    query_manifest_rows: list[dict[str, str]] = []
+    query_list_paths: list[str] = []
+    if n_queries > 0:
+        stride = max(1, len(ref_manifest_rows) // n_queries)
+        query_indices = sorted({(i * stride) % len(ref_manifest_rows) for i in range(n_queries)})
+        # Lookup helpers indexed by lineage so we can pick the closest sibling.
+        by_genus: dict[str, list[int]] = defaultdict(list)
+        by_family: dict[str, list[int]] = defaultdict(list)
+        by_phylum: dict[str, list[int]] = defaultdict(list)
+        for idx, r in enumerate(ref_manifest_rows):
+            by_genus[r.get("genus", ".") or "."].append(idx)
+            by_family[r.get("family", ".") or "."].append(idx)
+            by_phylum[r.get("phylum", ".") or "."].append(idx)
+        query_set = set(query_indices)
+
+        def pick_benchmark_ref(qi: int) -> str:
+            qrow = ref_manifest_rows[qi]
+            for bucket, key in (
+                (by_genus, qrow.get("genus", ".") or "."),
+                (by_family, qrow.get("family", ".") or "."),
+                (by_phylum, qrow.get("phylum", ".") or "."),
+            ):
+                for cand in bucket.get(key, []):
+                    if cand != qi and cand not in query_set:
+                        return ref_manifest_rows[cand]["fasta_path"]
+            for cand in range(len(ref_manifest_rows)):
+                if cand != qi and cand not in query_set:
+                    return ref_manifest_rows[cand]["fasta_path"]
+            return "."
+
+        for qi in query_indices:
+            qrow = ref_manifest_rows[qi]
+            bench_ref = pick_benchmark_ref(qi)
+            query_manifest_rows.append({
+                "query_asm": qrow["asm_name"],
+                "query_mode": "assembly",
+                "path": qrow["fasta_path"],
+                "scenario": "million_real",
+                "lifestyle": ".",
+                "architecture": ".",
+                "benchmark_ref_asm": ".",
+                "benchmark_ref_fasta": bench_ref,
+                "phylum": qrow.get("phylum", "."),
+                "class": qrow.get("class", "."),
+                "order": qrow.get("order", "."),
+                "family": qrow.get("family", "."),
+                "genus": qrow.get("genus", "."),
+                "species": qrow.get("clade_name", "."),
+                "source": args.source,
+            })
+            query_list_paths.append(qrow["fasta_path"])
+        # Drop queries from the ref/hierarchy manifest so the index doesn't
+        # see its own truth (would silently boost recall).
+        keep_mask = [i not in query_set for i in range(len(ref_manifest_rows))]
+        ref_manifest_rows = [r for r, k in zip(ref_manifest_rows, keep_mask) if k]
+        ref_list_paths = [p for p, k in zip(ref_list_paths, keep_mask) if k]
+        print(
+            f"      held out {len(query_manifest_rows)} assemblies as MycoSV-only "
+            f"benchmark queries; {len(ref_manifest_rows)} remain in the index",
+            flush=True,
+        )
 
     hierarchy_manifest = out_dir / "hierarchy_manifest.tsv"
     write_tsv(
@@ -4878,6 +5012,17 @@ def prepare_million_real(args: argparse.Namespace) -> int:
         ["asm_name", "phylum", "class", "order", "family", "genus", "clade_name", "clade_rank", "fasta_path"],
     )
     (out_dir / "ref_list.txt").write_text("\n".join(ref_list_paths) + "\n", encoding="utf-8")
+    if query_manifest_rows:
+        write_tsv(
+            out_dir / "query_manifest.tsv",
+            query_manifest_rows,
+            ["query_asm", "query_mode", "path", "scenario", "lifestyle", "architecture",
+             "benchmark_ref_asm", "benchmark_ref_fasta", "phylum", "class", "order",
+             "family", "genus", "species", "source"],
+        )
+        (out_dir / "query_list.txt").write_text(
+            "\n".join(query_list_paths) + "\n", encoding="utf-8"
+        )
     write_tsv(
         out_dir / "source_links.tsv",
         source_link_rows,
@@ -4886,7 +5031,7 @@ def prepare_million_real(args: argparse.Namespace) -> int:
 
     # Step 4: build the real routing index by invoking the MycoSV binary, then
     # pad with synthetic decoys up to --target-centroids if requested.
-    print(f"[4/4] Building real routing index via MycoSV binary -> {index_dir}")
+    print(f"[4/4] Building real routing index via MycoSV binary -> {index_dir}", flush=True)
     compile_binary_if_needed(args.binary_path.resolve(), force=args.force_rebuild)
     build_cmd = [
         str(args.binary_path.resolve()),
@@ -4912,6 +5057,8 @@ def prepare_million_real(args: argparse.Namespace) -> int:
         "source": args.source,
         "max_assemblies_requested": args.max_assemblies,
         "assemblies_downloaded": download_count,
+        "queries_held_out": len(query_manifest_rows),
+        "refs_in_index": len(ref_manifest_rows),
         "target_centroids": args.target_centroids,
         "seed": args.seed,
         "hierarchy_manifest": str(hierarchy_manifest),
@@ -4923,8 +5070,11 @@ def prepare_million_real(args: argparse.Namespace) -> int:
     summary_path.write_text(json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")
 
     print(
-        f"million_real_ready\tassemblies={download_count}\tcentroids_real={info['real_centroids']}"
-        f"\tcentroids_total={info['total_centroids']}\tindex_dir={index_dir}\tsummary={summary_path}"
+        f"million_real_ready\tassemblies={download_count}"
+        f"\tqueries_held_out={len(query_manifest_rows)}"
+        f"\tcentroids_real={info['real_centroids']}"
+        f"\tcentroids_total={info['total_centroids']}\tindex_dir={index_dir}\tsummary={summary_path}",
+        flush=True,
     )
     return 0
 
@@ -4983,6 +5133,17 @@ def build_parser() -> argparse.ArgumentParser:
     smr.add_argument("--binary-path", type=Path, default=DEFAULT_BIN)
     smr.add_argument("--force-rebuild", action="store_true")
     smr.add_argument("--data-cache-dir", type=Path, default=DEFAULT_DATA_CACHE, help="Shared directory for downloaded FASTA files; reused across runs to avoid re-downloading. Defaults to data_cache/ next to this script.")
+    smr.add_argument(
+        "--million-real-queries", type=int, default=0,
+        help=(
+            "Hold out N assemblies as MycoSV-only benchmark queries (sampled "
+            "stride-uniformly across phyla). Writes query_manifest.tsv + "
+            "query_list.txt next to the index so the standard `benchmark` "
+            "subcommand can run end-to-end (SV calls, TE classification, "
+            "biology candidates, visualization) without algorithmic "
+            "comparators. Default 0 = index-only, no held-out queries."
+        ),
+    )
 
     spp = sub.add_parser("prepare", help="Download a real fungal panel and write MycoSV-ready manifests.")
     spp.add_argument("--out-dir", type=Path, required=True)
@@ -5036,6 +5197,21 @@ def build_parser() -> argparse.ArgumentParser:
                     help="Auto-enable every --run-X flag whose tool binaries are detected on PATH "
                          "(or in the project conda env). The most robust way to get truth-set rows "
                          "in exact_benchmark_summary.tsv without naming each comparator individually.")
+    sb.add_argument("--mycosv-only", action="store_true",
+                    help="Run MycoSV only — no algorithmic comparators (minigraph/syri/cactus/"
+                         "svim-asm/anchorwave/sniffles/cuteSV/svim/Delly/Manta) are launched, "
+                         "and the per-mode mandatory-baseline forcing in benchmark_real_data is "
+                         "disabled. Used by the million-real flow where comparators are out of "
+                         "scope. exact_benchmark_summary.tsv falls back to the no_comparator "
+                         "placeholder rows; biology candidates / TE classification / read-level "
+                         "validation still run.")
+    sb.add_argument("--reuse-index-dir", type=Path,
+                    help="Reuse a pre-built MycoSV routing index instead of rebuilding from "
+                         "the prepared dir's hierarchy_manifest.tsv. Path must contain "
+                         "routing_manifest.tsv (e.g. ${MILLION_REAL_DIR}/index from "
+                         "prepare-million-real).")
+    sb.add_argument("--reuse-registry-dir", type=Path,
+                    help="Reuse a pre-built clade registry alongside --reuse-index-dir.")
     sb.add_argument("--run-syri", action="store_true", help="For assembly-mode queries, run SyRI and use query-coordinate TSV output as proxy truth.")
     sb.add_argument("--run-minigraph", action="store_true", help="For assembly-mode queries, run a pairwise minigraph + gfatools bubble baseline (reference-space, strongest for INS/DEL/INV).")
     sb.add_argument("--run-pggb", action="store_true", help="For assembly-mode queries, run a pairwise pggb build and parse its reference-space VCF output.")

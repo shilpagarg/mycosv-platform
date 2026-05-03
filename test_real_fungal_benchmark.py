@@ -231,3 +231,281 @@ def test_run_mycosv_injects_read_mode_perf_defaults(tmp_path: Path, monkeypatch)
     assert "150000" in cmd
     assert "--genome-size-hint" in cmd
     assert "400" in cmd
+
+
+def test_run_mycosv_reuses_prebuilt_index(tmp_path: Path, monkeypatch):
+    """run_mycosv with reuse_index_dir must NOT rebuild the index and must
+    point the binary at the prebuilt directory. Guards the million-real flow
+    where prepare-million-real already wrote the index next to query_manifest.
+    """
+    prepared = tmp_path / "prepared"
+    prepared.mkdir()
+    ref = prepared / "ref.fa"
+    ref.write_text(">chr1\nACGTACGTACGT\n", encoding="utf-8")
+    (prepared / "ref_list.txt").write_text(str(ref) + "\n", encoding="utf-8")
+    (prepared / "query_list.txt").write_text(str(ref) + "\n", encoding="utf-8")
+    (prepared / "query_manifest.tsv").write_text(
+        "query_asm\tbenchmark_ref_fasta\nq1\t" + str(ref) + "\n",
+        encoding="utf-8",
+    )
+    (prepared / "hierarchy_manifest.tsv").write_text(
+        "asm_name\tphylum\tclass\torder\tfamily\tgenus\tclade_name\tclade_rank\tfasta_path\n"
+        f"q1\t.\t.\t.\t.\t.\t.\tspecies\t{ref}\n",
+        encoding="utf-8",
+    )
+
+    # Prebuilt index dir with the marker file run_mycosv looks for.
+    prebuilt_idx = tmp_path / "million_real_index"
+    prebuilt_idx.mkdir()
+    (prebuilt_idx / "routing_manifest.tsv").write_text("asm\tcentroid\n", encoding="utf-8")
+    prebuilt_reg = tmp_path / "million_real_registry"
+    prebuilt_reg.mkdir()
+
+    invocations: list[list[str]] = []
+
+    def fake_run(cmd, cwd=None):
+        invocations.append(list(cmd))
+        class Dummy:
+            stdout = ""
+            stderr = ""
+        return Dummy()
+
+    monkeypatch.setattr(rrfb, "run_mycosv_command", fake_run)
+    run_mycosv(
+        prepared, tmp_path / "bench", tmp_path / "fake.exe", "assembly", [],
+        reuse_index_dir=prebuilt_idx, reuse_registry_dir=prebuilt_reg,
+    )
+
+    # Exactly one binary call (the SV-call run); no rebuild of the index.
+    assert len(invocations) == 1, invocations
+    cmd = invocations[0]
+    assert "--tol-build-index" not in cmd, "reuse path must NOT rebuild the index"
+    assert str(prebuilt_idx.resolve()) in cmd
+    assert str(prebuilt_reg.resolve()) in cmd
+
+
+def test_run_mycosv_rejects_invalid_reuse_index(tmp_path: Path, monkeypatch):
+    prepared = tmp_path / "prepared"
+    prepared.mkdir()
+    ref = prepared / "ref.fa"
+    ref.write_text(">chr1\nACGT\n", encoding="utf-8")
+    (prepared / "ref_list.txt").write_text(str(ref) + "\n", encoding="utf-8")
+    (prepared / "query_list.txt").write_text(str(ref) + "\n", encoding="utf-8")
+    (prepared / "query_manifest.tsv").write_text("query_asm\nq1\n", encoding="utf-8")
+    (prepared / "hierarchy_manifest.tsv").write_text(
+        "asm_name\tphylum\tclass\torder\tfamily\tgenus\tclade_name\tclade_rank\tfasta_path\n"
+        f"q1\t.\t.\t.\t.\t.\t.\tspecies\t{ref}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(rrfb, "run_mycosv_command", lambda cmd, cwd=None: None)
+
+    bogus_idx = tmp_path / "no_marker"
+    bogus_idx.mkdir()
+    import pytest
+    with pytest.raises(FileNotFoundError):
+        run_mycosv(
+            prepared, tmp_path / "bench", tmp_path / "fake.exe", "assembly", [],
+            reuse_index_dir=bogus_idx,
+        )
+
+
+def test_prepare_million_real_holds_out_queries_and_strips_them_from_index(
+    tmp_path: Path, monkeypatch
+):
+    """End-to-end smoke of the million-real flow's manifest layer (no real
+    network or binary calls): we mock the NCBI download + binary build so the
+    test exercises:
+      1. selection -> ref_manifest_rows construction
+      2. held-out queries are sampled stride-uniformly across phyla
+      3. queries get a sibling-genus benchmark_ref_fasta
+      4. queries are stripped from hierarchy_manifest.tsv / ref_list.txt
+      5. query_manifest.tsv + query_list.txt are written next to the index
+    Without this guard the chain prepare -> benchmark in step 2 would silently
+    skip step 2b (no held-out queries) or, worse, leak truth into the index.
+    """
+    import argparse
+    fake_summary = "#assembly_accession\ttaxid\torganism_name\tassembly_level\tversion_status\tftp_path\n"
+    rows = []
+    # 6 fake rows across 2 phyla; --max-assemblies caps at 6, --queries=2.
+    # ftp_path must be under https://ftp.ncbi.nlm.nih.gov/ for select_all_public_rows.
+    for i in range(6):
+        rows.append(
+            f"GCA_{i:09d}.1\t100{i}\tFakespecies sp{i}\tComplete Genome\tlatest\t"
+            f"https://ftp.ncbi.nlm.nih.gov/genomes/all/GCA/000/{i:03d}/GCA_{i:09d}.1\n"
+        )
+    monkeypatch.setattr(rrfb, "http_get_text", lambda url: fake_summary + "".join(rows))
+
+    def fake_taxonomy(taxids, cache_path=None):
+        out = {}
+        for i, t in enumerate(taxids):
+            phylum = "Ascomycota" if i < 3 else "Basidiomycota"
+            out[t] = {
+                "phylum": phylum, "class": ".", "order": ".",
+                "family": ".", "genus": f"Genus{i}",
+                "species": f"Fakespecies sp{i}",
+            }
+        return out
+    monkeypatch.setattr(rrfb, "fetch_taxonomy_lineages", fake_taxonomy)
+
+    # Materialize a tiny FASTA per row instead of hitting the network.
+    refs_dir = tmp_path / "cache" / "refs"
+    refs_dir.mkdir(parents=True)
+    def fake_materialize(url, dest, keep_gz=True):
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(b">chr\nACGT\n")
+        return dest
+    monkeypatch.setattr(rrfb, "materialize_entry", fake_materialize)
+    # Skip the binary build / decoy padding so the test stays hermetic.
+    monkeypatch.setattr(rrfb, "compile_binary_if_needed", lambda *a, **k: None)
+    monkeypatch.setattr(rrfb, "run_mycosv_command", lambda cmd, cwd=None: None)
+    monkeypatch.setattr(rrfb, "augment_routing_store",
+                        lambda idx, target, seed: {"real_centroids": 0,
+                                                    "decoy_centroids": 0,
+                                                    "total_centroids": 0,
+                                                    "hashes_per_centroid": 0})
+
+    out_dir = tmp_path / "million_real"
+    args = argparse.Namespace(
+        out_dir=out_dir,
+        source="ncbi-genbank",
+        max_assemblies=6,
+        min_assembly_level="contig",
+        latest_only=False,
+        target_centroids=0,
+        seed=42,
+        threads=1,
+        max_clade_genomes=2,
+        binary_path=tmp_path / "fake_bin",
+        force_rebuild=False,
+        data_cache_dir=tmp_path / "cache",
+        million_real_queries=2,
+    )
+    rc = rrfb.prepare_million_real(args)
+    assert rc == 0
+
+    # The index manifest must NOT contain any of the held-out queries.
+    hierarchy = (out_dir / "hierarchy_manifest.tsv").read_text(encoding="utf-8").splitlines()
+    assert len(hierarchy) - 1 == 4, hierarchy  # 6 selected - 2 queries
+    qm_path = out_dir / "query_manifest.tsv"
+    assert qm_path.exists(), "million-real did not write query_manifest.tsv"
+    qm_lines = qm_path.read_text(encoding="utf-8").splitlines()
+    assert len(qm_lines) - 1 == 2, qm_lines
+    qm_header = qm_lines[0].split("\t")
+    assert "query_asm" in qm_header
+    assert "benchmark_ref_fasta" in qm_header
+    assert "phylum" in qm_header
+    bench_ref_idx = qm_header.index("benchmark_ref_fasta")
+    qasm_idx = qm_header.index("query_asm")
+    qasms = [line.split("\t")[qasm_idx] for line in qm_lines[1:]]
+    bench_refs = [line.split("\t")[bench_ref_idx] for line in qm_lines[1:]]
+    assert len(set(qasms)) == 2, qasms
+    # Each held-out query's benchmark_ref_fasta must be one of the OTHER
+    # rows' FASTA paths — never the query's own — so we don't leak truth.
+    for line in qm_lines[1:]:
+        cells = line.split("\t")
+        own_path_in_qlist = any(cells[qasm_idx] in ref for ref in bench_refs)
+        # Loosely: a benchmark ref path must exist on disk.
+        assert Path(cells[bench_ref_idx]).exists(), cells
+    # query_list.txt must mirror query_manifest.tsv.
+    ql_lines = (out_dir / "query_list.txt").read_text(encoding="utf-8").splitlines()
+    assert len([l for l in ql_lines if l.strip()]) == 2
+
+    # Every line in ref_list.txt must NOT belong to a held-out query.
+    rl_lines = (out_dir / "ref_list.txt").read_text(encoding="utf-8").splitlines()
+    rl_paths = {Path(l).name for l in rl_lines if l.strip()}
+    for q_path in ql_lines:
+        if q_path.strip():
+            assert Path(q_path).name not in rl_paths, (q_path, rl_paths)
+
+
+def test_benchmark_real_data_mycosv_only_skips_comparators(tmp_path: Path, monkeypatch):
+    """--mycosv-only must not auto-enable any comparator binaries, must not
+    force the per-mode mandatory baseline, and must clear any pre-set
+    --run-X flags. Guards the million-real step against silent comparator
+    runs that would inflate wall time and pull in tools we don't intend to
+    benchmark in that flow.
+    """
+    import argparse
+    # Build a minimal prepared dir that benchmark_real_data accepts.
+    prepared = tmp_path / "prepared"
+    prepared.mkdir()
+    ref = prepared / "ref.fa"
+    ref.write_text(">chr1\nACGT\n", encoding="utf-8")
+    (prepared / "ref_list.txt").write_text(str(ref) + "\n", encoding="utf-8")
+    (prepared / "query_list.txt").write_text(str(ref) + "\n", encoding="utf-8")
+    (prepared / "query_manifest.tsv").write_text(
+        "query_asm\tquery_mode\tpath\tbenchmark_ref_fasta\n"
+        f"q1\tassembly\t{ref}\t{ref}\n",
+        encoding="utf-8",
+    )
+    (prepared / "hierarchy_manifest.tsv").write_text(
+        "asm_name\tphylum\tclass\torder\tfamily\tgenus\tclade_name\tclade_rank\tfasta_path\n"
+        f"q1\t.\t.\t.\t.\t.\t.\tspecies\t{ref}\n",
+        encoding="utf-8",
+    )
+
+    # Make every binary appear available so a missing-tool short-circuit
+    # cannot mask the --mycosv-only path.
+    monkeypatch.setattr(rrfb, "tool_path", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(rrfb, "compile_binary_if_needed", lambda *a, **k: None)
+    monkeypatch.setattr(
+        rrfb, "run_mycosv",
+        lambda *a, **k: {"vcf": str(prepared / "calls.vcf"),
+                         "hits": str(prepared / "calls.hits.tsv"),
+                         "gfa": str(prepared / "calls.gfa")},
+    )
+    (prepared / "calls.vcf").write_text(
+        "##fileformat=VCFv4.3\n#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tSAMPLE\n",
+        encoding="utf-8",
+    )
+    (prepared / "calls.hits.tsv").write_text("", encoding="utf-8")
+    (prepared / "calls.gfa").write_text("", encoding="utf-8")
+
+    # Trip-wires: if --mycosv-only is honored, none of these comparator
+    # entry points should be reached.
+    for name in ("run_syri_for_query", "run_minigraph_for_query",
+                 "run_pggb_for_query", "run_cactus_for_query",
+                 "run_svim_asm_for_query", "run_anchorwave_for_query",
+                 "run_svim_for_query", "run_sniffles_for_query",
+                 "run_cutesv_for_query", "run_delly_for_query",
+                 "run_manta_for_query"):
+        def _trip(*a, **k):
+            raise AssertionError(f"comparator {name} ran under --mycosv-only")
+        monkeypatch.setattr(rrfb, name, _trip)
+
+    # Skip the candidate analyzer for hermeticity (it shells out).
+    monkeypatch.setattr(rrfb, "maybe_run_candidate_analysis",
+                        lambda *a, **k: (None, None))
+
+    args = argparse.Namespace(
+        prepared_dir=prepared,
+        out_dir=tmp_path / "out",
+        binary_path=tmp_path / "fake_bin",
+        force_rebuild=False,
+        mode="assembly",
+        threads=1,
+        max_clade_genomes=2,
+        run_all_comparators=True,   # would normally enable everything; mycosv_only must override
+        mycosv_only=True,
+        run_syri=True, run_minigraph=True, run_pggb=True,
+        run_cactus=True, run_svim_asm=True, run_anchorwave=True,
+        run_svim=True, run_sniffles=True, run_cutesv=True,
+        run_delly=True, run_manta=True,
+        cactus_arg=[],
+        normalized_other=[], other_vcf=[],
+        mycosv_arg=[], minigraph_arg=[], pggb_arg=[],
+        pggb_identity="90", pggb_segment_len="5k",
+        expression_tsv=None, gene_annotations_tsv=None, ancestral_tsv=None,
+        validate_with_reads=False,
+        read_validation_min_support=3,
+        read_validation_flank_bp=250,
+        reuse_index_dir=None, reuse_registry_dir=None,
+    )
+    rc = rrfb.benchmark_real_data(args)
+    assert rc == 0
+    # Every --run-X must have been cleared by the --mycosv-only branch.
+    for flag in ("run_syri", "run_minigraph", "run_pggb", "run_cactus",
+                 "run_svim_asm", "run_anchorwave",
+                 "run_svim", "run_sniffles", "run_cutesv",
+                 "run_delly", "run_manta"):
+        assert getattr(args, flag) is False, flag

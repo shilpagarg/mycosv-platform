@@ -35,6 +35,15 @@ EXPERIMENT_TYPE="${EXPERIMENT_TYPE#--}"
 # million-scale routing index. Override with env var when needed.
 MILLION_REAL_MAX_ASSEMBLIES="${MILLION_REAL_MAX_ASSEMBLIES:-10000}"
 MILLION_REAL_TARGET_CENTROIDS="${MILLION_REAL_TARGET_CENTROIDS:-1000000}"
+# How many of the downloaded assemblies to hold out as MycoSV-only benchmark
+# queries (excluded from the index, then run end-to-end through indexing,
+# alignment, SV calling, TE classification, biology candidates, and
+# visualization in step 2b). 5 keeps wall time bounded on large indexes;
+# raise on long-walltime nodes.
+MILLION_REAL_QUERIES="${MILLION_REAL_QUERIES:-5}"
+# Per-clade RAM cap on the MycoSV binary's hierarchical graph build; the
+# default fits a 12 GiB cgroup but can be raised on bigger nodes.
+MILLION_REAL_MAX_CLADE_GENOMES="${MILLION_REAL_MAX_CLADE_GENOMES:-8}"
 
 # Worker threads passed to every tool that accepts a thread count:
 #   MycoSV binary (--threads / --tol-index-threads), minimap2 (-t),
@@ -157,27 +166,100 @@ fi
 # ============================================================================
 
 if [[ "$EXPERIMENT_TYPE" == "all" || "$EXPERIMENT_TYPE" == "million-real" ]]; then
-  echo -e "${YELLOW}[2/4] Building real million-scale fungal routing index...${NC}"
+  echo -e "${YELLOW}[2/4] Building real million-scale fungal routing index + MycoSV-only benchmark...${NC}"
   echo "      Downloading up to ${MILLION_REAL_MAX_ASSEMBLIES} NCBI GenBank assemblies (contig level or better)"
   echo "      Target centroids (real+decoys): ${MILLION_REAL_TARGET_CENTROIDS}"
+  echo "      Holding out ${MILLION_REAL_QUERIES} assemblies as MycoSV-only benchmark queries"
   echo "      Output: ${MILLION_REAL_DIR}"
 
-  if python3 run_real_fungal_benchmark.py prepare-million-real \
-      --out-dir "${MILLION_REAL_DIR}" \
-      --source ncbi-genbank \
-      --max-assemblies "${MILLION_REAL_MAX_ASSEMBLIES}" \
-      --target-centroids "${MILLION_REAL_TARGET_CENTROIDS}" \
-      --min-assembly-level contig \
-      --threads "${THREADS}" \
-      --seed 42 \
-      --data-cache-dir "${DATA_CACHE_DIR}" \
-      2>&1 | tee "${MILLION_REAL_DIR}/prepare_million_real.log"; then
+  # Wall-clock caps per sub-step so a slow NCBI download burst or runaway
+  # binary cannot starve the rest of the matrix.  Override / disable with
+  # MILLION_REAL_PREPARE_TIMEOUT=0 / MILLION_REAL_BENCH_TIMEOUT=0.
+  MILLION_REAL_PREPARE_TIMEOUT="${MILLION_REAL_PREPARE_TIMEOUT:-${MILLION_REAL_TIMEOUT:-3h}}"
+  MILLION_REAL_BENCH_TIMEOUT="${MILLION_REAL_BENCH_TIMEOUT:-2h}"
+
+  prepare_million_succeeded=0
+  # ── 2a) prepare: download assemblies, build the routing index, hold out
+  # ────── MILLION_REAL_QUERIES assemblies for the MycoSV-only benchmark.
+  # python3 -u keeps stdout line-buffered under tee so progress is visible.
+  prepare_cmd=(python3 -u run_real_fungal_benchmark.py prepare-million-real
+      --out-dir "${MILLION_REAL_DIR}"
+      --source ncbi-genbank
+      --max-assemblies "${MILLION_REAL_MAX_ASSEMBLIES}"
+      --target-centroids "${MILLION_REAL_TARGET_CENTROIDS}"
+      --min-assembly-level contig
+      --threads "${THREADS}"
+      --seed 42
+      --max-clade-genomes "${MILLION_REAL_MAX_CLADE_GENOMES}"
+      --million-real-queries "${MILLION_REAL_QUERIES}"
+      --data-cache-dir "${DATA_CACHE_DIR}")
+  if [[ -n "${MILLION_REAL_PREPARE_TIMEOUT}" && "${MILLION_REAL_PREPARE_TIMEOUT}" != "0" ]] && command -v timeout >/dev/null; then
+    prepare_cmd=(timeout --signal=TERM --kill-after=60 "${MILLION_REAL_PREPARE_TIMEOUT}" "${prepare_cmd[@]}")
+  fi
+  if "${prepare_cmd[@]}" 2>&1 | tee "${MILLION_REAL_DIR}/prepare_million_real.log"; then
     mark_success "million_real.index_build"
     echo -e "${GREEN}✓ Real million-scale index ready${NC}"
+    prepare_million_succeeded=1
   else
-    mark_failure "million_real.index_build"
+    rc=${PIPESTATUS[0]}
+    if [[ "${rc}" == "124" || "${rc}" == "137" ]]; then
+      mark_failure "million_real.index_build.timeout(${MILLION_REAL_PREPARE_TIMEOUT})"
+      echo -e "${RED}✗ million-real prepare exceeded ${MILLION_REAL_PREPARE_TIMEOUT} — skipping 2b${NC}"
+    else
+      mark_failure "million_real.index_build"
+    fi
   fi
   echo ""
+
+  # ── 2b) MycoSV-only benchmark on the held-out queries: indexing was done
+  # ────── in 2a, so reuse that index (no rebuild); skip every algorithmic
+  # ────── comparator (--mycosv-only) so we cleanly exercise indexing →
+  # ────── alignment → SV calling → TE classification → biology candidates
+  # ────── → biology_findings.tsv → novel_mycosv_calls.tsv. Visualization
+  # ────── (step 4) picks all of these up via MILLION_REAL_DIR scan.
+  if [[ "${prepare_million_succeeded}" == "1" \
+        && -f "${MILLION_REAL_DIR}/query_manifest.tsv" \
+        && $(wc -l < "${MILLION_REAL_DIR}/query_manifest.tsv") -gt 1 ]]; then
+    echo -e "${YELLOW}[2b/4] Running MycoSV-only benchmark on million-real held-out queries...${NC}"
+    bench_dir="${MILLION_REAL_DIR}/benchmark_assembly"
+    mkdir -p "${bench_dir}"
+    # Read-level validation needs a single per-query benchmark_ref_fasta;
+    # in the million-real flow that ref is a sibling-genus assembly chosen
+    # by prepare-million-real. We keep validation OFF by default to bound
+    # wall time on big indexes — set MILLION_REAL_VALIDATE_WITH_READS=1 to
+    # turn it back on.
+    val_flag="--no-validate-with-reads"
+    if [[ "${MILLION_REAL_VALIDATE_WITH_READS:-0}" == "1" ]]; then
+      val_flag="--validate-with-reads"
+    fi
+    bench_cmd=(python3 -u run_real_fungal_benchmark.py benchmark
+        --prepared-dir "${MILLION_REAL_DIR}"
+        --out-dir "${bench_dir}"
+        --mode assembly
+        --threads "${THREADS}"
+        --max-clade-genomes "${MILLION_REAL_MAX_CLADE_GENOMES}"
+        --mycosv-only
+        --reuse-index-dir "${MILLION_REAL_DIR}/index"
+        --reuse-registry-dir "${MILLION_REAL_DIR}/registry"
+        "${val_flag}")
+    if [[ -n "${MILLION_REAL_BENCH_TIMEOUT}" && "${MILLION_REAL_BENCH_TIMEOUT}" != "0" ]] && command -v timeout >/dev/null; then
+      bench_cmd=(timeout --signal=TERM --kill-after=60 "${MILLION_REAL_BENCH_TIMEOUT}" "${bench_cmd[@]}")
+    fi
+    if "${bench_cmd[@]}" 2>&1 | tee "${bench_dir}/benchmark.log"; then
+      mark_success "million_real.mycosv_benchmark"
+      echo -e "${GREEN}✓ MycoSV-only million-real benchmark complete${NC}"
+    else
+      rc=${PIPESTATUS[0]}
+      if [[ "${rc}" == "124" || "${rc}" == "137" ]]; then
+        mark_failure "million_real.mycosv_benchmark.timeout(${MILLION_REAL_BENCH_TIMEOUT})"
+      else
+        mark_failure "million_real.mycosv_benchmark"
+      fi
+    fi
+    echo ""
+  elif [[ "${prepare_million_succeeded}" == "1" ]]; then
+    echo "      [skip] no held-out queries written (MILLION_REAL_QUERIES=${MILLION_REAL_QUERIES})"
+  fi
 fi
 
 # ============================================================================
@@ -390,21 +472,25 @@ PY
     return 0
   }
 
-  mapfile -t REAL_TSVS < <(find "${REAL_DIR}" -type f \( \
+  # Scan REAL_DIR (per-panel benchmarks) AND MILLION_REAL_DIR (the
+  # MycoSV-only million-scale benchmark from step 2b). Without the latter,
+  # the held-out queries' SV calls / TE classifications / biology candidates
+  # never reach the report and the million-real flow looks empty.
+  mapfile -t REAL_TSVS < <(find "${REAL_DIR}" "${MILLION_REAL_DIR}" -type f \( \
       -name "*summary*.tsv" -o \
       -name "*pr_metrics*.tsv" -o \
       -name "*normalized_calls*.tsv" -o \
       -name "*score*.tsv" \
     \) 2>/dev/null | sort)
 
-  mapfile -t BIO_TSVS < <(find "${REAL_DIR}" -type f \( \
+  mapfile -t BIO_TSVS < <(find "${REAL_DIR}" "${MILLION_REAL_DIR}" -type f \( \
       -name "*biology*.tsv" -o \
       -name "*candidate*.tsv" -o \
       -name "*annotation*.tsv" -o \
       -name "*pathway*.tsv" \
     \) 2>/dev/null | sort)
 
-  mapfile -t NOVEL_TSVS < <(find "${REAL_DIR}" -type f \
+  mapfile -t NOVEL_TSVS < <(find "${REAL_DIR}" "${MILLION_REAL_DIR}" -type f \
       -name "novel_mycosv_calls.tsv" 2>/dev/null | sort)
 
   if [[ ${#REAL_TSVS[@]} -gt 0 ]]; then
