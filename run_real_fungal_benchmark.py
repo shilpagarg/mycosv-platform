@@ -88,7 +88,7 @@ PUBLIC_RESOURCE_LINKS: list[dict[str, str]] = [
     },
     {
         "label": "ensembl_fungi_ftp",
-        "url": "https://ftp.ensemblgenomes.org/pub/fungi/current/gff3/",
+        "url": "https://ftp.ensemblgenomes.ebi.ac.uk/pub/fungi/current/gff3/",
         "description": "Ensembl Fungi current GFF3 dumps (fallback when NCBI has no GFF for an assembly)",
     },
     {
@@ -118,7 +118,7 @@ PUBLIC_RESOURCE_LINKS: list[dict[str, str]] = [
     },
     {
         "label": "fungaltraits",
-        "url": "https://github.com/traitlife/FungalTraits",
+        "url": "https://github.com/traitecoevo/fungaltraits",
         "description": "FungalTraits: curated genus-/species-level lifestyle and trait database (Polõme 2020)",
     },
 ]
@@ -186,6 +186,24 @@ TYPE_CANON = {
     "OFF_REF": "OFF_REF",
 }
 
+BIOLOGY_FINDINGS_EXTRA_FIELDS = [
+    "comparator_support_count",
+    "comparator_support_labels",
+    "mycosv_unique",
+]
+
+READ_VALIDATION_FIELDS = [
+    "query_asm",
+    "ref_contig",
+    "pos",
+    "end",
+    "svtype",
+    "source",
+    "coord_space",
+    "read_support",
+    "read_validated",
+]
+
 # ── Long-read platform detection ───────────────────────────────────────────
 # PacBio HiFi (CCS): Revio, Sequel IIe/II CCS — ≥99 % accuracy, 10–25 kb.
 #   minimap2 preset:  map-hifi
@@ -225,10 +243,46 @@ class NormalizedCall:
     ref_contig: str = "."
 
 
-_TOOL_TIMEOUT = 7200  # 2-hour hard limit per external tool invocation
+_TOOL_TIMEOUT = int(os.environ.get("MYCOSV_TOOL_TIMEOUT", "14400"))
 
 
-def run(cmd: list[str], cwd: Path | None = None, timeout: int = _TOOL_TIMEOUT) -> subprocess.CompletedProcess[str]:
+def _log_comparator_failure(out_dir: Path, label: str, query_asm: str, reason: str) -> None:
+    """Append a structured failure row so the visualization (and any operator
+    grep) can see exactly which (query, comparator) pairs lost coverage and
+    why, without parsing free-form stderr.
+    """
+    try:
+        out_dir.mkdir(parents=True, exist_ok=True)
+        path = out_dir / "comparator_failures.tsv"
+        new_file = not path.exists()
+        with path.open("a", encoding="utf-8") as fh:
+            if new_file:
+                fh.write("query_asm\tcomparator\treason\n")
+            fh.write(f"{query_asm}\t{label}\t{reason.replace(chr(9), ' ').replace(chr(10), ' ')}\n")
+    except OSError:
+        pass
+
+
+def run(
+    cmd: list[str],
+    cwd: Path | None = None,
+    timeout: int = _TOOL_TIMEOUT,
+    memory_limit_bytes: int | None = None,
+) -> subprocess.CompletedProcess[str]:
+    preexec_fn = None
+    if memory_limit_bytes and memory_limit_bytes > 0 and os.name != "nt":
+        def _limit_child() -> None:
+            try:
+                import resource
+
+                resource.setrlimit(
+                    resource.RLIMIT_AS,
+                    (memory_limit_bytes, memory_limit_bytes),
+                )
+            except Exception:
+                pass
+
+        preexec_fn = _limit_child
     return subprocess.run(
         cmd,
         cwd=str(cwd) if cwd else None,
@@ -236,6 +290,7 @@ def run(cmd: list[str], cwd: Path | None = None, timeout: int = _TOOL_TIMEOUT) -
         capture_output=True,
         check=True,
         timeout=timeout,
+        preexec_fn=preexec_fn,
     )
 
 
@@ -361,10 +416,24 @@ def _preflight_memory_check(cmd: list[str]) -> None:
         sys.stderr.write(f"[mycosv preflight] cmd: {' '.join(cmd)}\n")
 
 
+def _mycosv_child_memory_limit_bytes() -> int | None:
+    limit = _detect_cgroup_memory_max_bytes()
+    if limit is None or limit <= 0:
+        return None
+    # Keep headroom for Python, tee/logging, shared libraries, and Slurm's own
+    # accounting so a runaway binary fails inside the benchmark wrapper instead
+    # of taking down the whole batch step via cgroup OOM.
+    headroom = max(2 * 1024 ** 3, limit // 10)
+    child_limit = limit - headroom
+    if child_limit < 4 * 1024 ** 3:
+        return None
+    return child_limit
+
+
 def run_mycosv_command(cmd: list[str], cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
     _preflight_memory_check(cmd)
     try:
-        return run(cmd, cwd=cwd)
+        return run(cmd, cwd=cwd, memory_limit_bytes=_mycosv_child_memory_limit_bytes())
     except subprocess.CalledProcessError as exc:
         # Surface SIGKILL as an OOM signal rather than a generic exit code.
         if exc.returncode in (-9, 137):
@@ -487,9 +556,25 @@ def http_get_text(url: str) -> str:
         return resp.read().decode("utf-8")
 
 
+def http_get_text_cached(url: str, cache_path: Path) -> str:
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    if cache_path.exists() and cache_path.stat().st_size > 0:
+        return cache_path.read_text(encoding="utf-8")
+    text = http_get_text(url)
+    tmp = cache_path.with_suffix(cache_path.suffix + ".part")
+    try:
+        tmp.write_text(text, encoding="utf-8")
+        tmp.rename(cache_path)
+    except Exception:
+        if tmp.exists():
+            tmp.unlink()
+        raise
+    return text
+
+
 def http_download(url: str, dest: Path) -> Path:
     dest.parent.mkdir(parents=True, exist_ok=True)
-    if dest.exists():
+    if dest.exists() and dest.stat().st_size > 0:
         return dest
     req = urllib.request.Request(url, headers={"User-Agent": "MycoSV-real-benchmark/1.0"})
     tmp = dest.with_suffix(dest.suffix + ".part")
@@ -504,6 +589,29 @@ def http_download(url: str, dest: Path) -> Path:
     return dest
 
 
+def data_cache_base(args: argparse.Namespace, out_dir: Path) -> Path:
+    """Return the persistent download cache for prepare-style commands."""
+    configured = getattr(args, "data_cache_dir", None)
+    return configured.resolve() if configured else (out_dir / "downloads")
+
+
+def cached_filename_for_source(source: str, fallback_name: str) -> str:
+    """Stable cache filename for arbitrary URLs and local manifest paths.
+
+    NCBI assembly downloads already carry accession-specific basenames. Custom
+    public manifests are less predictable, so URL-backed inputs get a short hash
+    prefix to avoid collisions such as multiple providers exposing genome.fa.gz.
+    """
+    parsed = urllib.parse.urlparse(source)
+    name = Path(parsed.path).name if parsed.path else ""
+    if not name:
+        name = fallback_name
+    if looks_like_url(source):
+        digest = hashlib.sha1(source.encode("utf-8")).hexdigest()[:12]
+        return f"{digest}_{name}"
+    return name
+
+
 def maybe_gunzip(path: Path, keep_gz: bool = True) -> Path:
     # Keep .gz in cache; the C++ binary reads gzip natively via popen.
     # Never write a decompressed copy alongside the archive.
@@ -511,9 +619,102 @@ def maybe_gunzip(path: Path, keep_gz: bool = True) -> Path:
 
 
 def open_text_auto(path: Path):
-    if path.suffix == ".gz":
+    try:
+        with path.open("rb") as fh:
+            magic = fh.read(2)
+    except OSError:
+        magic = b""
+    if path.suffix == ".gz" or magic == b"\x1f\x8b":
         return gzip.open(path, "rt", encoding="utf-8")
     return path.open("r", encoding="utf-8")
+
+
+def _fastq_record_iter(path: Path):
+    with open_text_auto(path) as fh:
+        while True:
+            header = fh.readline()
+            if not header:
+                return
+            seq = fh.readline()
+            plus = fh.readline()
+            qual = fh.readline()
+            if not qual:
+                return
+            yield header, seq, plus, qual
+
+
+def subset_fastq_records(src: Path, dest: Path, max_records: int) -> tuple[Path, int, bool]:
+    """Write at most max_records FASTQ records to dest.
+
+    Public ENA runs can be many gigabytes. MycoSV already caps reads internally,
+    but external comparators map the FASTQ path directly; feeding them a bounded
+    subset keeps benchmark wall time predictable without changing the prepared
+    manifest on disk.
+    """
+    if max_records <= 0:
+        return src, 0, False
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    if dest.exists() and dest.stat().st_size > 0:
+        return dest, max_records, True
+    count = 0
+    tmp = dest.with_suffix(dest.suffix + ".part")
+    try:
+        with tmp.open("w", encoding="utf-8") as out_fh:
+            for header, seq, plus, qual in _fastq_record_iter(src):
+                if count >= max_records:
+                    break
+                out_fh.write(header)
+                out_fh.write(seq)
+                out_fh.write(plus)
+                out_fh.write(qual)
+                count += 1
+        tmp.rename(dest)
+    except Exception:
+        if tmp.exists():
+            tmp.unlink()
+        raise
+    return dest, count, count > 0
+
+
+def cap_read_query_inputs(
+    query_manifest: list[dict[str, str]],
+    out_dir: Path,
+    mode: str,
+    max_short_reads: int,
+    max_long_reads: int,
+) -> list[dict[str, str]]:
+    if mode not in {"short-reads", "long-reads"}:
+        return query_manifest
+    max_records = max_long_reads if mode == "long-reads" else max_short_reads
+    if max_records <= 0:
+        return query_manifest
+
+    capped_rows: list[dict[str, str]] = []
+    subset_dir = out_dir / "read_subsets"
+    for row in query_manifest:
+        original = locate_query_path(row)
+        if sequence_kind_from_name(original.name) != "fastq":
+            capped_rows.append(row)
+            continue
+        dest = subset_dir / f"{normalize_name(row.get('query_asm', original.stem))}.{max_records}.fastq"
+        try:
+            capped_path, kept, capped = subset_fastq_records(original, dest, max_records)
+        except Exception as exc:
+            sys.stderr.write(
+                f"[reads-mode] could not create bounded FASTQ for "
+                f"{row.get('query_asm', original.name)}: {exc}; using original\n"
+            )
+            capped_rows.append(row)
+            continue
+        new_row = dict(row)
+        new_row["path"] = str(capped_path)
+        capped_rows.append(new_row)
+        if capped:
+            sys.stderr.write(
+                f"[reads-mode] comparator input capped for "
+                f"{row.get('query_asm', original.name)}: {kept} reads -> {capped_path}\n"
+            )
+    return capped_rows
 
 
 _FASTA_CONTIG_CACHE: dict[str, frozenset[str]] = {}
@@ -898,6 +1099,16 @@ def fetch_expression_atlas_for_species(
     return out
 
 
+def _looks_like_atlas_analytics_tsv(text: str) -> bool:
+    stripped = text.lstrip()
+    if not stripped:
+        return False
+    if stripped.startswith("<") or "<!doctype html" in stripped[:200].lower():
+        return False
+    first = stripped.splitlines()[0] if stripped.splitlines() else ""
+    return "\t" in first and "Gene ID" in first
+
+
 def fetch_atlas_experiment_analytics(
     experiment_accession: str,
     cache_dir: Path,
@@ -909,7 +1120,24 @@ def fetch_atlas_experiment_analytics(
     cache_dir.mkdir(parents=True, exist_ok=True)
     cached = cache_dir / f"{experiment_accession}.analytics.tsv"
     if cached.exists() and cached.stat().st_size > 0:
-        return cached
+        try:
+            cached_text = cached.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            cached_text = ""
+        if _looks_like_atlas_analytics_tsv(cached_text):
+            return cached
+        bad = cached.with_suffix(cached.suffix + ".invalid.html")
+        try:
+            cached.rename(bad)
+        except OSError:
+            try:
+                cached.unlink()
+            except OSError:
+                pass
+        sys.stderr.write(
+            f"[expression-atlas] {experiment_accession}: cached analytics "
+            f"was not TSV; quarantined as {bad.name}\n"
+        )
     url = (
         f"https://www.ebi.ac.uk/gxa/experiments/{experiment_accession}"
         f"/download/all-analytics?accessKey="
@@ -920,6 +1148,17 @@ def fetch_atlas_experiment_analytics(
         sys.stderr.write(
             f"[expression-atlas] {experiment_accession}: download failed "
             f"({type(exc).__name__}: {exc})\n"
+        )
+        return None
+    if not _looks_like_atlas_analytics_tsv(text):
+        bad = cached.with_suffix(cached.suffix + ".invalid.html")
+        try:
+            bad.write_text(text, encoding="utf-8")
+        except OSError:
+            pass
+        sys.stderr.write(
+            f"[expression-atlas] {experiment_accession}: analytics endpoint "
+            f"did not return a gene analytics TSV; skipping\n"
         )
         return None
     cached.write_text(text, encoding="utf-8")
@@ -1026,8 +1265,8 @@ def assemble_expression_tsv(
 
 
 _FUNGALTRAITS_URL = (
-    "https://raw.githubusercontent.com/traitlife/FungalTraits/main/"
-    "FungalTraits_1.2_ver_16Dec_2020V.1.2.csv"
+    "https://raw.githubusercontent.com/traitecoevo/fungaltraits/master/"
+    "funtothefun.csv"
 )
 
 
@@ -1081,10 +1320,33 @@ def write_ecological_summary_tsv(
         record = dict(zip(header, parts))
         genus = (record.get("GENUS") or record.get("Genus") or "").strip().lower()
         species = (record.get("SPECIES") or record.get("Species") or "").strip().lower()
+        if not species:
+            species = (record.get("speciesMatched") or record.get("species") or "").strip().replace("_", " ").lower()
+        if not genus and species:
+            genus = species.split()[0]
+        trait_name = (record.get("trait_name") or "").strip().lower()
+        trait_value = (record.get("value") or "").strip()
+        if trait_name and trait_value:
+            # The current traitecoevo/fungaltraits export is long-form
+            # (speciesMatched, trait_name, value). Pivot the ecology fields we
+            # use so the downstream join can consume it like the older wide
+            # FungalTraits v1.2 CSV.
+            pivoted = {
+                "GENUS": genus,
+                "SPECIES": species,
+            }
+            if trait_name == "trophic_mode_fg":
+                pivoted["Trophic_mode"] = trait_value
+                pivoted["primary_lifestyle"] = trait_value
+            elif trait_name == "substrate":
+                pivoted["Substrate"] = trait_value
+            else:
+                pivoted[trait_name] = trait_value
+            record = pivoted
         if genus:
-            by_genus.setdefault(genus, record)
+            by_genus.setdefault(genus, {}).update({k: v for k, v in record.items() if v})
         if species:
-            by_species[species] = record
+            by_species.setdefault(species, {}).update({k: v for k, v in record.items() if v})
     rows: list[dict[str, Any]] = []
     for species, qasms in species_to_query_asms.items():
         species_low = species.strip().lower()
@@ -1140,7 +1402,12 @@ def materialize_entry(url_or_path: str, dest: Path, keep_gz: bool = True) -> Pat
     else:
         src = Path(url_or_path)
         dest.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(src, dest)
+        try:
+            same_file = src.resolve() == dest.resolve()
+        except OSError:
+            same_file = False
+        if not same_file:
+            shutil.copy2(src, dest)
         path = dest
     if path.suffix == ".gz":
         return maybe_gunzip(path, keep_gz=keep_gz)
@@ -1434,6 +1701,16 @@ def filter_ena_rows_for_mode(rows: list[dict[str, str]], query_mode: str) -> lis
     return result
 
 
+def _ena_fastq_bytes(row: dict[str, str]) -> int:
+    total = 0
+    for raw in split_values(row.get("fastq_bytes", "")):
+        try:
+            total += int(raw)
+        except ValueError:
+            continue
+    return total
+
+
 def direct_read_sources_from_row(row: dict[str, str]) -> list[str]:
     sources: list[str] = []
     for key in ("fastq_url_1", "fastq_url_2", "fastq_url", "fastq_urls", "read_url", "read_urls", "path", "url"):
@@ -1455,6 +1732,13 @@ def direct_read_sources_from_row(row: dict[str, str]) -> list[str]:
 
 def select_ena_read_sources(run_rows: list[dict[str, str]], query_mode: str, max_runs: int) -> tuple[list[str], list[dict[str, str]]]:
     filtered = filter_ena_rows_for_mode(run_rows, query_mode)
+    if query_mode == "long-reads":
+        filtered = sorted(
+            filtered,
+            key=lambda row: (-_long_read_platform_score(row), _ena_fastq_bytes(row) or 10**18),
+        )
+    elif query_mode == "short-reads":
+        filtered = sorted(filtered, key=lambda row: _ena_fastq_bytes(row) or 10**18)
     urls: list[str] = []
     meta_rows: list[dict[str, str]] = []
     picked_runs = 0
@@ -1487,15 +1771,22 @@ def select_ena_read_sources(run_rows: list[dict[str, str]], query_mode: str, max
 
 
 def merge_sequence_sources(sources: list[str], dest_prefix: Path) -> Path:
+    # Byte-mode concatenation. ENA mirrors occasionally serve compressed FASTQs
+    # whose extension does not match their magic bytes (bz2/zstd/partial), and
+    # the previous text-mode merge crashed at the first non-UTF-8 byte (seen in
+    # production as "'utf-8' codec can't decode byte 0x89" on Rhizophagus
+    # long-reads). Treating the payload as opaque bytes is safe because every
+    # downstream consumer (mycosv, samtools, minimap2, comparators) reads
+    # gzip-/text- formats via their own auto-detection.
     if not sources:
         raise ValueError("No sequence sources were provided")
     kind = sequence_kind_from_name(sources[0])
     suffix = ".fastq" if kind == "fastq" else ".fasta"
     out_path = dest_prefix.with_suffix(suffix)
-    if out_path.exists():
+    if out_path.exists() and out_path.stat().st_size > 0:
         return out_path
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    with out_path.open("w", encoding="utf-8") as out_fh:
+    with out_path.open("wb") as out_fh:
         for idx, src in enumerate(sources):
             parsed = urllib.parse.urlparse(src)
             source_name = Path(parsed.path).name or f"source_{idx + 1}{suffix}"
@@ -1504,8 +1795,32 @@ def merge_sequence_sources(sources: list[str], dest_prefix: Path) -> Path:
             part_kind = sequence_kind_from_name(local_part.name)
             if part_kind != kind:
                 raise ValueError(f"Mixed sequence kinds in one query input: {kind} vs {part_kind} from {src}")
-            with open_text_auto(local_part) as in_fh:
-                shutil.copyfileobj(in_fh, out_fh)
+            part_size = local_part.stat().st_size if local_part.exists() else 0
+            if part_size < 20:
+                # Bail on empty / HTML-error-page payloads (gzip header alone
+                # is 10 bytes; a one-record gzipped FASTQ is ~40-100 bytes,
+                # so 20 catches "obviously broken" without rejecting tiny
+                # fixtures). The previous silent skip let mycosv read 0
+                # sequences and still report success.
+                if local_part != out_path and local_part.parent == dest_prefix.parent and local_part.exists():
+                    local_part.unlink()
+                raise ValueError(
+                    f"Downloaded part looks truncated ({part_size} bytes) for {src}"
+                )
+            with local_part.open("rb") as in_fh:
+                # Strip a leading gzip header by streaming through gzip if the
+                # part is gz-magic but the merged output is plain text. This
+                # preserves the "one plain FASTQ" output contract for the C++
+                # binary while still tolerating gz parts (materialize_entry
+                # with keep_gz=False already gunzips, so this is belt-and-
+                # suspenders for mixed mirrors).
+                if in_fh.read(2) == b"\x1f\x8b":
+                    in_fh.seek(0)
+                    with gzip.open(in_fh, "rb") as gz_fh:
+                        shutil.copyfileobj(gz_fh, out_fh)
+                else:
+                    in_fh.seek(0)
+                    shutil.copyfileobj(in_fh, out_fh)
             if local_part != out_path and local_part.parent == dest_prefix.parent and local_part.exists():
                 local_part.unlink()
     return out_path
@@ -1527,7 +1842,7 @@ def materialize_query_input(
         fasta_src = row.get("fasta_url") or row.get("path") or row.get("url") or ""
         if not fasta_src:
             raise ValueError(f"Missing fasta_url/path/url for assembly query row {asm_name}")
-        dest_name = Path(urllib.parse.urlparse(fasta_src).path).name or f"{asm_name}.fa"
+        dest_name = cached_filename_for_source(fasta_src, f"{asm_name}.fa")
         local_path = materialize_entry(fasta_src, dest_dir / dest_name, keep_gz=True)
         source_rows.append({
             "query_asm": asm_name,
@@ -1600,9 +1915,10 @@ def materialize_query_input(
 def prepare_from_custom_manifest(args: argparse.Namespace) -> int:
     out_dir = args.out_dir.resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
-    downloads_dir = out_dir / "downloads"
-    refs_dir = downloads_dir / "refs"
-    queries_dir = downloads_dir / "queries"
+    cache_base = data_cache_base(args, out_dir)
+    cache_base.mkdir(parents=True, exist_ok=True)
+    refs_dir = cache_base / "refs"
+    queries_dir = cache_base / "queries"
     rows = parse_custom_url_manifest(args.custom_url_manifest.resolve())
 
     ref_manifest_rows: list[dict[str, str]] = []
@@ -1619,7 +1935,7 @@ def prepare_from_custom_manifest(args: argparse.Namespace) -> int:
             fasta_src = row.get("fasta_url") or row.get("path") or row.get("url") or ""
             if not fasta_src:
                 raise ValueError(f"Missing fasta_url/path/url for reference manifest row {asm_name}")
-            dest_name = Path(urllib.parse.urlparse(fasta_src).path).name or f"{asm_name}.fa"
+            dest_name = cached_filename_for_source(fasta_src, f"{asm_name}.fa")
             local_fasta = materialize_entry(fasta_src, refs_dir / dest_name, keep_gz=True)
             ref_list_paths.append(str(local_fasta))
             ref_manifest_rows.append({
@@ -1683,6 +1999,19 @@ def prepare_from_custom_manifest(args: argparse.Namespace) -> int:
         ["query_asm", "role", "query_mode", "source_type", "source_accession", "source_url", "local_path", "species"],
     )
     write_public_resource_links(out_dir / "public_resource_links.tsv")
+    (out_dir / "prepare_summary.json").write_text(
+        json.dumps(
+            {
+                "mode": "custom",
+                "ref_count": len(ref_manifest_rows),
+                "query_count": len(query_rows),
+                "data_cache_dir": str(cache_base),
+            },
+            indent=2,
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
     print(f"prepared\trefs={len(ref_manifest_rows)}\tqueries={len(query_rows)}\tmode=custom")
     return 0
 
@@ -1690,8 +2019,13 @@ def prepare_from_custom_manifest(args: argparse.Namespace) -> int:
 def prepare_from_ncbi(args: argparse.Namespace) -> int:
     out_dir = args.out_dir.resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
+    cache_base = data_cache_base(args, out_dir)
+    cache_base.mkdir(parents=True, exist_ok=True)
     summary_url = NCBI_ASSEMBLY_SUMMARY[args.source]
-    summary_text = http_get_text(summary_url)
+    summary_text = http_get_text_cached(
+        summary_url,
+        cache_base / "assembly_summaries" / f"{args.source}_fungi_assembly_summary.txt",
+    )
     all_rows = parse_assembly_summary(summary_text)
 
     selectors: list[dict[str, str]] = []
@@ -1773,9 +2107,6 @@ def prepare_from_ncbi(args: argparse.Namespace) -> int:
     if args.catalog_only:
         print(f"catalog_only\tassemblies={len(selected_rows)}\tsource={args.source}")
         return 0
-
-    cache_base = args.data_cache_dir.resolve() if args.data_cache_dir else (out_dir / "downloads")
-    cache_base.mkdir(parents=True, exist_ok=True)
 
     taxonomy_cache = fetch_taxonomy_lineages(
         sorted({row.get("taxid", "") for row in selected_rows if row.get("taxid")}),
@@ -2288,6 +2619,8 @@ def prepare_from_ncbi(args: argparse.Namespace) -> int:
                 "max_query_downloads": args.max_query_downloads,
                 "allow_no_queries": bool(args.allow_no_queries),
                 "public_query_manifest": str(args.public_query_manifest) if args.public_query_manifest else "",
+                "data_cache_dir": str(cache_base),
+                "assembly_summary_cache": str(cache_base / "assembly_summaries" / f"{args.source}_fungi_assembly_summary.txt"),
                 "phenotypic_records_cached": len(phenotype_meta),
                 "expression_rows_written": expression_rows_written,
                 "ecological_rows_written": ecological_rows_written,
@@ -2646,6 +2979,14 @@ def effective_contig(call: NormalizedCall) -> str:
     return call.ref_contig if call.coord_space == "reference" else call.query_contig
 
 
+def _call_span_end(call: NormalizedCall) -> int:
+    return max(call.end, call.pos + abs(call.svlen))
+
+
+def _call_span_contains(span_call: NormalizedCall, pos: int, *, pad: int = 0) -> bool:
+    return (span_call.pos - pad) <= pos <= (_call_span_end(span_call) + pad)
+
+
 def calls_compatible(truth: NormalizedCall, pred: NormalizedCall) -> bool:
     if truth.coord_space != pred.coord_space:
         return False
@@ -2657,9 +2998,14 @@ def calls_compatible(truth: NormalizedCall, pred: NormalizedCall) -> bool:
         return False
     tol_bp = DEFAULT_TOL_BP.get(canonical_group(truth.svtype), 500)
     tol_frac = DEFAULT_TOL_LEN_FRAC.get(canonical_group(truth.svtype), 0.30)
-    if abs(truth.pos - pred.pos) > tol_bp:
+    inv_or_tra = canonical_group(truth.svtype) == "TRA" or canonical_group(pred.svtype) == "TRA" or truth.svtype == "INV" or pred.svtype == "INV"
+    pos_within_tol = abs(truth.pos - pred.pos) <= tol_bp
+    # MycoSV can emit whole-chain INV/TRA blocks: the comparator breakpoint may
+    # be embedded inside the predicted block rather than near pred.pos.
+    pos_within_span = inv_or_tra and _call_span_contains(pred, truth.pos, pad=tol_bp)
+    if not (pos_within_tol or pos_within_span):
         return False
-    if truth.svtype not in {"TRA", "OFF_REF", "INS"}:
+    if truth.svtype not in {"INV", "TRA", "OFF_REF", "INS"}:
         denom = max(abs(truth.svlen), 1)
         if abs(abs(truth.svlen) - abs(pred.svlen)) / denom > tol_frac:
             return False
@@ -2667,7 +3013,15 @@ def calls_compatible(truth: NormalizedCall, pred: NormalizedCall) -> bool:
 
 
 def call_distance(truth: NormalizedCall, pred: NormalizedCall) -> int:
-    return abs(truth.pos - pred.pos) + abs(abs(truth.svlen) - abs(pred.svlen))
+    inv_or_tra = canonical_group(truth.svtype) == "TRA" or canonical_group(pred.svtype) == "TRA" or truth.svtype == "INV" or pred.svtype == "INV"
+    if inv_or_tra and _call_span_contains(pred, truth.pos, pad=DEFAULT_TOL_BP.get(canonical_group(truth.svtype), 500)):
+        pos_d = 0
+    elif inv_or_tra:
+        pos_d = abs(truth.pos - (pred.pos + abs(pred.svlen) // 2))
+    else:
+        pos_d = abs(truth.pos - pred.pos)
+    len_d = 0 if canonical_group(truth.svtype) == "TRA" else abs(abs(truth.svlen) - abs(pred.svlen))
+    return pos_d + len_d
 
 
 def build_consensus_truth(
@@ -2858,12 +3212,115 @@ def parse_other_spec(spec: str) -> tuple[str, Path]:
 # ============================================================================
 
 
+CIGAR_RE = re.compile(r"(\d+)([MIDNSHP=X])")
+
+
+def _cigar_ref_len(cigar: str) -> int:
+    return sum(int(n) for n, op in CIGAR_RE.findall(cigar) if op in {"M", "D", "N", "=", "X"})
+
+
+def _within_bp(a: int, b: int, flank_bp: int) -> bool:
+    return abs(a - b) <= flank_bp
+
+
+def _len_compatible(observed_len: int, expected_len: int | None, svtype: str | None) -> bool:
+    if expected_len is None or expected_len <= 0 or svtype in {None, "INS", "TRA", "OFF_REF"}:
+        return True
+    tol_frac = DEFAULT_TOL_LEN_FRAC.get(canonical_group(svtype), 0.30)
+    return abs(observed_len - expected_len) / max(expected_len, 1) <= max(tol_frac, 0.50)
+
+
+def _cigar_indel_supports_call(
+    cigar: str,
+    ref_start: int,
+    pos: int,
+    end: int,
+    *,
+    svtype: str | None,
+    svlen: int | None,
+    flank_bp: int,
+) -> bool:
+    ref_cursor = ref_start
+    expected_len = abs(svlen) if svlen is not None else None
+    for raw_n, op in CIGAR_RE.findall(cigar):
+        n = int(raw_n)
+        if op in {"M", "=", "X"}:
+            ref_cursor += n
+            continue
+        if op in {"D", "N"}:
+            event_start = ref_cursor
+            event_end = ref_cursor + n - 1
+            ref_cursor += n
+            if svtype not in {None, "DEL"}:
+                continue
+            same_locus = (
+                _within_bp(event_start, pos, flank_bp)
+                or _within_bp(event_end, end, flank_bp)
+                or (pos - flank_bp) <= event_start <= (end + flank_bp)
+                or (pos - flank_bp) <= event_end <= (end + flank_bp)
+            )
+            if same_locus and _len_compatible(n, expected_len, svtype):
+                return True
+            continue
+        if op == "I":
+            event_pos = max(ref_start, ref_cursor - 1)
+            if svtype not in {None, "INS", "DUP", "OFF_REF"}:
+                continue
+            if (_within_bp(event_pos, pos, flank_bp) or _within_bp(event_pos, end, flank_bp)) and _len_compatible(n, expected_len, svtype):
+                return True
+            continue
+        if op in {"S", "H", "P"}:
+            continue
+    return False
+
+
+def _split_or_clip_supports_call(
+    cigar: str,
+    ref_start: int,
+    ref_end: int,
+    fields: list[str],
+    pos: int,
+    end: int,
+    *,
+    svtype: str | None,
+    flank_bp: int,
+    min_clip: int,
+) -> bool:
+    has_sa = any(f.startswith("SA:Z:") for f in fields[11:])
+    left_clip = 0
+    right_clip = 0
+    m = re.match(r"^(\d+)[SH]", cigar)
+    if m:
+        left_clip = int(m.group(1))
+    m = re.search(r"(\d+)[SH]$", cigar)
+    if m:
+        right_clip = int(m.group(1))
+    clipped = left_clip >= min_clip or right_clip >= min_clip
+    if not (has_sa or clipped):
+        return False
+    bp_set = {pos, end}
+    if left_clip >= min_clip and any(_within_bp(ref_start, bp, flank_bp) for bp in bp_set):
+        return True
+    if right_clip >= min_clip and any(_within_bp(ref_end, bp, flank_bp) for bp in bp_set):
+        return True
+    if has_sa:
+        if any(_within_bp(ref_start, bp, flank_bp) or _within_bp(ref_end, bp, flank_bp) for bp in bp_set):
+            return True
+        # Whole-block INV/TRA alignments may carry supplementary evidence while
+        # the embedded breakpoint lies inside the aligned interval.
+        if svtype in {"INV", "TRA"} and any((ref_start - flank_bp) <= bp <= (ref_end + flank_bp) for bp in bp_set):
+            return True
+    return False
+
+
 def _samtools_count_breakpoint_support(
     bam_path: Path,
     contig: str,
     pos: int,
     end: int,
     *,
+    svtype: str | None = None,
+    svlen: int | None = None,
     flank_bp: int = 250,
     min_clip: int = 30,
 ) -> int:
@@ -2889,7 +3346,6 @@ def _samtools_count_breakpoint_support(
     except subprocess.TimeoutExpired:
         return 0
     support = 0
-    bp_set = {pos, end}
     for line in proc.stdout.splitlines():
         fields = line.rstrip("\n").split("\t")
         if len(fields) < 11:
@@ -2899,22 +3355,14 @@ def _samtools_count_breakpoint_support(
         except ValueError:
             continue
         cigar = fields[5]
-        # Supplementary alignment tag indicates the read is split across loci.
-        has_sa = any(f.startswith("SA:Z:") for f in fields[11:])
-        # Soft/hard clips at either end ≥ min_clip flag a likely breakpoint.
-        clipped = False
-        m = re.match(r"^(\d+)[SH]", cigar)
-        if m and int(m.group(1)) >= min_clip:
-            clipped = True
-        m = re.search(r"(\d+)[SH]$", cigar)
-        if m and int(m.group(1)) >= min_clip:
-            clipped = True
-        if not (has_sa or clipped):
-            continue
-        # Require the alignment to cover at least one of the breakpoints
-        # within the flank window so we don't count clipped reads from
-        # unrelated nearby events as support for this SV.
-        if any(abs(read_pos - bp) <= flank_bp for bp in bp_set):
+        ref_end = read_pos + max(0, _cigar_ref_len(cigar) - 1)
+        if _cigar_indel_supports_call(
+            cigar, read_pos, pos, end,
+            svtype=svtype, svlen=svlen, flank_bp=flank_bp,
+        ) or _split_or_clip_supports_call(
+            cigar, read_pos, ref_end, fields, pos, end,
+            svtype=svtype, flank_bp=flank_bp, min_clip=min_clip,
+        ):
             support += 1
     return support
 
@@ -3011,6 +3459,7 @@ def validate_calls_with_reads(
         contig = call.ref_contig if call.coord_space == "reference" and call.ref_contig not in {"", "."} else call.query_contig
         support = _samtools_count_breakpoint_support(
             bam_sorted, contig, call.pos, call.end,
+            svtype=call.svtype, svlen=call.svlen,
             flank_bp=flank_bp, min_clip=30,
         )
         validated = support >= min_support
@@ -3031,7 +3480,12 @@ def validate_calls_with_reads(
 
 
 def compile_binary_if_needed(binary_path: Path, force: bool = False) -> None:
-    if binary_path.exists() and not force:
+    sources = [ROOT / "main.cpp", *ROOT.glob("*.hpp")]
+    needs_build = force or not binary_path.exists()
+    if not needs_build and binary_path.exists():
+        bin_mtime = binary_path.stat().st_mtime
+        needs_build = any(src.exists() and src.stat().st_mtime > bin_mtime for src in sources)
+    if not needs_build:
         return
     run(["g++", "-O2", "-std=c++17", "-pthread", str(ROOT / "main.cpp"), "-o", str(binary_path)], cwd=ROOT)
 
@@ -3243,6 +3697,7 @@ def run_syri_for_query(query_row: dict[str, str], out_dir: Path, threads: int) -
         # with a non-zero exit. Treat as "no comparator output" rather than
         # propagating the failure up to abort the whole panel.
         sys.stderr.write(f"[warn] syri rejected {query_asm} (likely too divergent): {exc}\n")
+        _log_comparator_failure(out_dir, "syri", query_asm, f"divergent_or_alignment_failure rc={exc.returncode}")
         return None
     syri_tsv = work_dir / "syri_syri.out"
     if not syri_tsv.exists():
@@ -3441,6 +3896,15 @@ def _long_read_preset(query_row: dict[str, str]) -> str:
     return "map-ont"
 
 
+def _existing_variants_vcf(work_dir: Path) -> Path | None:
+    candidates = [work_dir / "variants.vcf"]
+    candidates.extend(sorted(work_dir.rglob("variants.vcf")))
+    for cand in candidates:
+        if cand.exists() and cand.stat().st_size > 0:
+            return cand
+    return None
+
+
 def run_svim_for_query(query_row: dict[str, str], out_dir: Path, threads: int) -> dict[str, str] | None:
     """SVIM: long-read SV caller. Produces variants.vcf in its output dir."""
     if not tool_path("svim"):
@@ -3461,13 +3925,17 @@ def run_svim_for_query(query_row: dict[str, str], out_dir: Path, threads: int) -
             cwd=ROOT,
         )
     except subprocess.CalledProcessError:
-        return None
-    vcf_path = svim_out / "variants.vcf"
-    if not vcf_path.exists():
-        candidates = sorted(svim_out.rglob("variants.vcf"))
-        if not candidates:
+        vcf_path = _existing_variants_vcf(svim_out)
+        if vcf_path is None:
             return None
-        vcf_path = candidates[0]
+        sys.stderr.write(
+            f"[warn] svim exited non-zero for {query_asm}, but produced "
+            f"{vcf_path}; keeping VCF output\n"
+        )
+        return {"label": "svim", "vcf": str(vcf_path)}
+    vcf_path = _existing_variants_vcf(svim_out)
+    if vcf_path is None:
+        return None
     return {"label": "svim", "vcf": str(vcf_path)}
 
 
@@ -3804,14 +4272,18 @@ def run_svim_asm_for_query(query_row: dict[str, str], out_dir: Path, threads: in
             cwd=ROOT,
         )
     except subprocess.CalledProcessError:
-        return None
-
-    vcf_path = svim_out / "variants.vcf"
-    if not vcf_path.exists():
-        candidates = sorted(svim_out.rglob("variants.vcf"))
-        if not candidates:
+        vcf_path = _existing_variants_vcf(svim_out)
+        if vcf_path is None:
             return None
-        vcf_path = candidates[0]
+        sys.stderr.write(
+            f"[warn] svim-asm exited non-zero for {query_asm}, but produced "
+            f"{vcf_path}; keeping VCF output\n"
+        )
+        return {"label": "svim_asm", "vcf": str(vcf_path)}
+
+    vcf_path = _existing_variants_vcf(svim_out)
+    if vcf_path is None:
+        return None
     return {"label": "svim_asm", "vcf": str(vcf_path)}
 
 
@@ -3976,8 +4448,11 @@ def join_biology_findings(
     if candidates_tsv is None or not candidates_tsv.exists():
         return
     rows: list[dict[str, Any]] = []
+    fieldnames: list[str] = []
     with candidates_tsv.open() as fh:
-        for row in csv.DictReader(fh, delimiter="\t"):
+        reader = csv.DictReader(fh, delimiter="\t")
+        fieldnames = list(reader.fieldnames or [])
+        for row in reader:
             key = (
                 row.get("query_asm", "."),
                 row.get("query_contig", "."),
@@ -3991,6 +4466,11 @@ def join_biology_findings(
             row["mycosv_unique"] = "yes" if not supporters else "no"
             rows.append(row)
     if not rows:
+        if fieldnames:
+            for extra in BIOLOGY_FINDINGS_EXTRA_FIELDS:
+                if extra not in fieldnames:
+                    fieldnames.append(extra)
+            write_tsv(out_path, [], fieldnames)
         return
     fieldnames = list(rows[0].keys())
     write_tsv(out_path, rows, fieldnames)
@@ -4256,6 +4736,14 @@ def benchmark_real_data(args: argparse.Namespace) -> int:
         )
         return 0
 
+    query_manifest = cap_read_query_inputs(
+        query_manifest,
+        out_dir,
+        args.mode,
+        getattr(args, "max_comparator_short_reads", 150000),
+        getattr(args, "max_comparator_long_reads", 20000),
+    )
+
     # Pre-flight: report which comparators are available / missing and write a
     # COMPARATORS_STATUS.txt so the user does not need to grep through logs.
     _report_comparator_status(args, out_dir)
@@ -4357,6 +4845,7 @@ def benchmark_real_data(args: argparse.Namespace) -> int:
                 result = run_syri_for_query(query_row, out_dir, args.threads)
             except Exception as exc:  # pragma: no cover - defensive
                 sys.stderr.write(f"[warn] syri failed for {query_row['query_asm']}: {exc}\n")
+                _log_comparator_failure(out_dir, "syri", query_row["query_asm"], f"exception:{exc}")
                 continue
             if result:
                 truth_sets[query_row["query_asm"]][("query", "syri")] = load_syri_query_calls(Path(result["normalized_tsv"]), query_row["query_asm"])
@@ -4367,6 +4856,7 @@ def benchmark_real_data(args: argparse.Namespace) -> int:
                 result = run_minigraph_for_query(query_row, out_dir, args.threads, args.minigraph_arg)
             except Exception as exc:  # pragma: no cover - defensive
                 sys.stderr.write(f"[warn] minigraph failed for {query_row['query_asm']}: {exc}\n")
+                _log_comparator_failure(out_dir, "minigraph", query_row["query_asm"], f"exception:{exc}")
                 continue
             if result:
                 truth_sets[query_row["query_asm"]][("reference", "minigraph")] = load_minigraph_bubble_calls(
@@ -4388,6 +4878,7 @@ def benchmark_real_data(args: argparse.Namespace) -> int:
                 )
             except Exception as exc:  # pragma: no cover - defensive
                 sys.stderr.write(f"[warn] pggb failed for {query_row['query_asm']}: {exc}\n")
+                _log_comparator_failure(out_dir, "pggb", query_row["query_asm"], f"exception:{exc}")
                 continue
             if result:
                 truth_sets[query_row["query_asm"]][("reference", "pggb")] = load_reference_vcf_calls(
@@ -4422,6 +4913,7 @@ def benchmark_real_data(args: argparse.Namespace) -> int:
                 sys.stderr.write(
                     f"[warn] {label} failed for {query_row['query_asm']}: {exc}\n"
                 )
+                _log_comparator_failure(out_dir, label, query_row["query_asm"], f"exception:{exc}")
                 continue
             if not result:
                 continue
@@ -4457,6 +4949,7 @@ def benchmark_real_data(args: argparse.Namespace) -> int:
                 sys.stderr.write(
                     f"[warn] {label} failed for {query_row['query_asm']}: {exc}\n"
                 )
+                _log_comparator_failure(out_dir, label, query_row["query_asm"], f"exception:{exc}")
                 continue
             if not result:
                 continue
@@ -4467,6 +4960,11 @@ def benchmark_real_data(args: argparse.Namespace) -> int:
 
     agreement_rows: list[dict[str, Any]] = []
     read_validated_truth_rows: list[dict[str, Any]] = []
+    # Write a header-only placeholder up front so a SLURM time-out (or any
+    # mid-run kill) still leaves the visualization a parseable file. The final
+    # write_tsv at the end of benchmark() overwrites this with the populated
+    # rows when we reach it.
+    write_tsv(out_dir / "read_validated_truth.tsv", [], READ_VALIDATION_FIELDS)
     support_by_key: dict[tuple[str, str, int, int, str], list[str]] = defaultdict(list)
     summary_json: dict[str, Any] = {
         "mode": args.mode,
@@ -4700,6 +5198,35 @@ def benchmark_real_data(args: argparse.Namespace) -> int:
                         pred_calls=cmp_calls,
                     ))
 
+        # Always validate MycoSV's own reference-coordinate predictions
+        # against the held-out reads/assembly. Previously this branch only
+        # ran in --mycosv-only mode, so the regular real-data flow had
+        # comparator truth sets in read_validated_truth.tsv but nothing
+        # tagged source=mycosv. With the gate lifted, every panel/mode
+        # now reports concrete read_support counts for MycoSV's own calls.
+        if (
+            getattr(args, "validate_with_reads", False)
+            and tool_path("samtools") is not None
+            and tool_path("minimap2") is not None
+            and mycosv_ref_calls
+        ):
+            val_dir = out_dir / "read_validation" / query_asm / "mycosv_reference"
+            kept_calls, support_rows = validate_calls_with_reads(
+                mycosv_ref_calls,
+                query_row,
+                val_dir,
+                threads=args.threads,
+                min_support=args.read_validation_min_support,
+                flank_bp=args.read_validation_flank_bp,
+            )
+            read_validated_truth_rows.extend(support_rows)
+            summary_json["queries"][query_asm]["read_validation"] = {
+                "source": "mycosv_reference",
+                "input_calls": len(mycosv_ref_calls),
+                "read_validated": len(kept_calls),
+                "min_split_reads": args.read_validation_min_support,
+            }
+
     # If no comparator was available (e.g. all of pggb/minigraph/syri/svim_asm
     # missing on this host) the per-query exact benchmarks above produce zero
     # rows, leaving exact_benchmark_summary.tsv header-only and the merged
@@ -4746,13 +5273,11 @@ def benchmark_real_data(args: argparse.Namespace) -> int:
     with (out_dir / "benchmark_summary.json").open("w", encoding="utf-8") as fh:
         json.dump(summary_json, fh, indent=2, sort_keys=True)
 
-    if read_validated_truth_rows:
-        write_tsv(
-            out_dir / "read_validated_truth.tsv",
-            read_validated_truth_rows,
-            ["query_asm", "ref_contig", "pos", "end", "svtype", "source",
-             "coord_space", "read_support", "read_validated"],
-        )
+    write_tsv(
+        out_dir / "read_validated_truth.tsv",
+        read_validated_truth_rows,
+        READ_VALIDATION_FIELDS,
+    )
 
     all_mycosv_calls = [call for rows in mycosv_calls_by_query.values() for call in rows.get("query", [])]
     novel_rows = []
@@ -4825,7 +5350,7 @@ def prepare_million_real(args: argparse.Namespace) -> int:
     """
     out_dir = args.out_dir.resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
-    cache_dir = args.data_cache_dir.resolve() if args.data_cache_dir else out_dir
+    cache_dir = data_cache_base(args, out_dir)
     refs_dir = cache_dir / "refs"
     refs_dir.mkdir(parents=True, exist_ok=True)
     index_dir = out_dir / "index"
@@ -4842,7 +5367,12 @@ def prepare_million_real(args: argparse.Namespace) -> int:
     # the step look frozen even when it was making real progress.
     summary_url = NCBI_ASSEMBLY_SUMMARY[args.source]
     print(f"[1/4] Fetching NCBI assembly summary: {summary_url}", flush=True)
-    all_rows = parse_assembly_summary(http_get_text(summary_url))
+    all_rows = parse_assembly_summary(
+        http_get_text_cached(
+            summary_url,
+            cache_dir / "assembly_summaries" / f"{args.source}_fungi_assembly_summary.txt",
+        )
+    )
     print(f"      parsed {len(all_rows)} rows from {args.source}", flush=True)
 
     selected = select_all_public_rows(
@@ -4858,7 +5388,7 @@ def prepare_million_real(args: argparse.Namespace) -> int:
     # Step 2: resolve taxonomy lineages for all selected rows.
     print("[2/4] Resolving NCBI taxonomy lineages...", flush=True)
     taxids = sorted({row.get("taxid", "") for row in selected if row.get("taxid")})
-    taxonomy_cache = fetch_taxonomy_lineages(taxids, cache_path=out_dir / "taxonomy_cache.json")
+    taxonomy_cache = fetch_taxonomy_lineages(taxids, cache_path=cache_dir / "taxonomy_cache.json")
 
     # Step 3: download each assembly FASTA (or re-use existing on disk) and
     # build the hierarchy manifest the MycoSV binary consumes.
@@ -4868,18 +5398,28 @@ def prepare_million_real(args: argparse.Namespace) -> int:
     # Emit one progress line every 200 examined rows + one every 60 s of wall
     # clock so the operator can tell the difference between "downloading" and
     # "stuck", and bail individual rows that exceed _HTTP_TIMEOUT.
-    print(f"[3/4] Downloading up to {len(selected)} assemblies -> {refs_dir}", flush=True)
+    # Parallel download. The serial loop spent ~3 h on ~3300/10000 rows in
+    # production because every NCBI fetch was synchronous; threading is safe
+    # since materialize_entry is per-URL and disk-cached. Workers are tunable
+    # via MILLION_REAL_DOWNLOAD_WORKERS — 16 saturates a typical RDS NIC
+    # without overrunning NCBI's per-IP rate limits. Cached rows return
+    # near-instantly so a re-launch after timeout naturally resumes.
+    download_workers = max(
+        1, int(os.environ.get("MILLION_REAL_DOWNLOAD_WORKERS", "16"))
+    )
+    print(
+        f"[3/4] Downloading up to {len(selected)} assemblies -> {refs_dir} "
+        f"(workers={download_workers})",
+        flush=True,
+    )
     ref_manifest_rows: list[dict[str, str]] = []
     ref_list_paths: list[str] = []
     source_link_rows: list[dict[str, str]] = []
-    download_count = 0
-    examined = 0
-    last_progress_t = time.monotonic()
-    for row in selected:
-        examined += 1
+
+    def _download_one(row: dict[str, str]) -> tuple[dict[str, str] | None, dict[str, str] | None]:
         asm_name = row.get("assembly_accession", "").replace(".", "_")
         if not asm_name:
-            continue
+            return None, None
         lineage = taxonomy_cache.get(row.get("taxid", ""), {})
         fasta_path: Path | None = None
         for url, filename in ncbi_download_targets(row, include_gff=False):
@@ -4894,10 +5434,9 @@ def prepare_million_real(args: argparse.Namespace) -> int:
                 fasta_path = None
             break
         if fasta_path is None or not fasta_path.exists():
-            continue
-        download_count += 1
+            return None, None
         species = lineage.get("species") or row.get("organism_name", ".") or "."
-        ref_manifest_rows.append({
+        manifest_row = {
             "asm_name": asm_name,
             "phylum": lineage.get("phylum", "."),
             "class": lineage.get("class", "."),
@@ -4907,9 +5446,8 @@ def prepare_million_real(args: argparse.Namespace) -> int:
             "clade_name": species,
             "clade_rank": "species",
             "fasta_path": str(fasta_path),
-        })
-        ref_list_paths.append(str(fasta_path))
-        source_link_rows.append({
+        }
+        source_row = {
             "query_asm": asm_name,
             "role": "ref",
             "query_mode": "assembly",
@@ -4918,15 +5456,37 @@ def prepare_million_real(args: argparse.Namespace) -> int:
             "source_url": row.get("ftp_path", "."),
             "local_path": str(fasta_path),
             "species": species,
-        })
-        now = time.monotonic()
-        if download_count % 200 == 0 or (now - last_progress_t) >= 60.0:
-            print(
-                f"      ... examined {examined}/{len(selected)} "
-                f"available={download_count}",
-                flush=True,
-            )
-            last_progress_t = now
+        }
+        return manifest_row, source_row
+
+    examined = 0
+    download_count = 0
+    last_progress_t = time.monotonic()
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    with ThreadPoolExecutor(max_workers=download_workers) as pool:
+        futures = {pool.submit(_download_one, row): row for row in selected}
+        for fut in as_completed(futures):
+            examined += 1
+            try:
+                manifest_row, source_row = fut.result()
+            except Exception as exc:
+                sys.stderr.write(f"[warn] download worker raised: {exc}\n")
+                sys.stderr.flush()
+                manifest_row = source_row = None
+            if manifest_row is not None and source_row is not None:
+                ref_manifest_rows.append(manifest_row)
+                ref_list_paths.append(manifest_row["fasta_path"])
+                source_link_rows.append(source_row)
+                download_count += 1
+            now = time.monotonic()
+            if examined % 200 == 0 or (now - last_progress_t) >= 60.0:
+                print(
+                    f"      ... examined {examined}/{len(selected)} "
+                    f"available={download_count}",
+                    flush=True,
+                )
+                last_progress_t = now
 
     if not ref_manifest_rows:
         raise RuntimeError("No assemblies were successfully downloaded — aborting indexing.")
@@ -5054,6 +5614,8 @@ def prepare_million_real(args: argparse.Namespace) -> int:
 
     summary = {
         "out_dir": str(out_dir),
+        "data_cache_dir": str(cache_dir),
+        "assembly_summary_cache": str(cache_dir / "assembly_summaries" / f"{args.source}_fungi_assembly_summary.txt"),
         "source": args.source,
         "max_assemblies_requested": args.max_assemblies,
         "assemblies_downloaded": download_count,
@@ -5132,7 +5694,7 @@ def build_parser() -> argparse.ArgumentParser:
     smr.add_argument("--max-clade-genomes", type=int, default=32)
     smr.add_argument("--binary-path", type=Path, default=DEFAULT_BIN)
     smr.add_argument("--force-rebuild", action="store_true")
-    smr.add_argument("--data-cache-dir", type=Path, default=DEFAULT_DATA_CACHE, help="Shared directory for downloaded FASTA files; reused across runs to avoid re-downloading. Defaults to data_cache/ next to this script.")
+    smr.add_argument("--data-cache-dir", type=Path, default=DEFAULT_DATA_CACHE, help="Shared directory for downloaded FASTA/GFF/FASTQ files and metadata caches; reused across runs to avoid re-downloading. Defaults to data_cache/ next to this script.")
     smr.add_argument(
         "--million-real-queries", type=int, default=0,
         help=(
@@ -5178,7 +5740,7 @@ def build_parser() -> argparse.ArgumentParser:
     spp.add_argument("--query-mode", default="assembly", choices=["assembly", "short-reads", "long-reads", "mixed"], help="Which query modes to prepare. 'mixed' produces assembly + short-reads + long-reads queries for each panel species. Read-mode queries come from ENA filereport lookups.")
     spp.add_argument("--read-accessions-per-species", type=int, default=0, help="For each panel species and each requested reads mode, download up to this many public ENA read runs. Set to 0 to disable reads-mode query generation.")
     spp.add_argument("--ena-max-rows-per-species", type=int, default=200, help="Maximum read_run rows to pull from ENA per species before filtering by platform.")
-    spp.add_argument("--data-cache-dir", type=Path, default=DEFAULT_DATA_CACHE, help="Shared directory for downloaded FASTA files; reused across runs to avoid re-downloading. Defaults to data_cache/ next to this script.")
+    spp.add_argument("--data-cache-dir", type=Path, default=DEFAULT_DATA_CACHE, help="Shared directory for downloaded FASTA/GFF/FASTQ files and metadata caches; reused across runs to avoid re-downloading. Defaults to data_cache/ next to this script.")
 
     sb = sub.add_parser("benchmark", help="Run MycoSV on a prepared real-data panel and compare to exact normalized truth/query-aware callsets.")
     sb.add_argument("--prepared-dir", type=Path, required=True)
@@ -5224,6 +5786,12 @@ def build_parser() -> argparse.ArgumentParser:
     sb.add_argument("--run-cutesv", action="store_true", help="For long-read queries, run cuteSV on a minimap2 alignment and parse its reference-coordinate VCF.")
     sb.add_argument("--run-delly", action="store_true", help="For short-read queries, run Delly (germline SV mode) on a minimap2 -ax sr alignment.")
     sb.add_argument("--run-manta", action="store_true", help="For short-read queries, run Manta (configManta.py + runWorkflow.py) on a minimap2 -ax sr alignment.")
+    sb.add_argument("--max-comparator-short-reads", type=int, default=150000,
+                    help="Cap short-read FASTQ records used by external comparators "
+                         "and read validation. 0 disables subsetting (default: 150000).")
+    sb.add_argument("--max-comparator-long-reads", type=int, default=20000,
+                    help="Cap long-read FASTQ records used by external comparators "
+                         "and read validation. 0 disables subsetting (default: 20000).")
     sb.add_argument("--normalized-other", action="append", default=[], metavar="LABEL=PATH", help="Additional normalized TSV callsets to benchmark against. TSVs may use query or reference coordinates via a coord_space column.")
     sb.add_argument("--other-vcf", action="append", default=[], metavar="LABEL=PATH", help="Additional reference-coordinate VCF comparator output, best for single-query or pairwise benchmark runs.")
     sb.add_argument("--mycosv-arg", action="append", default=[], help="Extra argument to pass through to the MycoSV binary; may be used multiple times.")

@@ -24,7 +24,8 @@ WORK_DIR="/mnt/bmh01-rds/Shilpa_Group/2024/projects/fungi/AMF/scale"
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 EXPERIMENT_TYPE="${1:-all}"  # all, simulated, real, million-real
 
-# Shared download cache: FASTA files downloaded here are reused across runs.
+# Shared download cache: FASTA/GFF/FASTQ files and metadata fetched here are
+# reused across timestamped experiment runs.
 DATA_CACHE_DIR="${DATA_CACHE_DIR:-${WORK_DIR}/data_cache}"
 mkdir -p "${DATA_CACHE_DIR}"
 
@@ -32,8 +33,17 @@ mkdir -p "${DATA_CACHE_DIR}"
 EXPERIMENT_TYPE="${EXPERIMENT_TYPE#--}"
 
 # How many real NCBI fungal assemblies to download when building the real
-# million-scale routing index. Override with env var when needed.
-MILLION_REAL_MAX_ASSEMBLIES="${MILLION_REAL_MAX_ASSEMBLIES:-10000}"
+# million-scale routing index. A full 10000-assembly pull is appropriate for a
+# dedicated --million-real run, but it does not fit comfortably inside the
+# comprehensive all-panels matrix on a 10-24h Slurm allocation. The all-mode
+# default still pads the routing store to one million centroids via decoys.
+if [[ -z "${MILLION_REAL_MAX_ASSEMBLIES:-}" ]]; then
+  if [[ "${EXPERIMENT_TYPE}" == "million-real" ]]; then
+    MILLION_REAL_MAX_ASSEMBLIES=10000
+  else
+    MILLION_REAL_MAX_ASSEMBLIES=2000
+  fi
+fi
 MILLION_REAL_TARGET_CENTROIDS="${MILLION_REAL_TARGET_CENTROIDS:-1000000}"
 # How many of the downloaded assemblies to hold out as MycoSV-only benchmark
 # queries (excluded from the index, then run end-to-end through indexing,
@@ -45,21 +55,74 @@ MILLION_REAL_QUERIES="${MILLION_REAL_QUERIES:-5}"
 # default fits a 12 GiB cgroup but can be raised on bigger nodes.
 MILLION_REAL_MAX_CLADE_GENOMES="${MILLION_REAL_MAX_CLADE_GENOMES:-8}"
 
+# Effective cgroup memory limit, when Slurm/cgroup v2 exposes one. This is
+# more useful than host RAM on shared HPC nodes: the failed 14535674 run had a
+# 64 GiB cgroup despite a larger physical node.
+detect_cgroup_memory_gib() {
+  local line rel cur candidate value depth i
+  local IFS='/'
+  local -a parts
+  [[ -r /proc/self/cgroup ]] || return 0
+  line="$(head -n 1 /proc/self/cgroup)"
+  [[ "${line}" == *"::"* ]] || return 0
+  rel="${line#*::}"
+  rel="${rel#/}"
+  cur="/sys/fs/cgroup"
+  read -r -a parts <<< "${rel}"
+  for (( depth=${#parts[@]}; depth>=0; depth-- )); do
+    candidate="${cur}"
+    for (( i=0; i<depth; i++ )); do
+      [[ -n "${parts[$i]}" ]] && candidate+="/${parts[$i]}"
+    done
+    candidate+="/memory.max"
+    [[ -r "${candidate}" ]] || continue
+    value="$(<"${candidate}")"
+    if [[ -n "${value}" && "${value}" != "max" ]]; then
+      echo $(( value / 1024 / 1024 / 1024 ))
+      return 0
+    fi
+  done
+}
+CGROUP_MEMORY_GIB="$(detect_cgroup_memory_gib)"
+
 # Worker threads passed to every tool that accepts a thread count:
 #   MycoSV binary (--threads / --tol-index-threads), minimap2 (-t),
 #   samtools sort (-@), sniffles2 (--threads), cuteSV (--threads),
 #   Delly (OMP_NUM_THREADS), Manta (-j), minigraph (-t), pggb (-t).
-THREADS="${THREADS:-32}"
+if [[ -z "${THREADS+x}" ]]; then
+  THREADS="${SLURM_CPUS_PER_TASK:-32}"
+  if [[ -n "${CGROUP_MEMORY_GIB}" && "${CGROUP_MEMORY_GIB}" -le 80 && "${THREADS}" -gt 16 ]]; then
+    THREADS=16
+  fi
+fi
+
+# AMF / repeat-rich assembly mode can still spike memory inside whole-contig
+# matching. Run those panel/mode invocations with a much smaller thread budget
+# by default; override if you are on a genuinely larger cgroup.
+REAL_HEAVY_ASSEMBLY_THREADS="${REAL_HEAVY_ASSEMBLY_THREADS:-1}"
+REAL_HEAVY_SA_MAX_CONTIG_MB="${REAL_HEAVY_SA_MAX_CONTIG_MB:-25}"
+
+# Timeout used inside run_real_fungal_benchmark.py for individual external
+# tool calls. Keep it at least as large as the assembly benchmark cap so AMF
+# MycoSV runs are governed by the stage timeout, not an older 2h hard stop.
+export MYCOSV_TOOL_TIMEOUT="${MYCOSV_TOOL_TIMEOUT:-14400}"
 
 # Per-panel/per-mode wall-clock budget. A single benchmark invocation that
 # overruns this limit is killed and the next mode/panel still runs — without
 # it, one slow panel (typically AMF assembly mode where cactus chews on
 # ~1 Gbp Rhizophagus genomes) consumes the SLURM time budget and starves
-# every subsequent panel in the matrix. Defaults: 4h for assembly mode,
-# 2h for read modes. Override via env var when running on long-walltime
-# partitions. Set to 0 to disable the cap.
-BENCHMARK_TIMEOUT_ASSEMBLY="${BENCHMARK_TIMEOUT_ASSEMBLY:-4h}"
-BENCHMARK_TIMEOUT_READS="${BENCHMARK_TIMEOUT_READS:-2h}"
+# every subsequent panel in the matrix. Defaults are intentionally 50 %
+# wider than MYCOSV_TOOL_TIMEOUT so a 4h MycoSV invocation still leaves
+# the comparators time to run. Override via env var when running on
+# long-walltime partitions. Set to 0 to disable the cap.
+BENCHMARK_TIMEOUT_ASSEMBLY="${BENCHMARK_TIMEOUT_ASSEMBLY:-6h}"
+BENCHMARK_TIMEOUT_READS="${BENCHMARK_TIMEOUT_READS:-6h}"
+
+# Bound public-read comparator inputs. MycoSV caps read consumption internally,
+# but tools such as SVIM/Sniffles/cuteSV/Delly/Manta align the FASTQ path they
+# are given. These caps keep public ENA runs from dominating wall time.
+MAX_COMPARATOR_SHORT_READS="${MAX_COMPARATOR_SHORT_READS:-150000}"
+MAX_COMPARATOR_LONG_READS="${MAX_COMPARATOR_LONG_READS:-20000}"
 
 # Comma-separated list of panel names whose assembly-mode benchmark should
 # skip cactus / pggb / anchorwave. These three are the heaviest comparators
@@ -175,8 +238,8 @@ if [[ "$EXPERIMENT_TYPE" == "all" || "$EXPERIMENT_TYPE" == "million-real" ]]; th
   # Wall-clock caps per sub-step so a slow NCBI download burst or runaway
   # binary cannot starve the rest of the matrix.  Override / disable with
   # MILLION_REAL_PREPARE_TIMEOUT=0 / MILLION_REAL_BENCH_TIMEOUT=0.
-  MILLION_REAL_PREPARE_TIMEOUT="${MILLION_REAL_PREPARE_TIMEOUT:-${MILLION_REAL_TIMEOUT:-3h}}"
-  MILLION_REAL_BENCH_TIMEOUT="${MILLION_REAL_BENCH_TIMEOUT:-2h}"
+  MILLION_REAL_PREPARE_TIMEOUT="${MILLION_REAL_PREPARE_TIMEOUT:-${MILLION_REAL_TIMEOUT:-8h}}"
+  MILLION_REAL_BENCH_TIMEOUT="${MILLION_REAL_BENCH_TIMEOUT:-4h}"
 
   prepare_million_succeeded=0
   # ── 2a) prepare: download assemblies, build the routing index, hold out
@@ -225,13 +288,14 @@ if [[ "$EXPERIMENT_TYPE" == "all" || "$EXPERIMENT_TYPE" == "million-real" ]]; th
     mkdir -p "${bench_dir}"
     # Read-level validation needs a single per-query benchmark_ref_fasta;
     # in the million-real flow that ref is a sibling-genus assembly chosen
-    # by prepare-million-real. We keep validation OFF by default to bound
-    # wall time on big indexes — set MILLION_REAL_VALIDATE_WITH_READS=1 to
-    # turn it back on.
-    val_flag="--no-validate-with-reads"
-    if [[ "${MILLION_REAL_VALIDATE_WITH_READS:-0}" == "1" ]]; then
-      val_flag="--validate-with-reads"
+    # by prepare-million-real. It is ON by default so million-real produces
+    # read_validated_truth.tsv / benchmark_summary.json support counts; set
+    # MILLION_REAL_VALIDATE_WITH_READS=0 to skip on very tight walltime runs.
+    val_flag="--validate-with-reads"
+    if [[ "${MILLION_REAL_VALIDATE_WITH_READS:-1}" == "0" ]]; then
+      val_flag="--no-validate-with-reads"
     fi
+    million_real_readval_support="${MILLION_REAL_READ_VALIDATION_MIN_SUPPORT:-1}"
     bench_cmd=(python3 -u run_real_fungal_benchmark.py benchmark
         --prepared-dir "${MILLION_REAL_DIR}"
         --out-dir "${bench_dir}"
@@ -241,6 +305,7 @@ if [[ "$EXPERIMENT_TYPE" == "all" || "$EXPERIMENT_TYPE" == "million-real" ]]; th
         --mycosv-only
         --reuse-index-dir "${MILLION_REAL_DIR}/index"
         --reuse-registry-dir "${MILLION_REAL_DIR}/registry"
+        --read-validation-min-support "${million_real_readval_support}"
         "${val_flag}")
     if [[ -n "${MILLION_REAL_BENCH_TIMEOUT}" && "${MILLION_REAL_BENCH_TIMEOUT}" != "0" ]] && command -v timeout >/dev/null; then
       bench_cmd=(timeout --signal=TERM --kill-after=60 "${MILLION_REAL_BENCH_TIMEOUT}" "${bench_cmd[@]}")
@@ -277,11 +342,13 @@ fi
 # ============================================================================
 
 if [[ "$EXPERIMENT_TYPE" == "all" || "$EXPERIMENT_TYPE" == "real" ]]; then
-  echo -e "${YELLOW}[3/4] Running real fungal data benchmarks...${NC}"
-  echo "      Panels: compact_yeast, amf_large, cross_phylum_hgt, te_rich_pathogen, two_speed_pathogen"
-  echo "      Output: ${REAL_DIR}"
+  IFS=',' read -r -a PANELS <<< "${REAL_PANELS:-compact_yeast,amf_large,cross_phylum_hgt,te_rich_pathogen,two_speed_pathogen}"
+  IFS=',' read -r -a REAL_MODES <<< "${REAL_BENCHMARK_MODES:-assembly,short-reads,long-reads}"
 
-  PANELS=("compact_yeast" "amf_large" "cross_phylum_hgt" "te_rich_pathogen" "two_speed_pathogen")
+  echo -e "${YELLOW}[3/4] Running real fungal data benchmarks...${NC}"
+  echo "      Panels: ${PANELS[*]}"
+  echo "      Modes: ${REAL_MODES[*]}"
+  echo "      Output: ${REAL_DIR}"
 
   for panel in "${PANELS[@]}"; do
     echo ""
@@ -299,6 +366,7 @@ if [[ "$EXPERIMENT_TYPE" == "all" || "$EXPERIMENT_TYPE" == "real" ]]; then
     REAL_MAX_ASMS_PER_SPECIES="${REAL_MAX_ASMS_PER_SPECIES:-3}"
     REAL_QUERIES_PER_SPECIES="${REAL_QUERIES_PER_SPECIES:-3}"
     REAL_MAX_QUERY_DOWNLOADS="${REAL_MAX_QUERY_DOWNLOADS:-6}"
+    REAL_READ_ACCESSIONS_PER_SPECIES="${REAL_READ_ACCESSIONS_PER_SPECIES:-1}"
     if python3 run_real_fungal_benchmark.py prepare \
         --out-dir "${PANEL_DIR}/prepared" \
         --panel "${panel}" \
@@ -308,7 +376,7 @@ if [[ "$EXPERIMENT_TYPE" == "all" || "$EXPERIMENT_TYPE" == "real" ]]; then
         --max-ref-downloads "${REAL_MAX_REF_DOWNLOADS}" \
         --max-query-downloads "${REAL_MAX_QUERY_DOWNLOADS}" \
         --query-mode mixed \
-        --read-accessions-per-species 2 \
+        --read-accessions-per-species "${REAL_READ_ACCESSIONS_PER_SPECIES}" \
         --allow-no-queries \
         --data-cache-dir "${DATA_CACHE_DIR}" \
         2>&1 | tee "${PANEL_DIR}/prepare.log"; then
@@ -336,7 +404,8 @@ if [[ "$EXPERIMENT_TYPE" == "all" || "$EXPERIMENT_TYPE" == "real" ]]; then
       continue
     fi
 
-    for mode in assembly short-reads long-reads; do
+    for mode in "${REAL_MODES[@]}"; do
+      [[ -z "${mode}" ]] && continue
       echo "    - Benchmarking mode: ${mode}..."
       mkdir -p "${PANEL_DIR}/benchmark_${mode}"
 
@@ -359,6 +428,17 @@ if [[ "$EXPERIMENT_TYPE" == "all" || "$EXPERIMENT_TYPE" == "real" ]]; then
       # Per-clade RAM cap for the MycoSV index build. Default 8 fits
       # comfortably in a 12 GiB cgroup; raise on larger nodes.
       REAL_MAX_CLADE_GENOMES="${REAL_MAX_CLADE_GENOMES:-8}"
+      benchmark_threads="${THREADS}"
+      mycosv_extra_args=()
+      if [[ "${mode}" == "assembly" ]] && [[ ",${HEAVY_COMPARATOR_SKIP_PANELS}," == *",${panel},"* ]]; then
+        benchmark_threads="${REAL_HEAVY_ASSEMBLY_THREADS}"
+        mycosv_extra_args=(
+          --mycosv-arg=--no-gfa
+          --mycosv-arg=--sa-max-contig-mb
+          --mycosv-arg="${REAL_HEAVY_SA_MAX_CONTIG_MB}"
+        )
+        echo "      [mem] heavy assembly settings: threads=${benchmark_threads}, MycoSV SA contig cap=${REAL_HEAVY_SA_MAX_CONTIG_MB} MB"
+      fi
 
       # Wrap the benchmark invocation in `timeout` so a single slow panel
       # (e.g. cactus on AMF-scale genomes) cannot consume the SLURM time
@@ -366,15 +446,21 @@ if [[ "$EXPERIMENT_TYPE" == "all" || "$EXPERIMENT_TYPE" == "real" ]]; then
       # (e.g. "4h", "30m") are passed straight through to GNU `timeout`.
       if [[ "${mode}" == "assembly" ]]; then
         bench_timeout="${BENCHMARK_TIMEOUT_ASSEMBLY}"
+        read_validation_min_support="${REAL_READ_VALIDATION_MIN_SUPPORT_ASSEMBLY:-1}"
       else
         bench_timeout="${BENCHMARK_TIMEOUT_READS}"
+        read_validation_min_support="${REAL_READ_VALIDATION_MIN_SUPPORT_READS:-3}"
       fi
       bench_cmd=(python3 run_real_fungal_benchmark.py benchmark
         --prepared-dir "${PANEL_DIR}/prepared"
         --mode "${mode}"
         --out-dir "${PANEL_DIR}/benchmark_${mode}"
-        --threads "${THREADS}"
+        --threads "${benchmark_threads}"
         --max-clade-genomes "${REAL_MAX_CLADE_GENOMES}"
+        --read-validation-min-support "${read_validation_min_support}"
+        --max-comparator-short-reads "${MAX_COMPARATOR_SHORT_READS}"
+        --max-comparator-long-reads "${MAX_COMPARATOR_LONG_READS}"
+        "${mycosv_extra_args[@]}"
         "${comparator_flags[@]}")
       if [[ -n "${bench_timeout}" && "${bench_timeout}" != "0" ]] && command -v timeout >/dev/null; then
         bench_cmd=(timeout --signal=TERM --kill-after=60 "${bench_timeout}" "${bench_cmd[@]}")

@@ -20,7 +20,6 @@ import sys
 from collections import defaultdict
 from pathlib import Path
 
-import run_real_fungal_benchmark as rfb
 from run_real_fungal_benchmark import (
     NormalizedCall,
     build_consensus_truth,

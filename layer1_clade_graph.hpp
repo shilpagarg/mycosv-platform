@@ -1117,6 +1117,7 @@ struct SuffixArray {
     std::vector<Mem> find_mems(const std::string& query, int minLen = 20) const {
         std::vector<Mem> out;
         if (sa.empty() || query.empty()) return out;
+        constexpr size_t kMaxMemsPerQuery = 500000;
         const int n  = static_cast<int>(text.size());
         const int qn = static_cast<int>(query.size());
 
@@ -1185,6 +1186,7 @@ struct SuffixArray {
                 m.rPos = sa[static_cast<size_t>(k)];
                 m.len  = best_len;
                 out.push_back(m);
+                if (out.size() >= kMaxMemsPerQuery) return out;
             }
             i += best_len;  // right-extension maximality
         }

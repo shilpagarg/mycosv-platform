@@ -863,8 +863,7 @@ static const RefContigInfo* best_ref_match(const SimpleRefIndex& refIdx,
 }
 
 static double kmer_overlap_fraction(const std::string& a, const std::string& b, int k) {
-    // Delegates to the canonical implementation in fungi_tol_bridge.hpp.
-    // The previous copy here was an exact duplicate that risked silent drift.
+    // Keep overlap thresholds and edge-case handling single-sourced.
     return tol::kmer_overlap_fraction(a, b, k);
 }
 
@@ -875,10 +874,7 @@ static std::string novelty_tier_for_overlap(double frac) {
 }
 
 static bool is_low_complexity_sequence(const std::string& seq) {
-    // Delegates to the canonical implementation in fungi_tol_bridge.hpp.
-    // The previous copy here capped 5-mer collection at 8 entries, which
-    // disagreed with the bridge version and caused different complexity
-    // classifications between the two fallback paths.
+    // Keep read-mode and assembly fallback complexity filters aligned.
     return tol::is_low_complexity_sequence(seq);
 }
 
@@ -1234,7 +1230,7 @@ static bool try_mem_chain_call_single_ref_cached(
         out.call.refPos = 0;
         out.call.refEnd = 0;
         out.call.pos = std::max(1, res.qBreakStart + 1);
-        out.call.end = std::max(out.call.pos, res.qBreakEnd > 0 ? res.qBreakEnd : out.call.pos);
+        out.call.end = std::max(out.call.pos, res.qBreakEnd >= 0 ? res.qBreakEnd + 1 : out.call.pos);
         out.call.svlen = res.svLen;
         out.call.genotype = "0/1";
         out.call.gq = 40.0;
@@ -1255,25 +1251,25 @@ static bool try_mem_chain_call_single_ref_cached(
             case T::INS:
                 out.call.type = "INS";
                 out.call.pantreeClass = "INS";
-                out.call.refPos = res.rBreakStart > 0 ? (res.rBreakStart + 1) : 0;
+                out.call.refPos = res.rBreakStart >= 0 ? (res.rBreakStart + 1) : 0;
                 out.call.refEnd = out.call.refPos;
                 break;
             case T::DEL:
                 out.call.type = "DEL";
                 out.call.pantreeClass = "DEL";
-                out.call.refPos = res.rBreakStart > 0 ? (res.rBreakStart + 1) : 0;
+                out.call.refPos = res.rBreakStart >= 0 ? (res.rBreakStart + 1) : 0;
                 out.call.refEnd = res.rBreakEnd > 0 ? res.rBreakEnd : out.call.refPos;
                 break;
             case T::INV:
                 out.call.type = "INV";
                 out.call.pantreeClass = "INV";
-                out.call.refPos = res.rBreakStart > 0 ? (res.rBreakStart + 1) : 0;
+                out.call.refPos = res.rBreakStart >= 0 ? (res.rBreakStart + 1) : 0;
                 out.call.refEnd = res.rBreakEnd > 0 ? res.rBreakEnd : out.call.refPos;
                 break;
             case T::DUP:
                 out.call.type = "DUP";
                 out.call.pantreeClass = "DUP";
-                out.call.refPos = res.rBreakStart > 0 ? (res.rBreakStart + 1) : 0;
+                out.call.refPos = res.rBreakStart >= 0 ? (res.rBreakStart + 1) : 0;
                 out.call.refEnd = res.rBreakEnd > 0 ? res.rBreakEnd : out.call.refPos;
                 break;
             case T::TRA:

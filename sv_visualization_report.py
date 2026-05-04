@@ -65,15 +65,30 @@ import argparse
 import base64
 import io
 import math
+import os
 import sys
-import textwrap
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
-import matplotlib.pyplot as plt
-import numpy as np
-import pandas as pd
+try:
+    import numpy as np
+    import pandas as pd
+except ModuleNotFoundError:
+    fallback_python = Path(
+        os.environ.get(
+            "MYCOSV_ENV_PYTHON",
+            "/mnt/bmh01-rds/Shilpa_Group/2024/projects/fungi/tools/envs/envs/fungi_graph_sv/bin/python",
+        )
+    )
+    if fallback_python.exists() and Path(sys.executable).resolve() != fallback_python.resolve():
+        os.execv(str(fallback_python), [str(fallback_python), *sys.argv])
+    raise
+
+try:
+    import matplotlib.pyplot as plt
+except ModuleNotFoundError:
+    plt = None
 
 
 # -----------------------------
@@ -175,6 +190,18 @@ def ensure_dir(path: Path) -> None:
 
 def save_df(df: pd.DataFrame, path: Path) -> None:
     df.to_csv(path, sep="\t", index=False)
+
+
+def plotting_available() -> bool:
+    return plt is not None
+
+
+def plotting_unavailable_html() -> str:
+    return (
+        "<p><i>Plotting skipped because matplotlib is not installed in this "
+        "Python environment. Summary tables and the HTML report were still "
+        "generated.</i></p>"
+    )
 
 
 
@@ -341,6 +368,11 @@ def build_simulated_section(sim_df: Optional[pd.DataFrame], outdir: Path) -> Tup
             preview = summary.head(20).to_html(index=False, border=0)
             blocks.append("<h3>Simulated benchmark summary</h3>" + preview)
 
+    if not plotting_available():
+        blocks.append(plotting_unavailable_html())
+        blocks.append("<p>This section summarizes caller performance on simulated truth sets, including accuracy, breakpoint precision, and size-stratified sensitivity.</p>")
+        return "\n".join(blocks), figs, tables
+
     if {"sv_type", "f1", "caller"}.issubset(sim_df.columns):
         fig = plot_grouped_metric(sim_df, "sv_type", "f1", "caller", "F1 by SV type and caller (simulated)")
         encoded = write_figure(fig, outdir / "sim_f1_by_svtype_caller.png")
@@ -401,6 +433,19 @@ def build_real_section(real_df: Optional[pd.DataFrame], metadata_df: Optional[pd
         metadata_df = harmonize_columns(metadata_df)
         if "sample" in real_df.columns and "sample" in metadata_df.columns:
             real_df = real_df.merge(metadata_df, on="sample", how="left", suffixes=("", "_meta"))
+
+    if not plotting_available():
+        if "sample" in real_df.columns:
+            burden = real_df.groupby("sample", dropna=False).size().reset_index(name="sv_count").sort_values("sv_count", ascending=False)
+            tables.append(burden)
+            save_df(burden, outdir / "real_sv_burden_by_sample.tsv")
+        if {"chrom", "sv_type"}.issubset(real_df.columns):
+            chrom_counts = real_df.groupby(["chrom", "sv_type"], dropna=False).size().reset_index(name="count")
+            tables.append(chrom_counts)
+            save_df(chrom_counts, outdir / "real_sv_by_chrom_and_type.tsv")
+        blocks.append(plotting_unavailable_html())
+        blocks.append("<p>This section summarizes real-data structural variant landscapes, sample burden, class composition, size distributions, and cohort-level heterogeneity.</p>")
+        return "\n".join(blocks), figs, tables
 
     if "sample" in real_df.columns:
         burden = real_df.groupby("sample", dropna=False).size().reset_index(name="sv_count").sort_values("sv_count", ascending=False)
@@ -483,6 +528,19 @@ def build_biology_section(bio_df: Optional[pd.DataFrame], outdir: Path) -> Tuple
     figs: List[FigureRecord] = []
     tables: List[pd.DataFrame] = []
     blocks: List[str] = []
+
+    if not plotting_available():
+        if "gene" in bio_df.columns:
+            gene_counts = top_n(bio_df, "gene", 20)
+            tables.append(gene_counts)
+            save_df(gene_counts, outdir / "biology_top_genes.tsv")
+        if "pathway" in bio_df.columns:
+            pathway_counts = top_n(bio_df, "pathway", 15)
+            tables.append(pathway_counts)
+            save_df(pathway_counts, outdir / "biology_top_pathways.tsv")
+        blocks.append(plotting_unavailable_html())
+        blocks.append("<p>This section summarizes recurrent genes, pathways, functional effects, and expression/copy-number links associated with SVs.</p>")
+        return "\n".join(blocks), figs, tables
 
     if "gene" in bio_df.columns:
         gene_counts = top_n(bio_df, "gene", 20)
@@ -858,6 +916,8 @@ def build_wins_matrix_section(
 ) -> Tuple[str, List[FigureRecord], List[pd.DataFrame]]:
     if real_df is None or real_df.empty:
         return ("<p>No real-data PR table provided — wins matrix skipped.</p>", [], [])
+    if not plotting_available():
+        return (plotting_unavailable_html(), [], [])
     df = real_df.copy()
     # Don't run real_df through harmonize_columns: the wins matrix needs the
     # raw `truth_label`, `svtype`, `method`, `f1`, and `query_asm` columns
@@ -887,6 +947,8 @@ def build_clade_te_hgt_section(
 ) -> Tuple[str, List[FigureRecord], List[pd.DataFrame]]:
     figs: List[FigureRecord] = []
     tables: List[pd.DataFrame] = []
+    if not plotting_available():
+        return plotting_unavailable_html(), [], []
 
     for src_df in [real_df, bio_df]:
         if src_df is None or src_df.empty:
@@ -1158,6 +1220,15 @@ def build_novel_questions_section(
     if joined.empty:
         return "<p>No MycoSV-unique novel SVs to highlight.</p>", [], []
 
+    save_df(joined, outdir / "novel_questions_joined.tsv")
+    if not plotting_available():
+        return (
+            "<p>Novel-SV biological-question table was generated, but plots "
+            "were skipped because matplotlib is not installed.</p>",
+            [],
+            [],
+        )
+
     figs: List[FigureRecord] = []
     for builder in (_novel_q1_hgt, _novel_q2_two_speed, _novel_q3_expression):
         try:
@@ -1171,7 +1242,6 @@ def build_novel_questions_section(
         if rec is not None:
             figs.append(rec)
 
-    save_df(joined, outdir / "novel_questions_joined.tsv")
     html_intro = (
         "<p>Three biological questions over the MycoSV-unique (novel) SV set, "
         "joined to <code>biology_findings.tsv</code> for element_class, "

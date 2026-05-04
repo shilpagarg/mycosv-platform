@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# install_tools_github_comparators.sh — install MycoSV comparator tools without Bioconda.
+# install_tools.sh — install MycoSV comparator tools without Bioconda.
 #
 # Installs the comparator pre-flight dependency closure from GitHub source trees,
 # GitHub-hosted release artifacts, or official GitHub/OCI containers for very
@@ -15,10 +15,10 @@
 #   delly/manta helpers: bcftools for BCF/VCF normalization
 #
 # Usage:
-#   bash install_tools_github_comparators.sh              # install comparator closure
-#   bash install_tools_github_comparators.sh --check      # report tool availability only
-#   bash install_tools_github_comparators.sh all          # install broad SV benchmark stack
-#   bash install_tools_github_comparators.sh syri pggb    # install selected tools
+#   bash install_tools.sh              # install comparator closure
+#   bash install_tools.sh --check      # report tool availability only
+#   bash install_tools.sh all          # install broad SV benchmark stack
+#   bash install_tools.sh syri pggb    # install selected tools
 #
 # Environment overrides:
 #   ENV_PATH=/path/to/conda/env
@@ -46,10 +46,10 @@ USE_APPTAINER="${USE_APPTAINER:-1}"
 CACTUS_MODE="${CACTUS_MODE:-container}"
 
 GREEN='\033[0;32m'; RED='\033[0;31m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'; NC='\033[0m'
-ok()   { printf "${GREEN}  OK    %s${NC}\n" "$*"; }
-fail() { printf "${RED}  FAIL  %s${NC}\n" "$*"; }
-info() { printf "${BLUE}  ->    %s${NC}\n" "$*"; }
-hdr()  { printf "\n${YELLOW}== %s ==${NC}\n" "$*"; }
+ok()   { printf '%b  OK    %s%b\n' "$GREEN" "$*" "$NC"; }
+fail() { printf '%b  FAIL  %s%b\n' "$RED" "$*" "$NC"; }
+info() { printf '%b  ->    %s%b\n' "$BLUE" "$*" "$NC"; }
+hdr()  { printf '\n%b== %s ==%b\n' "$YELLOW" "$*" "$NC"; }
 
 have() { command -v "$1" >/dev/null 2>&1; }
 need() { ! have "$1" || [[ "$FORCE" == "1" ]]; }

@@ -244,8 +244,8 @@ struct CladeGraphDescriptor {
 };
 
 // ── sanitize_name ─────────────────────────────────────────────────────────
-// Single authoritative implementation.  layer2 and layer3 duplicate it
-// locally to avoid circular includes but the character set is identical.
+// Shared sanitizer contract.  layer2 and layer3 keep local mirrors to avoid
+// circular includes; keep their accepted character set in sync with this one.
 inline std::string sanitize_name(const std::string& s) {
     if (s.empty()) return "unknown";
     std::string o;
@@ -321,9 +321,19 @@ inline uint64_t fnv1a_kmer(const char* p, int k) {
 inline std::unordered_set<uint64_t> kmer_hashes(const std::string& seq, int k) {
     std::unordered_set<uint64_t> out;
     if (k <= 0 || static_cast<int>(seq.size()) < k) return out;
-    out.reserve(seq.size() - static_cast<size_t>(k) + 1);
-    for (size_t i = 0; i + static_cast<size_t>(k) <= seq.size(); ++i)
+    const size_t nKmers = seq.size() - static_cast<size_t>(k) + 1;
+    // AMF assemblies can contain multi-hundred-Mbp contigs. Materialising every
+    // k-mer hash for whole-contig overlap checks can exhaust a 64 GiB Slurm
+    // cgroup, so use a deterministic sample for very large inputs.
+    constexpr size_t kMaxOverlapHashes = 200000;
+    const size_t step = std::max<size_t>(1, (nKmers + kMaxOverlapHashes - 1) / kMaxOverlapHashes);
+    out.reserve(std::min(nKmers, kMaxOverlapHashes));
+    for (size_t i = 0; i + static_cast<size_t>(k) <= seq.size(); i += step)
         out.insert(detail::fnv1a_kmer(seq.data() + i, k));
+    if (step > 1 && nKmers > 1) {
+        const size_t last = nKmers - 1;
+        out.insert(detail::fnv1a_kmer(seq.data() + last, k));
+    }
     return out;
 }
 
@@ -1957,25 +1967,25 @@ static bool try_mem_chain_call(
             case T::INS:
                 out.call.type = "INS";
                 out.call.pantreeClass = "INS";
-                out.call.refPos = res.rBreakStart > 0 ? (res.rBreakStart + 1) : 0;
+                out.call.refPos = res.rBreakStart >= 0 ? (res.rBreakStart + 1) : 0;
                 out.call.refEnd = out.call.refPos;
                 break;
             case T::DEL:
                 out.call.type = "DEL";
                 out.call.pantreeClass = "DEL";
-                out.call.refPos = res.rBreakStart > 0 ? (res.rBreakStart + 1) : 0;
+                out.call.refPos = res.rBreakStart >= 0 ? (res.rBreakStart + 1) : 0;
                 out.call.refEnd = res.rBreakEnd > 0 ? res.rBreakEnd : out.call.refPos;
                 break;
             case T::INV:
                 out.call.type = "INV";
                 out.call.pantreeClass = "INV";
-                out.call.refPos = res.rBreakStart > 0 ? (res.rBreakStart + 1) : 0;
+                out.call.refPos = res.rBreakStart >= 0 ? (res.rBreakStart + 1) : 0;
                 out.call.refEnd = res.rBreakEnd > 0 ? res.rBreakEnd : out.call.refPos;
                 break;
             case T::DUP:
                 out.call.type = "DUP";
                 out.call.pantreeClass = "DUP";
-                out.call.refPos = res.rBreakStart > 0 ? (res.rBreakStart + 1) : 0;
+                out.call.refPos = res.rBreakStart >= 0 ? (res.rBreakStart + 1) : 0;
                 out.call.refEnd = res.rBreakEnd > 0 ? res.rBreakEnd : out.call.refPos;
                 break;
             case T::TRA:

@@ -112,6 +112,43 @@ def test_load_mycosv_calls_match_full_fasta_qasm_alias(tmp_path: Path):
     assert ref_calls[0].pos == 101
 
 
+def test_calls_compatible_accepts_inv_whole_block_prediction():
+    truth = NormalizedCall("q1", "ctg", 5000, 5200, "INV", 200, "truth", coord_space="reference", ref_contig="chr1")
+    pred = NormalizedCall("q1", "ctg", 1000, 9000, "INV", 8000, "mycosv", coord_space="reference", ref_contig="chr1")
+    assert rrfb.calls_compatible(truth, pred)
+    assert score_callsets([truth], [pred])["tp"] == 1
+
+
+def test_cigar_indels_support_reference_breakpoints():
+    assert rrfb._cigar_indel_supports_call(
+        "100M75D200M",
+        1000,
+        1098,
+        1175,
+        svtype="DEL",
+        svlen=-75,
+        flank_bp=10,
+    )
+    assert rrfb._cigar_indel_supports_call(
+        "100M80I200M",
+        1000,
+        1099,
+        1099,
+        svtype="INS",
+        svlen=80,
+        flank_bp=10,
+    )
+    assert not rrfb._cigar_indel_supports_call(
+        "100M80I200M",
+        1000,
+        2000,
+        2000,
+        svtype="INS",
+        svlen=80,
+        flank_bp=10,
+    )
+
+
 def test_load_normalized_calls_tsv_supports_reference_space(tmp_path: Path):
     tsv = tmp_path / "other.tsv"
     tsv.write_text(
@@ -188,6 +225,41 @@ def test_materialize_query_input_supports_direct_fastq_urls(tmp_path: Path):
     assert query_row["query_mode"] == "short-reads"
     assert Path(query_path).exists()
     assert source_rows
+
+
+def test_prepare_custom_manifest_uses_shared_data_cache(tmp_path: Path):
+    import argparse
+
+    src = tmp_path / "src"
+    src.mkdir()
+    ref = src / "ref.fa"
+    qry = src / "query.fa"
+    ref.write_text(">ref\nACGTACGT\n", encoding="utf-8")
+    qry.write_text(">query\nACGTACGA\n", encoding="utf-8")
+    manifest = tmp_path / "manifest.tsv"
+    manifest.write_text(
+        "role\tasm_name\tpath\tspecies\n"
+        f"ref\tref_asm\t{ref}\tExample species\n"
+        f"query\tquery_asm\t{qry}\tExample species\n",
+        encoding="utf-8",
+    )
+
+    out_dir = tmp_path / "prepared"
+    cache_dir = tmp_path / "data_cache"
+    args = argparse.Namespace(
+        out_dir=out_dir,
+        custom_url_manifest=manifest,
+        data_cache_dir=cache_dir,
+        public_query_max_runs=1,
+    )
+
+    assert rrfb.prepare_from_custom_manifest(args) == 0
+    ref_list = (out_dir / "ref_list.txt").read_text(encoding="utf-8").strip()
+    query_list = (out_dir / "query_list.txt").read_text(encoding="utf-8").strip()
+    assert ref_list == str((cache_dir / "refs" / "ref.fa").resolve())
+    assert query_list == str((cache_dir / "queries" / "query.fa").resolve())
+    summary = (out_dir / "prepare_summary.json").read_text(encoding="utf-8")
+    assert str(cache_dir.resolve()) in summary
 
 
 def test_estimate_prepared_genome_size_hint_reads_gz_benchmark_reference(tmp_path: Path):
@@ -335,7 +407,9 @@ def test_prepare_million_real_holds_out_queries_and_strips_them_from_index(
         )
     monkeypatch.setattr(rrfb, "http_get_text", lambda url: fake_summary + "".join(rows))
 
+    taxonomy_cache_paths = []
     def fake_taxonomy(taxids, cache_path=None):
+        taxonomy_cache_paths.append(cache_path)
         out = {}
         for i, t in enumerate(taxids):
             phylum = "Ascomycota" if i < 3 else "Basidiomycota"
@@ -382,6 +456,7 @@ def test_prepare_million_real_holds_out_queries_and_strips_them_from_index(
     )
     rc = rrfb.prepare_million_real(args)
     assert rc == 0
+    assert taxonomy_cache_paths == [tmp_path / "cache" / "taxonomy_cache.json"]
 
     # The index manifest must NOT contain any of the held-out queries.
     hierarchy = (out_dir / "hierarchy_manifest.tsv").read_text(encoding="utf-8").splitlines()
@@ -509,3 +584,96 @@ def test_benchmark_real_data_mycosv_only_skips_comparators(tmp_path: Path, monke
                  "run_svim", "run_sniffles", "run_cutesv",
                  "run_delly", "run_manta"):
         assert getattr(args, flag) is False, flag
+
+
+def test_benchmark_mycosv_only_validates_mycosv_reference_calls(tmp_path: Path, monkeypatch):
+    """Million-real runs use --mycosv-only, so there is no comparator truth
+    to validate. Guard that read-level validation still records support for
+    MycoSV reference-coordinate calls when --validate-with-reads is enabled.
+    """
+    import argparse
+    import json
+
+    prepared = tmp_path / "prepared"
+    prepared.mkdir()
+    ref = prepared / "ref.fa"
+    ref.write_text(">chr1\n" + "ACGT" * 100 + "\n", encoding="utf-8")
+    (prepared / "ref_list.txt").write_text(str(ref) + "\n", encoding="utf-8")
+    (prepared / "query_list.txt").write_text(str(ref) + "\n", encoding="utf-8")
+    (prepared / "query_manifest.tsv").write_text(
+        "query_asm\tquery_mode\tpath\tbenchmark_ref_fasta\n"
+        f"q1\tassembly\t{ref}\t{ref}\n",
+        encoding="utf-8",
+    )
+    (prepared / "hierarchy_manifest.tsv").write_text(
+        "asm_name\tphylum\tclass\torder\tfamily\tgenus\tclade_name\tclade_rank\tfasta_path\n"
+        f"q1\t.\t.\t.\t.\t.\t.\tspecies\t{ref}\n",
+        encoding="utf-8",
+    )
+    vcf = prepared / "calls.vcf"
+    vcf.write_text(
+        "##fileformat=VCFv4.3\n"
+        "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tSAMPLE\n"
+        "qctg\t11\tsv1\tN\t<DEL>\t40\tPASS\t"
+        "SVTYPE=DEL;SVLEN=-50;END=11;REFCONTIG=chr1;REFPOS=101;REFEND=150;QASM=q1\tGT\t0/1\n",
+        encoding="utf-8",
+    )
+    hits = prepared / "calls.hits.tsv"
+    hits.write_text("", encoding="utf-8")
+    gfa = prepared / "calls.gfa"
+    gfa.write_text("", encoding="utf-8")
+
+    monkeypatch.setattr(rrfb, "tool_path", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(rrfb, "compile_binary_if_needed", lambda *a, **k: None)
+    monkeypatch.setattr(
+        rrfb, "run_mycosv",
+        lambda *a, **k: {"vcf": str(vcf), "hits": str(hits), "gfa": str(gfa)},
+    )
+    monkeypatch.setattr(rrfb, "maybe_run_candidate_analysis", lambda *a, **k: (None, None))
+
+    def fake_validate(calls, query_row, work_dir, *, threads, min_support, flank_bp):
+        assert len(calls) == 1
+        return list(calls), [{
+            "query_asm": query_row["query_asm"],
+            "ref_contig": calls[0].ref_contig,
+            "pos": calls[0].pos,
+            "end": calls[0].end,
+            "svtype": calls[0].svtype,
+            "source": calls[0].source,
+            "coord_space": calls[0].coord_space,
+            "read_support": min_support,
+            "read_validated": "yes",
+        }]
+
+    monkeypatch.setattr(rrfb, "validate_calls_with_reads", fake_validate)
+
+    args = argparse.Namespace(
+        prepared_dir=prepared,
+        out_dir=tmp_path / "out",
+        binary_path=tmp_path / "fake_bin",
+        force_rebuild=False,
+        mode="assembly",
+        threads=1,
+        max_clade_genomes=2,
+        run_all_comparators=False,
+        mycosv_only=True,
+        run_syri=False, run_minigraph=False, run_pggb=False,
+        run_cactus=False, run_svim_asm=False, run_anchorwave=False,
+        run_svim=False, run_sniffles=False, run_cutesv=False,
+        run_delly=False, run_manta=False,
+        cactus_arg=[],
+        normalized_other=[], other_vcf=[],
+        mycosv_arg=[], minigraph_arg=[], pggb_arg=[],
+        pggb_identity="90", pggb_segment_len="5k",
+        expression_tsv=None, gene_annotations_tsv=None, ancestral_tsv=None,
+        validate_with_reads=True,
+        read_validation_min_support=1,
+        read_validation_flank_bp=250,
+        reuse_index_dir=None, reuse_registry_dir=None,
+    )
+    assert rrfb.benchmark_real_data(args) == 0
+    readval = args.out_dir / "read_validated_truth.tsv"
+    assert readval.exists()
+    assert "mycosv" in readval.read_text(encoding="utf-8")
+    summary = json.loads((args.out_dir / "benchmark_summary.json").read_text(encoding="utf-8"))
+    assert summary["queries"]["q1"]["read_validation"]["read_validated"] == 1

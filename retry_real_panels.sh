@@ -54,6 +54,8 @@ if [[ ${#PANELS[@]} -eq 0 ]]; then
   PANELS=(compact_yeast amf_large cross_phylum_hgt te_rich_pathogen two_speed_pathogen)
 fi
 
+# Shared across retries and fresh prepares so large FASTA/GFF/FASTQ downloads
+# and metadata caches are not repeated for each timestamped run.
 DATA_CACHE_DIR="${DATA_CACHE_DIR:-${WORK_DIR}/data_cache}"
 
 cd "${WORK_DIR}"
@@ -104,6 +106,12 @@ retry_one_panel() {
 
   for mode in assembly short-reads long-reads; do
     local out="${panel_dir}/benchmark_${mode}_retry"
+    local read_validation_min_support
+    if [[ "${mode}" == "assembly" ]]; then
+      read_validation_min_support="${REAL_READ_VALIDATION_MIN_SUPPORT_ASSEMBLY:-1}"
+    else
+      read_validation_min_support="${REAL_READ_VALIDATION_MIN_SUPPORT_READS:-3}"
+    fi
     mkdir -p "${out}"
     echo "[retry] ${panel} / ${mode} -> ${out}" >&2
     python3 run_real_fungal_benchmark.py benchmark \
@@ -112,6 +120,7 @@ retry_one_panel() {
         --out-dir "${out}" \
         --threads "${THREADS}" \
         --max-clade-genomes "${REAL_MAX_CLADE_GENOMES}" \
+        --read-validation-min-support "${read_validation_min_support}" \
         --run-all-comparators \
         2>&1 | tee "${panel_dir}/benchmark_${mode}_retry.log"
   done
