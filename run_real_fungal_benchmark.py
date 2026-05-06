@@ -246,6 +246,56 @@ class NormalizedCall:
 _TOOL_TIMEOUT = int(os.environ.get("MYCOSV_TOOL_TIMEOUT", "14400"))
 
 
+def _stderr_tail(exc: BaseException, max_lines: int = 8) -> str:
+    """Last `max_lines` of captured stderr from a CalledProcessError, joined
+    into a single newline-prefixed string for inclusion in `[warn]` lines.
+    Returns "" if no stderr is available."""
+    raw = getattr(exc, "stderr", None)
+    if not raw:
+        return ""
+    if isinstance(raw, bytes):
+        try:
+            raw = raw.decode("utf-8", errors="replace")
+        except Exception:
+            raw = repr(raw)
+    lines = [ln for ln in raw.splitlines() if ln.strip()]
+    if not lines:
+        return ""
+    tail = lines[-max_lines:]
+    return "\n  | " + "\n  | ".join(tail)
+
+
+def _persist_stderr(work_dir: Path, label: str, exc: BaseException) -> Path | None:
+    """Dump full stderr (and stdout, if non-empty) to a per-failure log so the
+    exit-1/2 reason is recoverable after the run finishes. Returns the log
+    path on success, None if nothing to write."""
+    raw_err = getattr(exc, "stderr", None) or ""
+    raw_out = getattr(exc, "stdout", None) or ""
+    if isinstance(raw_err, bytes):
+        raw_err = raw_err.decode("utf-8", errors="replace")
+    if isinstance(raw_out, bytes):
+        raw_out = raw_out.decode("utf-8", errors="replace")
+    if not raw_err and not raw_out:
+        return None
+    try:
+        work_dir.mkdir(parents=True, exist_ok=True)
+        path = work_dir / f"{label}.stderr.log"
+        with path.open("w", encoding="utf-8") as fh:
+            if raw_err:
+                fh.write("=== stderr ===\n")
+                fh.write(raw_err)
+                if not raw_err.endswith("\n"):
+                    fh.write("\n")
+            if raw_out:
+                fh.write("=== stdout ===\n")
+                fh.write(raw_out)
+                if not raw_out.endswith("\n"):
+                    fh.write("\n")
+        return path
+    except OSError:
+        return None
+
+
 def _log_comparator_failure(out_dir: Path, label: str, query_asm: str, reason: str) -> None:
     """Append a structured failure row so the visualization (and any operator
     grep) can see exactly which (query, comparator) pairs lost coverage and
@@ -549,10 +599,68 @@ def normalise_download_url(raw: str) -> str:
 
 _HTTP_TIMEOUT = 300  # seconds; prevents hanging on slow/unresponsive NCBI
 
+# NCBI / EBI assembly mirrors return 503 in bursts when the server pool is
+# saturated, and 429 when we cross their rate limit.  These statuses are
+# transient: a short wait + retry recovers the vast majority of failures
+# the bulk download loop sees.  4xx other than 429 are permanent (e.g. 404
+# for an assembly that doesn't expose a GFF) and are not retried.
+_HTTP_RETRY_STATUS = {429, 500, 502, 503, 504}
+_HTTP_MAX_ATTEMPTS = 5
+_HTTP_BACKOFF_BASE = 2.0  # seconds; doubles each attempt -> 2,4,8,16
+_HTTP_BACKOFF_CAP  = 60.0
+
+
+def _http_retry_sleep(attempt: int, retry_after: str | None) -> float:
+    # Honor server-supplied Retry-After (seconds form; HTTP-date form is rare
+    # for these mirrors and we'd just fall back to the exponential schedule).
+    if retry_after:
+        try:
+            wait = float(retry_after.strip())
+            if wait > 0:
+                return min(wait, _HTTP_BACKOFF_CAP)
+        except ValueError:
+            pass
+    return min(_HTTP_BACKOFF_BASE * (2 ** attempt), _HTTP_BACKOFF_CAP)
+
+
+def _http_open_with_retry(req: urllib.request.Request):
+    """Open `req` with retry-on-transient-error.  Returns the urlopen response;
+    caller is responsible for closing it (use as a context manager)."""
+    last_exc: Exception | None = None
+    for attempt in range(_HTTP_MAX_ATTEMPTS):
+        try:
+            return urllib.request.urlopen(req, timeout=_HTTP_TIMEOUT)
+        except urllib.error.HTTPError as exc:
+            if exc.code not in _HTTP_RETRY_STATUS or attempt == _HTTP_MAX_ATTEMPTS - 1:
+                raise
+            retry_after = exc.headers.get("Retry-After") if exc.headers else None
+            wait = _http_retry_sleep(attempt, retry_after)
+            sys.stderr.write(
+                f"[retry] HTTP {exc.code} for {req.full_url}; sleeping {wait:.1f}s "
+                f"(attempt {attempt + 1}/{_HTTP_MAX_ATTEMPTS})\n"
+            )
+            sys.stderr.flush()
+            time.sleep(wait)
+            last_exc = exc
+        except (urllib.error.URLError, TimeoutError) as exc:
+            if attempt == _HTTP_MAX_ATTEMPTS - 1:
+                raise
+            wait = _http_retry_sleep(attempt, None)
+            sys.stderr.write(
+                f"[retry] network error for {req.full_url}: {exc}; "
+                f"sleeping {wait:.1f}s (attempt {attempt + 1}/{_HTTP_MAX_ATTEMPTS})\n"
+            )
+            sys.stderr.flush()
+            time.sleep(wait)
+            last_exc = exc
+    # Unreachable: the final attempt either returns or raises above.
+    assert last_exc is not None
+    raise last_exc
+
 
 def http_get_text(url: str) -> str:
     req = urllib.request.Request(url, headers={"User-Agent": "MycoSV-real-benchmark/1.0"})
-    with urllib.request.urlopen(req, timeout=_HTTP_TIMEOUT) as resp:
+    with _http_open_with_retry(req) as resp:
         return resp.read().decode("utf-8")
 
 
@@ -579,7 +687,7 @@ def http_download(url: str, dest: Path) -> Path:
     req = urllib.request.Request(url, headers={"User-Agent": "MycoSV-real-benchmark/1.0"})
     tmp = dest.with_suffix(dest.suffix + ".part")
     try:
-        with urllib.request.urlopen(req, timeout=_HTTP_TIMEOUT) as resp, tmp.open("wb") as out:
+        with _http_open_with_retry(req) as resp, tmp.open("wb") as out:
             shutil.copyfileobj(resp, out)
         tmp.rename(dest)
     except Exception:
@@ -715,6 +823,59 @@ def cap_read_query_inputs(
                 f"{row.get('query_asm', original.name)}: {kept} reads -> {capped_path}\n"
             )
     return capped_rows
+
+
+def filter_assembly_query_inputs(
+    query_manifest: list[dict[str, str]],
+    out_dir: Path,
+    max_contigs: int,
+    max_bp: int,
+) -> list[dict[str, str]]:
+    """Drop assembly queries that are too fragmented/large for matrix runs.
+
+    Some public fungal assemblies are MAG-style or highly fragmented drafts.
+    They are valid biological inputs, but they can make the hierarchical
+    assembly caller spend hours before producing a first VCF row. Filtering
+    them here keeps the panel matrix moving while recording exactly what was
+    skipped so the full query can be rerun separately on a long-walltime node.
+    """
+    if max_contigs <= 0 and max_bp <= 0:
+        return query_manifest
+
+    kept: list[dict[str, str]] = []
+    skipped: list[dict[str, str]] = []
+    for row in query_manifest:
+        query_path = locate_query_path(row)
+        n_contigs, total_bp, longest_bp = _fasta_stats(query_path)
+        reasons: list[str] = []
+        if max_contigs > 0 and n_contigs > max_contigs:
+            reasons.append(f"contigs>{max_contigs}")
+        if max_bp > 0 and total_bp > max_bp:
+            reasons.append(f"bp>{max_bp}")
+        if reasons:
+            skipped.append({
+                "query_asm": row.get("query_asm", query_path.name),
+                "path": str(query_path),
+                "contigs": str(n_contigs),
+                "total_bp": str(total_bp),
+                "longest_bp": str(longest_bp),
+                "reason": ",".join(reasons),
+            })
+            continue
+        kept.append(row)
+
+    if skipped:
+        skipped_path = out_dir / "SKIPPED_ASSEMBLY_QUERIES.tsv"
+        write_tsv(
+            skipped_path,
+            skipped,
+            ["query_asm", "path", "contigs", "total_bp", "longest_bp", "reason"],
+        )
+        sys.stderr.write(
+            f"[assembly-filter] skipped {len(skipped)} oversized/fragmented "
+            f"assembly query(s); kept {len(kept)}. Details: {skipped_path}\n"
+        )
+    return kept
 
 
 _FASTA_CONTIG_CACHE: dict[str, frozenset[str]] = {}
@@ -3575,6 +3736,12 @@ def run_mycosv(
                 f"[mycosv] reusing pre-built routing index at {idx_dir} "
                 f"(registry={reg_dir})\n"
             )
+            if "--no-flat-ref-fallback" not in caller_args:
+                caller_args.append("--no-flat-ref-fallback")
+                sys.stderr.write(
+                    "[mycosv] disabling flat reference fallback for reused "
+                    "hierarchical index to keep memory bounded\n"
+                )
         else:
             idx_dir = mycosv_dir / "idx"
             reg_dir = mycosv_dir / "reg"
@@ -3678,6 +3845,31 @@ def run_syri_for_query(query_row: dict[str, str], out_dir: Path, threads: int) -
     query_fa_plain = _ensure_plain_fasta(query_fa, work_dir)
     if query_fa_plain is None:
         return None
+
+    # SyRI's chrmatch heuristic (synsearchFunctions.pyx:438-465) auto-renames
+    # query contigs to the ref chromosome they best align to, then sys.exit(1)s
+    # with "Homologous chromosomes were not identified correctly" when more
+    # than one query contig competes for the same ref chromosome.  That's the
+    # default failure mode for fragmented MAG/bin queries (hundreds of small
+    # contigs) against a chromosome-level ref (~16 chromosomes for a yeast).
+    # Skip cleanly with a structured failure row rather than letting SyRI
+    # deterministically fail and emit a 30-line cmdline warning.  The 4x
+    # threshold is empirical: SyRI handles modest fragmentation but breaks
+    # once the query is dramatically more fragmented than the reference.
+    ref_n, _, _ = _fasta_stats(ref_fa_plain)
+    qry_n, _, _ = _fasta_stats(query_fa_plain)
+    if ref_n > 0 and qry_n > max(20, ref_n * 4):
+        sys.stderr.write(
+            f"[skip] syri {query_asm}: query is too fragmented "
+            f"(query={qry_n} contigs vs ref={ref_n}); SyRI's chrmatch heuristic "
+            "requires comparable contig counts.  Use minigraph / pggb / svim_asm instead.\n"
+        )
+        _log_comparator_failure(
+            out_dir, "syri", query_asm,
+            f"skipped:fragmented_query qry_contigs={qry_n} ref_contigs={ref_n}",
+        )
+        return None
+
     sam_path = work_dir / "query_vs_ref.sam"
     prefix = str(work_dir / "syri_")
     with sam_path.open("w", encoding="utf-8") as sam_out:
@@ -3695,9 +3887,20 @@ def run_syri_for_query(query_row: dict[str, str], out_dir: Path, threads: int) -
     except subprocess.CalledProcessError as exc:
         # SyRI rejects highly divergent pairs (e.g. cross-genus assemblies)
         # with a non-zero exit. Treat as "no comparator output" rather than
-        # propagating the failure up to abort the whole panel.
-        sys.stderr.write(f"[warn] syri rejected {query_asm} (likely too divergent): {exc}\n")
-        _log_comparator_failure(out_dir, "syri", query_asm, f"divergent_or_alignment_failure rc={exc.returncode}")
+        # propagating the failure up to abort the whole panel — but capture
+        # the actual stderr so the operator can distinguish "no syntenic
+        # region" (the expected divergence case) from a missing chromosome,
+        # SAM parse error, or pysam crash that needs different remediation.
+        log_path = _persist_stderr(work_dir, "syri", exc)
+        tail = _stderr_tail(exc)
+        log_hint = f" (full log: {log_path})" if log_path else ""
+        sys.stderr.write(
+            f"[warn] syri rc={exc.returncode} for {query_asm}{log_hint}{tail}\n"
+        )
+        _log_comparator_failure(
+            out_dir, "syri", query_asm,
+            f"rc={exc.returncode} stderr_tail={tail.strip().replace(chr(10), ' | ')}",
+        )
         return None
     syri_tsv = work_dir / "syri_syri.out"
     if not syri_tsv.exists():
@@ -3766,6 +3969,46 @@ def run_pggb_for_query(query_row: dict[str, str], out_dir: Path, threads: int, i
     pair_fa = build_pair_fasta(query_row, work_dir / "pair.fa")
     if pair_fa is None:
         return None
+
+    # pggb wraps wfmash → seqwish → smoothxg → vg deconstruct, and the
+    # combined pipeline returns rc=2 when wfmash produces zero homologous
+    # mappings.  Two predictable failure modes we can short-circuit:
+    #   (a) pair.fa contains <2 records — `build_pair_fasta` writes ref then
+    #       query, but if either FASTA was empty after gz decompression we
+    #       end up with a single sequence and pggb's `-n 2` fails immediately.
+    #   (b) the longest sequence is shorter than the segment length — wfmash
+    #       can't pick a single segment and emits "no segment found".
+    n_records, _, longest = _fasta_stats(pair_fa)
+    if n_records < 2:
+        sys.stderr.write(
+            f"[skip] pggb {query_asm}: pair.fa has only {n_records} record(s); "
+            "pggb -n 2 requires both ref and query sequences.\n"
+        )
+        _log_comparator_failure(
+            out_dir, "pggb", query_asm,
+            f"skipped:incomplete_pair n_records={n_records}",
+        )
+        return None
+    try:
+        seg_bp = int(str(segment_len).rstrip("kKmMgG")) * (
+            1000 if str(segment_len).lower().endswith("k") else
+            1_000_000 if str(segment_len).lower().endswith("m") else
+            1_000_000_000 if str(segment_len).lower().endswith("g") else
+            1
+        )
+    except ValueError:
+        seg_bp = 5000
+    if longest > 0 and longest < seg_bp:
+        sys.stderr.write(
+            f"[skip] pggb {query_asm}: longest sequence {longest} bp is below "
+            f"segment_len {seg_bp} bp; wfmash cannot place a segment.\n"
+        )
+        _log_comparator_failure(
+            out_dir, "pggb", query_asm,
+            f"skipped:short_sequences longest={longest} segment={seg_bp}",
+        )
+        return None
+
     if tool_path("samtools"):
         try:
             run(["samtools", "faidx", str(pair_fa)], cwd=ROOT)
@@ -3782,9 +4025,28 @@ def run_pggb_for_query(query_row: dict[str, str], out_dir: Path, threads: int, i
         "-V", "ref:1000",
         *extra_args,
     ]
-    run(cmd, cwd=ROOT)
+    try:
+        run(cmd, cwd=ROOT)
+    except subprocess.CalledProcessError as exc:
+        # pggb exit 2 is what wfmash / seqwish / smoothxg / vg deconstruct
+        # use when their inputs are unalignable (too divergent, identical
+        # sequences, or chromosomes too short for the segment size).  Capture
+        # the real stderr so the operator can tell which sub-step failed
+        # rather than reading "exit status 2" with no context.
+        log_path = _persist_stderr(work_dir, "pggb", exc)
+        tail = _stderr_tail(exc)
+        log_hint = f" (full log: {log_path})" if log_path else ""
+        sys.stderr.write(
+            f"[warn] pggb rc={exc.returncode} for {query_asm}{log_hint}{tail}\n"
+        )
+        _log_comparator_failure(
+            out_dir, "pggb", query_asm,
+            f"rc={exc.returncode} stderr_tail={tail.strip().replace(chr(10), ' | ')}",
+        )
+        return None
     vcf_candidates = sorted(work_dir.glob("**/*.vcf")) + sorted(work_dir.glob("**/*.vcf.gz"))
     if not vcf_candidates:
+        _log_comparator_failure(out_dir, "pggb", query_asm, "rc=0 but no VCF emitted")
         return None
     return {"label": "pggb", "vcf": str(vcf_candidates[0])}
 
@@ -4194,6 +4456,36 @@ def run_cactus_for_query(
         if cand.exists():
             return {"label": "cactus", "vcf": str(cand)}
     return None
+
+
+def _fasta_stats(fa: Path) -> tuple[int, int, int]:
+    """Return (n_records, total_bp, longest_bp) for a (possibly gzipped) FASTA.
+    Used by comparator pre-checks to skip pairs that would deterministically
+    blow up the downstream tool — e.g. fragmented MAG queries that defeat
+    SyRI's chrmatch heuristic, or pairs with too-short contigs that fall
+    below pggb's segment length."""
+    n_records = 0
+    longest = 0
+    total = 0
+    cur = 0
+    opener = gzip.open if str(fa).endswith(".gz") else open
+    try:
+        with opener(fa, "rt", encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                if line.startswith(">"):
+                    if cur > longest:
+                        longest = cur
+                    total += cur
+                    cur = 0
+                    n_records += 1
+                else:
+                    cur += len(line.strip())
+            if cur > longest:
+                longest = cur
+            total += cur
+    except OSError:
+        return (0, 0, 0)
+    return (n_records, total, longest)
 
 
 def _ensure_plain_fasta(ref_fa: Path, work_dir: Path) -> Path | None:
@@ -4743,6 +5035,27 @@ def benchmark_real_data(args: argparse.Namespace) -> int:
         getattr(args, "max_comparator_short_reads", 150000),
         getattr(args, "max_comparator_long_reads", 20000),
     )
+    if args.mode == "assembly":
+        query_manifest = filter_assembly_query_inputs(
+            query_manifest,
+            out_dir,
+            getattr(args, "max_assembly_query_contigs", 0),
+            getattr(args, "max_assembly_query_bp", 0),
+        )
+        if not query_manifest:
+            status_path = out_dir / "NO_QUERIES_AFTER_ASSEMBLY_FILTER.txt"
+            status_path.write_text(
+                f"All assembly queries were filtered before benchmarking.\n"
+                f"max_assembly_query_contigs={getattr(args, 'max_assembly_query_contigs', 0)}\n"
+                f"max_assembly_query_bp={getattr(args, 'max_assembly_query_bp', 0)}\n"
+                f"See SKIPPED_ASSEMBLY_QUERIES.tsv for the skipped query list.\n",
+                encoding="utf-8",
+            )
+            print(
+                f"benchmark_skipped\tmode={args.mode}\treason=assembly_query_filter"
+                f"\tstatus_file={status_path}"
+            )
+            return 0
 
     # Pre-flight: report which comparators are available / missing and write a
     # COMPARATORS_STATUS.txt so the user does not need to grep through logs.
@@ -4877,8 +5190,17 @@ def benchmark_real_data(args: argparse.Namespace) -> int:
                     args.pggb_arg,
                 )
             except Exception as exc:  # pragma: no cover - defensive
-                sys.stderr.write(f"[warn] pggb failed for {query_row['query_asm']}: {exc}\n")
-                _log_comparator_failure(out_dir, "pggb", query_row["query_asm"], f"exception:{exc}")
+                # `run_pggb_for_query` already converts CalledProcessError into
+                # a structured warning + log file; this catches anything that
+                # leaks past it (OSError on tmpfs full, etc.).
+                tail = _stderr_tail(exc)
+                sys.stderr.write(
+                    f"[warn] pggb failed for {query_row['query_asm']}: {exc}{tail}\n"
+                )
+                _log_comparator_failure(
+                    out_dir, "pggb", query_row["query_asm"],
+                    f"exception:{type(exc).__name__}:{exc}",
+                )
                 continue
             if result:
                 truth_sets[query_row["query_asm"]][("reference", "pggb")] = load_reference_vcf_calls(
@@ -5552,6 +5874,9 @@ def prepare_million_real(args: argparse.Namespace) -> int:
                 "genus": qrow.get("genus", "."),
                 "species": qrow.get("clade_name", "."),
                 "source": args.source,
+                "instrument_platform": ".",
+                "library_layout": ".",
+                "run_accession": ".",
             })
             query_list_paths.append(qrow["fasta_path"])
         # Drop queries from the ref/hierarchy manifest so the index doesn't
@@ -5564,6 +5889,97 @@ def prepare_million_real(args: argparse.Namespace) -> int:
             f"benchmark queries; {len(ref_manifest_rows)} remain in the index",
             flush=True,
         )
+
+    # ── Optional: pull public ENA reads for each held-out query species so
+    # ────── the million-real bench step can also exercise short-reads /
+    # ────── long-reads modes (matching the per-panel real-data flow).
+    # ────── Without this, only `benchmark_assembly/` is ever populated.
+    # ────── Each (query, mode) pair appends a new row to the query manifest;
+    # ────── benchmark filters by mode at run time so the assembly-mode
+    # ────── invocation continues to see only the assembly rows.
+    include_reads = bool(getattr(args, "million_real_include_reads", False))
+    if include_reads and query_manifest_rows:
+        modes_arg = getattr(args, "million_real_read_modes", "both") or "both"
+        if modes_arg == "both":
+            requested_read_modes = ["short-reads", "long-reads"]
+        elif modes_arg in {"short-reads", "long-reads"}:
+            requested_read_modes = [modes_arg]
+        else:
+            requested_read_modes = []
+        runs_per_query = max(1, int(getattr(args, "million_real_read_runs_per_query", 1) or 1))
+        ena_max_rows = max(1, int(getattr(args, "ena_max_rows_per_species", 200) or 200))
+        queries_dir = cache_dir / "queries"
+        queries_dir.mkdir(parents=True, exist_ok=True)
+        # Snapshot the assembly rows; we mutate query_manifest_rows below.
+        assembly_query_rows = list(query_manifest_rows)
+        sys.stderr.write(
+            f"[reads-mode] resolving ENA runs for {len(assembly_query_rows)} held-out "
+            f"queries (modes={requested_read_modes}, runs/query={runs_per_query})\n"
+        )
+        for arow in assembly_query_rows:
+            species = arow.get("species", ".") or "."
+            if species in {".", ""}:
+                continue
+            try:
+                ena_runs = fetch_ena_read_runs_by_species(species, max_rows=ena_max_rows)
+            except Exception as exc:
+                sys.stderr.write(
+                    f"[reads-mode] ENA species lookup failed for {species!r}: {exc}\n"
+                )
+                continue
+            if not ena_runs:
+                sys.stderr.write(
+                    f"[reads-mode] skip {species!r}: ENA filereport returned 0 runs\n"
+                )
+                continue
+            sys.stderr.write(
+                f"[reads-mode] {species!r}: ENA returned {len(ena_runs)} candidate runs\n"
+            )
+            for read_mode in requested_read_modes:
+                urls, meta_rows = select_ena_read_sources(ena_runs, read_mode, runs_per_query)
+                if not urls:
+                    sys.stderr.write(
+                        f"[reads-mode] {species!r} mode={read_mode}: "
+                        f"no eligible runs after platform filter\n"
+                    )
+                    continue
+                asm_name = normalize_name(
+                    f"{arow['query_asm']}_{read_mode}_{meta_rows[0].get('run_accession', 'na')}"
+                )
+                try:
+                    local_path = merge_sequence_sources(urls, queries_dir / asm_name)
+                except Exception as exc:
+                    sys.stderr.write(
+                        f"[warn] reads download failed for {species} {read_mode}: {exc}\n"
+                    )
+                    continue
+                read_row = dict(arow)
+                read_row.update({
+                    "query_asm": asm_name,
+                    "query_mode": read_mode,
+                    "path": str(local_path),
+                    "source": f"ena_{read_mode.replace('-', '_')}",
+                    "instrument_platform": meta_rows[0].get("instrument_platform", "."),
+                    "library_layout": meta_rows[0].get("library_layout", "."),
+                    "run_accession": meta_rows[0].get("run_accession", "."),
+                })
+                query_manifest_rows.append(read_row)
+                query_list_paths.append(str(local_path))
+                for meta in meta_rows:
+                    source_link_rows.append({
+                        "query_asm": asm_name,
+                        "role": "query",
+                        "query_mode": read_mode,
+                        "source_type": "ena_read_run",
+                        "source_accession": meta.get("run_accession", "."),
+                        "source_url": meta.get("source_url", "."),
+                        "local_path": str(local_path),
+                        "species": meta.get("scientific_name", species),
+                    })
+                sys.stderr.write(
+                    f"[reads-mode] {species!r} mode={read_mode}: "
+                    f"added query {asm_name}\n"
+                )
 
     hierarchy_manifest = out_dir / "hierarchy_manifest.tsv"
     write_tsv(
@@ -5578,7 +5994,8 @@ def prepare_million_real(args: argparse.Namespace) -> int:
             query_manifest_rows,
             ["query_asm", "query_mode", "path", "scenario", "lifestyle", "architecture",
              "benchmark_ref_asm", "benchmark_ref_fasta", "phylum", "class", "order",
-             "family", "genus", "species", "source"],
+             "family", "genus", "species", "source",
+             "instrument_platform", "library_layout", "run_accession"],
         )
         (out_dir / "query_list.txt").write_text(
             "\n".join(query_list_paths) + "\n", encoding="utf-8"
@@ -5706,11 +6123,39 @@ def build_parser() -> argparse.ArgumentParser:
             "comparators. Default 0 = index-only, no held-out queries."
         ),
     )
+    # Reads-mode queries for the held-out species: pull public ENA runs so
+    # the million-real bench can also exercise short-reads (Illumina) and
+    # long-reads (PacBio HiFi / ONT R10.4 etc.) modes — without these,
+    # only benchmark_assembly/ ever gets populated.  The per-mode queries
+    # share the held-out assembly's benchmark_ref_fasta (closest sibling),
+    # so per-query truth alignment still works.  Off by default to keep
+    # prep wall-time bounded; toggle via --million-real-include-reads.
+    smr.add_argument(
+        "--million-real-include-reads", action="store_true",
+        help="For each held-out query species, also resolve and download "
+             "ENA reads to seed reads-mode benchmark queries.",
+    )
+    smr.add_argument(
+        "--million-real-read-modes", default="both",
+        choices=["both", "short-reads", "long-reads"],
+        help="Which reads modes to materialise when --million-real-include-reads "
+             "is set (default both).",
+    )
+    smr.add_argument(
+        "--million-real-read-runs-per-query", type=int, default=1,
+        help="Number of ENA runs to fetch per (held-out query, reads mode); "
+             "the FASTQs are merged into a single per-query input (default 1).",
+    )
+    smr.add_argument(
+        "--ena-max-rows-per-species", type=int, default=200,
+        help="Maximum read_run rows to pull from ENA per species before "
+             "filtering by platform.",
+    )
 
     spp = sub.add_parser("prepare", help="Download a real fungal panel and write MycoSV-ready manifests.")
     spp.add_argument("--out-dir", type=Path, required=True)
     spp.add_argument("--source", choices=sorted(NCBI_ASSEMBLY_SUMMARY), default="ncbi-refseq")
-    spp.add_argument("--panel", dest="panels", action="append", choices=sorted(PANEL_PRESETS), default=[])
+    spp.add_argument("--panel", "--panels", dest="panels", action="append", choices=sorted(PANEL_PRESETS), default=[])
     spp.add_argument("--species", action="append", default=[], help="Override panels with explicit species names; may be used multiple times.")
     spp.add_argument("--all-public-assemblies", action="store_true", help="Select all public fungal assemblies from the chosen NCBI source instead of curated panels/species.")
     spp.add_argument("--max-public-assemblies", type=int, default=0, help="Optional cap on the number of public fungal assemblies considered when using --all-public-assemblies.")
@@ -5792,12 +6237,26 @@ def build_parser() -> argparse.ArgumentParser:
     sb.add_argument("--max-comparator-long-reads", type=int, default=20000,
                     help="Cap long-read FASTQ records used by external comparators "
                          "and read validation. 0 disables subsetting (default: 20000).")
+    sb.add_argument("--max-assembly-query-contigs", type=int, default=0,
+                    help="Skip assembly-mode query FASTAs with more than this many "
+                         "records before launching MycoSV/comparators. 0 disables "
+                         "the filter (default: 0). Skipped rows are written to "
+                         "SKIPPED_ASSEMBLY_QUERIES.tsv.")
+    sb.add_argument("--max-assembly-query-bp", type=int, default=0,
+                    help="Skip assembly-mode query FASTAs above this total bp before "
+                         "launching MycoSV/comparators. 0 disables the filter "
+                         "(default: 0).")
     sb.add_argument("--normalized-other", action="append", default=[], metavar="LABEL=PATH", help="Additional normalized TSV callsets to benchmark against. TSVs may use query or reference coordinates via a coord_space column.")
     sb.add_argument("--other-vcf", action="append", default=[], metavar="LABEL=PATH", help="Additional reference-coordinate VCF comparator output, best for single-query or pairwise benchmark runs.")
     sb.add_argument("--mycosv-arg", action="append", default=[], help="Extra argument to pass through to the MycoSV binary; may be used multiple times.")
     sb.add_argument("--minigraph-arg", action="append", default=[], help="Extra argument to pass through to minigraph runs; may be used multiple times.")
     sb.add_argument("--pggb-arg", action="append", default=[], help="Extra argument to pass through to pggb; may be used multiple times.")
-    sb.add_argument("--pggb-identity", default="90")
+    # 90% identity is wfmash's tutorial default for human haplotype panels;
+    # cross-strain fungal pairs routinely sit at 85-95% nucleotide identity,
+    # so the stricter default produced rc=2 (zero homologous mappings) on
+    # most yeast and basidiomycete panels.  80 is the value PanSN tutorials
+    # recommend for "diverged but related" inputs and recovers those pairs.
+    sb.add_argument("--pggb-identity", default="80")
     sb.add_argument("--pggb-segment-len", default="5k")
     sb.add_argument("--expression-tsv", type=Path)
     sb.add_argument("--gene-annotations-tsv", type=Path)

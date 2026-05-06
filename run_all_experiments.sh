@@ -55,6 +55,19 @@ MILLION_REAL_QUERIES="${MILLION_REAL_QUERIES:-5}"
 # default fits a 12 GiB cgroup but can be raised on bigger nodes.
 MILLION_REAL_MAX_CLADE_GENOMES="${MILLION_REAL_MAX_CLADE_GENOMES:-8}"
 
+# Per-query memory caps for the MycoSV binary in the million-real bench.
+# Without a per-thread cache cap, the SingleRefMemCache (suffix arrays for
+# every ref contig touched by a query) grows unbounded; with --threads
+# parallel queries each holding their own cache the binary previously died
+# with std::bad_alloc on multi-Gbp routed sub-graphs.  Default 4096 MB per
+# thread fits comfortably in a 128 GiB SLURM job at 16 threads (~64 GiB
+# total cache budget); shrink on tight cgroups or raise on bigger nodes.
+MILLION_REAL_SA_MAX_CONTIG_MB="${MILLION_REAL_SA_MAX_CONTIG_MB:-25}"
+MILLION_REAL_SINGLE_REF_CACHE_MB="${MILLION_REAL_SINGLE_REF_CACHE_MB:-4096}"
+MILLION_REAL_MAX_REF_MEMORY_MB="${MILLION_REAL_MAX_REF_MEMORY_MB:-1024}"
+MILLION_REAL_MAX_ASSEMBLY_QUERY_CONTIGS="${MILLION_REAL_MAX_ASSEMBLY_QUERY_CONTIGS:-5000}"
+MILLION_REAL_MAX_ASSEMBLY_QUERY_BP="${MILLION_REAL_MAX_ASSEMBLY_QUERY_BP:-350000000}"
+
 # Effective cgroup memory limit, when Slurm/cgroup v2 exposes one. This is
 # more useful than host RAM on shared HPC nodes: the failed 14535674 run had a
 # 64 GiB cgroup despite a larger physical node.
@@ -101,22 +114,31 @@ fi
 # by default; override if you are on a genuinely larger cgroup.
 REAL_HEAVY_ASSEMBLY_THREADS="${REAL_HEAVY_ASSEMBLY_THREADS:-1}"
 REAL_HEAVY_SA_MAX_CONTIG_MB="${REAL_HEAVY_SA_MAX_CONTIG_MB:-25}"
+REAL_HEAVY_SINGLE_REF_CACHE_MB="${REAL_HEAVY_SINGLE_REF_CACHE_MB:-1024}"
+REAL_HEAVY_MAX_REF_MEMORY_MB="${REAL_HEAVY_MAX_REF_MEMORY_MB:-1024}"
+REAL_HEAVY_MAX_ASSEMBLY_QUERY_CONTIGS="${REAL_HEAVY_MAX_ASSEMBLY_QUERY_CONTIGS:-5000}"
+REAL_HEAVY_MAX_ASSEMBLY_QUERY_BP="${REAL_HEAVY_MAX_ASSEMBLY_QUERY_BP:-350000000}"
 
 # Timeout used inside run_real_fungal_benchmark.py for individual external
 # tool calls. Keep it at least as large as the assembly benchmark cap so AMF
 # MycoSV runs are governed by the stage timeout, not an older 2h hard stop.
 export MYCOSV_TOOL_TIMEOUT="${MYCOSV_TOOL_TIMEOUT:-14400}"
 
+# Stage-level wall-clock budgets. These are fail-forward guards: a stage that
+# exceeds its cap is marked failed/timeout, then the matrix moves on to the
+# next independent stage where possible.
+SIM_BENCHMARK_TIMEOUT="${SIM_BENCHMARK_TIMEOUT:-3h}"
+REAL_PREPARE_TIMEOUT="${REAL_PREPARE_TIMEOUT:-2h}"
+REPORT_TIMEOUT="${REPORT_TIMEOUT:-30m}"
+
 # Per-panel/per-mode wall-clock budget. A single benchmark invocation that
 # overruns this limit is killed and the next mode/panel still runs — without
 # it, one slow panel (typically AMF assembly mode where cactus chews on
 # ~1 Gbp Rhizophagus genomes) consumes the SLURM time budget and starves
-# every subsequent panel in the matrix. Defaults are intentionally 50 %
-# wider than MYCOSV_TOOL_TIMEOUT so a 4h MycoSV invocation still leaves
-# the comparators time to run. Override via env var when running on
-# long-walltime partitions. Set to 0 to disable the cap.
-BENCHMARK_TIMEOUT_ASSEMBLY="${BENCHMARK_TIMEOUT_ASSEMBLY:-6h}"
-BENCHMARK_TIMEOUT_READS="${BENCHMARK_TIMEOUT_READS:-6h}"
+# every subsequent panel in the matrix. Override via env var when running
+# on long-walltime partitions. Set to 0 to disable the cap.
+BENCHMARK_TIMEOUT_ASSEMBLY="${BENCHMARK_TIMEOUT_ASSEMBLY:-3h}"
+BENCHMARK_TIMEOUT_READS="${BENCHMARK_TIMEOUT_READS:-2h}"
 
 # Bound public-read comparator inputs. MycoSV caps read consumption internally,
 # but tools such as SVIM/Sniffles/cuteSV/Delly/Manta align the FASTQ path they
@@ -131,6 +153,12 @@ MAX_COMPARATOR_LONG_READS="${MAX_COMPARATOR_LONG_READS:-20000}"
 # typical SLURM time limits while still leaving syri / minigraph / svim_asm
 # as truth comparators. Override or extend via env var.
 HEAVY_COMPARATOR_SKIP_PANELS="${HEAVY_COMPARATOR_SKIP_PANELS:-amf_large,te_rich_pathogen}"
+
+# Real-data panels to run by default. compact_yeast + amf_large cover the
+# current baseline; te_rich_pathogen adds TE-rich full-SV stress; and
+# two_speed_pathogen adds plant pathogen / effector-region biology. Other
+# PANEL_PRESETS, such as cross_phylum_hgt, remain available via REAL_PANELS=...
+REAL_PANELS_DEFAULT="${REAL_PANELS_DEFAULT:-compact_yeast,amf_large,te_rich_pathogen,two_speed_pathogen}"
 
 # Long-read platform used for both simulated and real experiments.
 #   hifi    PacBio HiFi CCS (Revio / Sequel IIe) — 15 kb reads, ≥Q20 accuracy.
@@ -202,7 +230,7 @@ if [[ "$EXPERIMENT_TYPE" == "all" || "$EXPERIMENT_TYPE" == "simulated" ]]; then
   echo "      Output: ${SIM_DIR}/benchmarks"
   mkdir -p "${SIM_DIR}/benchmarks"
 
-  if python3 run_million_mode_query_benchmark.py \
+  sim_cmd=(python3 -u run_million_mode_query_benchmark.py
       --out-dir "${SIM_DIR}/benchmarks" \
       --modes assembly,short-reads,long-reads \
       --scenario-set "${SIM_SCENARIO_SET}" \
@@ -214,12 +242,20 @@ if [[ "$EXPERIMENT_TYPE" == "all" || "$EXPERIMENT_TYPE" == "simulated" ]]; then
       --queries-per-scenario "${SIM_QUERIES_PER_SCENARIO}" \
       --min-contig-bp 12000 \
       --long-read-platform "${LONG_READ_PLATFORM}" \
-      --threads "${THREADS}" \
-      2>&1 | tee "${SIM_DIR}/benchmarks/benchmark.log"; then
+      --threads "${THREADS}")
+  if [[ -n "${SIM_BENCHMARK_TIMEOUT}" && "${SIM_BENCHMARK_TIMEOUT}" != "0" ]] && command -v timeout >/dev/null; then
+    sim_cmd=(timeout --signal=TERM --kill-after=60 "${SIM_BENCHMARK_TIMEOUT}" "${sim_cmd[@]}")
+  fi
+  if "${sim_cmd[@]}" 2>&1 | tee "${SIM_DIR}/benchmarks/benchmark.log"; then
     mark_success "simulated.pr_metrics_benchmark"
     echo -e "${GREEN}✓ Simulated benchmark complete${NC}"
   else
-    mark_failure "simulated.pr_metrics_benchmark"
+    rc=${PIPESTATUS[0]}
+    if [[ "${rc}" == "124" || "${rc}" == "137" ]]; then
+      mark_failure "simulated.pr_metrics_benchmark.timeout(${SIM_BENCHMARK_TIMEOUT})"
+    else
+      mark_failure "simulated.pr_metrics_benchmark"
+    fi
   fi
   echo ""
 fi
@@ -242,6 +278,16 @@ if [[ "$EXPERIMENT_TYPE" == "all" || "$EXPERIMENT_TYPE" == "million-real" ]]; th
   MILLION_REAL_BENCH_TIMEOUT="${MILLION_REAL_BENCH_TIMEOUT:-4h}"
 
   prepare_million_succeeded=0
+  # Reads-mode coverage in the million-real bench. When 1, prepare-million-real
+  # also resolves public ENA reads for each held-out query species so 2b can
+  # exercise short-reads (Illumina) and long-reads (PacBio HiFi / ONT R10.4)
+  # in addition to assembly mode.  Default ON so benchmark_short-reads/ and
+  # benchmark_long-reads/ get populated; set MILLION_REAL_INCLUDE_READS=0 to
+  # skip the ENA hops on time-constrained runs.
+  MILLION_REAL_INCLUDE_READS="${MILLION_REAL_INCLUDE_READS:-1}"
+  MILLION_REAL_READ_MODES="${MILLION_REAL_READ_MODES:-both}"
+  MILLION_REAL_READ_RUNS_PER_QUERY="${MILLION_REAL_READ_RUNS_PER_QUERY:-1}"
+
   # ── 2a) prepare: download assemblies, build the routing index, hold out
   # ────── MILLION_REAL_QUERIES assemblies for the MycoSV-only benchmark.
   # python3 -u keeps stdout line-buffered under tee so progress is visible.
@@ -255,7 +301,12 @@ if [[ "$EXPERIMENT_TYPE" == "all" || "$EXPERIMENT_TYPE" == "million-real" ]]; th
       --seed 42
       --max-clade-genomes "${MILLION_REAL_MAX_CLADE_GENOMES}"
       --million-real-queries "${MILLION_REAL_QUERIES}"
+      --million-real-read-modes "${MILLION_REAL_READ_MODES}"
+      --million-real-read-runs-per-query "${MILLION_REAL_READ_RUNS_PER_QUERY}"
       --data-cache-dir "${DATA_CACHE_DIR}")
+  if [[ "${MILLION_REAL_INCLUDE_READS}" == "1" ]]; then
+    prepare_cmd+=(--million-real-include-reads)
+  fi
   if [[ -n "${MILLION_REAL_PREPARE_TIMEOUT}" && "${MILLION_REAL_PREPARE_TIMEOUT}" != "0" ]] && command -v timeout >/dev/null; then
     prepare_cmd=(timeout --signal=TERM --kill-after=60 "${MILLION_REAL_PREPARE_TIMEOUT}" "${prepare_cmd[@]}")
   fi
@@ -283,9 +334,6 @@ if [[ "$EXPERIMENT_TYPE" == "all" || "$EXPERIMENT_TYPE" == "million-real" ]]; th
   if [[ "${prepare_million_succeeded}" == "1" \
         && -f "${MILLION_REAL_DIR}/query_manifest.tsv" \
         && $(wc -l < "${MILLION_REAL_DIR}/query_manifest.tsv") -gt 1 ]]; then
-    echo -e "${YELLOW}[2b/4] Running MycoSV-only benchmark on million-real held-out queries...${NC}"
-    bench_dir="${MILLION_REAL_DIR}/benchmark_assembly"
-    mkdir -p "${bench_dir}"
     # Read-level validation needs a single per-query benchmark_ref_fasta;
     # in the million-real flow that ref is a sibling-genus assembly chosen
     # by prepare-million-real. It is ON by default so million-real produces
@@ -295,33 +343,86 @@ if [[ "$EXPERIMENT_TYPE" == "all" || "$EXPERIMENT_TYPE" == "million-real" ]]; th
     if [[ "${MILLION_REAL_VALIDATE_WITH_READS:-1}" == "0" ]]; then
       val_flag="--no-validate-with-reads"
     fi
-    million_real_readval_support="${MILLION_REAL_READ_VALIDATION_MIN_SUPPORT:-1}"
-    bench_cmd=(python3 -u run_real_fungal_benchmark.py benchmark
-        --prepared-dir "${MILLION_REAL_DIR}"
-        --out-dir "${bench_dir}"
-        --mode assembly
-        --threads "${THREADS}"
-        --max-clade-genomes "${MILLION_REAL_MAX_CLADE_GENOMES}"
-        --mycosv-only
-        --reuse-index-dir "${MILLION_REAL_DIR}/index"
-        --reuse-registry-dir "${MILLION_REAL_DIR}/registry"
-        --read-validation-min-support "${million_real_readval_support}"
-        "${val_flag}")
-    if [[ -n "${MILLION_REAL_BENCH_TIMEOUT}" && "${MILLION_REAL_BENCH_TIMEOUT}" != "0" ]] && command -v timeout >/dev/null; then
-      bench_cmd=(timeout --signal=TERM --kill-after=60 "${MILLION_REAL_BENCH_TIMEOUT}" "${bench_cmd[@]}")
-    fi
-    if "${bench_cmd[@]}" 2>&1 | tee "${bench_dir}/benchmark.log"; then
-      mark_success "million_real.mycosv_benchmark"
-      echo -e "${GREEN}✓ MycoSV-only million-real benchmark complete${NC}"
-    else
-      rc=${PIPESTATUS[0]}
-      if [[ "${rc}" == "124" || "${rc}" == "137" ]]; then
-        mark_failure "million_real.mycosv_benchmark.timeout(${MILLION_REAL_BENCH_TIMEOUT})"
-      else
-        mark_failure "million_real.mycosv_benchmark"
+
+    # ── Modes to bench. assembly is always on; reads modes are added if
+    # ────── prepare-million-real materialised matching query rows. The
+    # ────── benchmark step itself filters by mode and writes a
+    # ────── NO_QUERIES_FOR_MODE.txt marker when none exist, so it's safe
+    # ────── to invoke unconditionally — but skipping the call avoids a
+    # ────── spurious comparator-pre-flight burst per missing mode.
+    declare -A million_real_modes_present
+    million_real_modes_present[assembly]=0
+    million_real_modes_present[short-reads]=0
+    million_real_modes_present[long-reads]=0
+    while IFS=$'\t' read -r _qa qmode _rest; do
+      case "${qmode}" in
+        assembly|short-reads|long-reads)
+          million_real_modes_present[${qmode}]=$(( million_real_modes_present[${qmode}] + 1 ))
+          ;;
+      esac
+    done < <(tail -n +2 "${MILLION_REAL_DIR}/query_manifest.tsv")
+
+    for million_real_mode in assembly short-reads long-reads; do
+      if [[ "${million_real_modes_present[${million_real_mode}]}" -eq 0 ]]; then
+        if [[ "${million_real_mode}" != "assembly" ]]; then
+          echo "      [skip] mode=${million_real_mode}: no query rows in manifest"
+          echo "             (re-run prep with MILLION_REAL_INCLUDE_READS=1 to materialise reads queries)"
+        fi
+        continue
       fi
-    fi
-    echo ""
+      echo -e "${YELLOW}[2b/4] Running MycoSV-only benchmark mode=${million_real_mode}...${NC}"
+      bench_dir="${MILLION_REAL_DIR}/benchmark_${million_real_mode}"
+      mkdir -p "${bench_dir}"
+      # Per-mode read-level validation support: assembly truth is
+      # high-confidence so 1 supporting read is enough; reads-mode truth
+      # is read-derived already so we want a stricter ≥3 to reject
+      # alignment artefacts.  Match the per-panel real-data defaults.
+      if [[ "${million_real_mode}" == "assembly" ]]; then
+        million_real_readval_support="${MILLION_REAL_READ_VALIDATION_MIN_SUPPORT:-1}"
+      else
+        million_real_readval_support="${MILLION_REAL_READ_VALIDATION_MIN_SUPPORT_READS:-3}"
+      fi
+      bench_cmd=(python3 -u run_real_fungal_benchmark.py benchmark
+          --prepared-dir "${MILLION_REAL_DIR}"
+          --out-dir "${bench_dir}"
+          --mode "${million_real_mode}"
+          --threads "${THREADS}"
+          --max-clade-genomes "${MILLION_REAL_MAX_CLADE_GENOMES}"
+          --mycosv-only
+          --reuse-index-dir "${MILLION_REAL_DIR}/index"
+          --reuse-registry-dir "${MILLION_REAL_DIR}/registry"
+          --read-validation-min-support "${million_real_readval_support}"
+          --mycosv-arg=--sa-max-contig-mb
+          --mycosv-arg="${MILLION_REAL_SA_MAX_CONTIG_MB}"
+          --mycosv-arg=--single-ref-cache-mb
+          --mycosv-arg="${MILLION_REAL_SINGLE_REF_CACHE_MB}"
+          --mycosv-arg=--max-ref-memory-mb
+          --mycosv-arg="${MILLION_REAL_MAX_REF_MEMORY_MB}"
+          --mycosv-arg=--no-flat-ref-fallback
+          --mycosv-arg=--no-gfa
+          "${val_flag}")
+      if [[ "${million_real_mode}" == "assembly" ]]; then
+        bench_cmd+=(
+          --max-assembly-query-contigs "${MILLION_REAL_MAX_ASSEMBLY_QUERY_CONTIGS}"
+          --max-assembly-query-bp "${MILLION_REAL_MAX_ASSEMBLY_QUERY_BP}"
+        )
+      fi
+      if [[ -n "${MILLION_REAL_BENCH_TIMEOUT}" && "${MILLION_REAL_BENCH_TIMEOUT}" != "0" ]] && command -v timeout >/dev/null; then
+        bench_cmd=(timeout --signal=TERM --kill-after=60 "${MILLION_REAL_BENCH_TIMEOUT}" "${bench_cmd[@]}")
+      fi
+      if "${bench_cmd[@]}" 2>&1 | tee "${bench_dir}/benchmark.log"; then
+        mark_success "million_real.mycosv_benchmark.${million_real_mode}"
+        echo -e "${GREEN}✓ MycoSV-only million-real benchmark complete (mode=${million_real_mode})${NC}"
+      else
+        rc=${PIPESTATUS[0]}
+        if [[ "${rc}" == "124" || "${rc}" == "137" ]]; then
+          mark_failure "million_real.mycosv_benchmark.${million_real_mode}.timeout(${MILLION_REAL_BENCH_TIMEOUT})"
+        else
+          mark_failure "million_real.mycosv_benchmark.${million_real_mode}"
+        fi
+      fi
+      echo ""
+    done
   elif [[ "${prepare_million_succeeded}" == "1" ]]; then
     echo "      [skip] no held-out queries written (MILLION_REAL_QUERIES=${MILLION_REAL_QUERIES})"
   fi
@@ -342,7 +443,7 @@ fi
 # ============================================================================
 
 if [[ "$EXPERIMENT_TYPE" == "all" || "$EXPERIMENT_TYPE" == "real" ]]; then
-  IFS=',' read -r -a PANELS <<< "${REAL_PANELS:-compact_yeast,amf_large,cross_phylum_hgt,te_rich_pathogen,two_speed_pathogen}"
+  IFS=',' read -r -a PANELS <<< "${REAL_PANELS:-${REAL_PANELS_DEFAULT}}"
   IFS=',' read -r -a REAL_MODES <<< "${REAL_BENCHMARK_MODES:-assembly,short-reads,long-reads}"
 
   echo -e "${YELLOW}[3/4] Running real fungal data benchmarks...${NC}"
@@ -367,7 +468,7 @@ if [[ "$EXPERIMENT_TYPE" == "all" || "$EXPERIMENT_TYPE" == "real" ]]; then
     REAL_QUERIES_PER_SPECIES="${REAL_QUERIES_PER_SPECIES:-3}"
     REAL_MAX_QUERY_DOWNLOADS="${REAL_MAX_QUERY_DOWNLOADS:-6}"
     REAL_READ_ACCESSIONS_PER_SPECIES="${REAL_READ_ACCESSIONS_PER_SPECIES:-1}"
-    if python3 run_real_fungal_benchmark.py prepare \
+    prepare_panel_cmd=(python3 -u run_real_fungal_benchmark.py prepare
         --out-dir "${PANEL_DIR}/prepared" \
         --panel "${panel}" \
         --source ncbi-genbank \
@@ -378,11 +479,19 @@ if [[ "$EXPERIMENT_TYPE" == "all" || "$EXPERIMENT_TYPE" == "real" ]]; then
         --query-mode mixed \
         --read-accessions-per-species "${REAL_READ_ACCESSIONS_PER_SPECIES}" \
         --allow-no-queries \
-        --data-cache-dir "${DATA_CACHE_DIR}" \
-        2>&1 | tee "${PANEL_DIR}/prepare.log"; then
+        --data-cache-dir "${DATA_CACHE_DIR}")
+    if [[ -n "${REAL_PREPARE_TIMEOUT}" && "${REAL_PREPARE_TIMEOUT}" != "0" ]] && command -v timeout >/dev/null; then
+      prepare_panel_cmd=(timeout --signal=TERM --kill-after=60 "${REAL_PREPARE_TIMEOUT}" "${prepare_panel_cmd[@]}")
+    fi
+    if "${prepare_panel_cmd[@]}" 2>&1 | tee "${PANEL_DIR}/prepare.log"; then
       mark_success "real.${panel}.prepare"
     else
-      mark_failure "real.${panel}.prepare"
+      rc=${PIPESTATUS[0]}
+      if [[ "${rc}" == "124" || "${rc}" == "137" ]]; then
+        mark_failure "real.${panel}.prepare.timeout(${REAL_PREPARE_TIMEOUT})"
+      else
+        mark_failure "real.${panel}.prepare"
+      fi
       echo "    - Skipping benchmarks for ${panel} (prepare failed)"
       continue
     fi
@@ -436,8 +545,18 @@ if [[ "$EXPERIMENT_TYPE" == "all" || "$EXPERIMENT_TYPE" == "real" ]]; then
           --mycosv-arg=--no-gfa
           --mycosv-arg=--sa-max-contig-mb
           --mycosv-arg="${REAL_HEAVY_SA_MAX_CONTIG_MB}"
+          --mycosv-arg=--single-ref-cache-mb
+          --mycosv-arg="${REAL_HEAVY_SINGLE_REF_CACHE_MB}"
+          --mycosv-arg=--max-ref-memory-mb
+          --mycosv-arg="${REAL_HEAVY_MAX_REF_MEMORY_MB}"
+          --mycosv-arg=--no-flat-ref-fallback
+          --max-assembly-query-contigs
+          "${REAL_HEAVY_MAX_ASSEMBLY_QUERY_CONTIGS}"
+          --max-assembly-query-bp
+          "${REAL_HEAVY_MAX_ASSEMBLY_QUERY_BP}"
         )
-        echo "      [mem] heavy assembly settings: threads=${benchmark_threads}, MycoSV SA contig cap=${REAL_HEAVY_SA_MAX_CONTIG_MB} MB"
+        echo "      [mem] heavy assembly settings: threads=${benchmark_threads}, MycoSV SA contig cap=${REAL_HEAVY_SA_MAX_CONTIG_MB} MB, SA cache=${REAL_HEAVY_SINGLE_REF_CACHE_MB} MB"
+        echo "      [filter] heavy assembly query caps: contigs<=${REAL_HEAVY_MAX_ASSEMBLY_QUERY_CONTIGS}, bp<=${REAL_HEAVY_MAX_ASSEMBLY_QUERY_BP}"
       fi
 
       # Wrap the benchmark invocation in `timeout` so a single slow panel
@@ -451,7 +570,7 @@ if [[ "$EXPERIMENT_TYPE" == "all" || "$EXPERIMENT_TYPE" == "real" ]]; then
         bench_timeout="${BENCHMARK_TIMEOUT_READS}"
         read_validation_min_support="${REAL_READ_VALIDATION_MIN_SUPPORT_READS:-3}"
       fi
-      bench_cmd=(python3 run_real_fungal_benchmark.py benchmark
+      bench_cmd=(python3 -u run_real_fungal_benchmark.py benchmark
         --prepared-dir "${PANEL_DIR}/prepared"
         --mode "${mode}"
         --out-dir "${PANEL_DIR}/benchmark_${mode}"
@@ -594,6 +713,9 @@ PY
   [[ -s "${REAL_RESULTS}" ]] && report_cmd+=(--real "${REAL_RESULTS}")
   [[ -s "${BIO_RESULTS}" ]] && report_cmd+=(--biology "${BIO_RESULTS}")
   [[ -s "${NOVEL_RESULTS}" ]] && report_cmd+=(--novel "${NOVEL_RESULTS}")
+  if [[ -n "${REPORT_TIMEOUT}" && "${REPORT_TIMEOUT}" != "0" ]] && command -v timeout >/dev/null; then
+    report_cmd=(timeout --signal=TERM --kill-after=60 "${REPORT_TIMEOUT}" "${report_cmd[@]}")
+  fi
 
   if [[ -f "${WORK_DIR}/sv_visualization_report.py" ]]; then
     if "${report_cmd[@]}" 2>&1 | tee "${REPORT_DIR}/report.log"; then
@@ -604,7 +726,12 @@ PY
         mark_failure "report.visualization_missing_output"
       fi
     else
-      mark_failure "report.visualization"
+      rc=${PIPESTATUS[0]}
+      if [[ "${rc}" == "124" || "${rc}" == "137" ]]; then
+        mark_failure "report.visualization.timeout(${REPORT_TIMEOUT})"
+      else
+        mark_failure "report.visualization"
+      fi
     fi
   else
     echo "      Report script not found: ${WORK_DIR}/sv_visualization_report.py"

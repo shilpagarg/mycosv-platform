@@ -90,7 +90,7 @@ mkdir -p experiments/real_data/$TIMESTAMP/$PANEL/{prepared,benchmark_assembly,be
 # Prepare panel
 python3 run_real_fungal_benchmark.py prepare \
   --out-dir experiments/real_data/$TIMESTAMP/$PANEL/prepared \
-  --panels $PANEL
+  --panel $PANEL
 
 # Benchmark all modes
 python3 run_real_fungal_benchmark.py benchmark \
@@ -106,22 +106,24 @@ python3 run_real_fungal_benchmark.py benchmark \
 python3 run_real_fungal_benchmark.py benchmark \
   --prepared-dir experiments/real_data/$TIMESTAMP/$PANEL/prepared \
   --mode long-reads \
-  --out-dir experiments/real_data/$TIMESTAMP/$TIMESTAMP/$PANEL/benchmark_long-reads
+  --out-dir experiments/real_data/$TIMESTAMP/$PANEL/benchmark_long-reads
 ```
 
-### Real Fungal Data - All Panels
+### Real Fungal Data - Expanded Default Panels
 ```bash
 cd /mnt/bmh01-rds/Shilpa_Group/2024/projects/fungi/AMF/scale
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 mkdir -p experiments/real_data/$TIMESTAMP
 
-for PANEL in compact_yeast amf_large cross_phylum_hgt te_rich_pathogen two_speed_pathogen; do
+for PANEL in compact_yeast amf_large te_rich_pathogen two_speed_pathogen; do
   echo "Processing: $PANEL"
   mkdir -p experiments/real_data/$TIMESTAMP/$PANEL/{prepared,benchmark_assembly,benchmark_short-reads,benchmark_long-reads}
   
   python3 run_real_fungal_benchmark.py prepare \
     --out-dir experiments/real_data/$TIMESTAMP/$PANEL/prepared \
-    --panels $PANEL
+    --panel $PANEL \
+    --query-mode mixed \
+    --read-accessions-per-species ${REAL_READ_ACCESSIONS_PER_SPECIES:-1}
   
   if [ -f "experiments/real_data/$TIMESTAMP/$PANEL/prepared/reference_catalog.tsv" ]; then
     for MODE in assembly short-reads long-reads; do

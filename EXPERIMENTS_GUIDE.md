@@ -69,11 +69,13 @@ done
 
 ### 5. Real Fungal Data Benchmarks (~30-60 minutes per panel)
 ```bash
-for panel in compact_yeast amf_large cross_phylum_hgt te_rich_pathogen two_speed_pathogen; do
+for panel in compact_yeast amf_large te_rich_pathogen two_speed_pathogen; do
   # Prepare
   python3 run_real_fungal_benchmark.py prepare \
     --out-dir experiments/real_data/YYYYMMDD_HHMMSS/$panel/prepared \
-    --panels "$panel"
+    --panel "$panel" \
+    --query-mode mixed \
+    --read-accessions-per-species ${REAL_READ_ACCESSIONS_PER_SPECIES:-1}
   
   # Benchmark all modes
   for mode in assembly short-reads long-reads; do
@@ -84,7 +86,7 @@ for panel in compact_yeast amf_large cross_phylum_hgt te_rich_pathogen two_speed
   done
 done
 ```
-- Tests 5 distinct fungal genome panels
+- Tests the 4 expanded real-data panels by default
 - Each panel has unique evolutionary characteristics
 - All 3 query modes tested for each panel
 - Output: `experiments/real_data/YYYYMMDD_HHMMSS/{panel}/`
@@ -92,9 +94,11 @@ done
 **Panels covered:**
 - `compact_yeast`: Model organism (S. cerevisiae)
 - `amf_large`: Arbuscular mycorrhizal fungi (symbiotic)
-- `cross_phylum_hgt`: Horizontal gene transfer scenarios
-- `te_rich_pathogen`: Transposable element diversity
-- `two_speed_pathogen`: Evolutionary rate variation
+- `te_rich_pathogen`: TE-rich plant pathogens with full SV-type stress
+- `two_speed_pathogen`: Fast-evolving plant pathogen effector regions
+
+The additional curated preset `cross_phylum_hgt` remains available for targeted
+runs with `--panel` or by setting `REAL_PANELS=...` in `run_all_experiments.sh`.
 
 ## Intermediate Files Preserved
 
@@ -132,7 +136,6 @@ experiments/
     └── YYYYMMDD_HHMMSS/
         ├── compact_yeast/
         ├── amf_large/
-        ├── cross_phylum_hgt/
         ├── te_rich_pathogen/
         └── two_speed_pathogen/
             ├── prepared/
@@ -244,7 +247,7 @@ ls -la experiments/real_data/
 TIMESTAMP="YYYYMMDD_HHMMSS"
 python3 run_real_fungal_benchmark.py prepare \
   --out-dir "experiments/real_data/${TIMESTAMP}/amf_large/prepared" \
-  --panels "amf_large"
+  --panel "amf_large"
 ```
 
 ## Performance Notes

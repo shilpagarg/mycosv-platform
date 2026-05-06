@@ -24,6 +24,7 @@
 #include <iomanip>
 #include <iostream>
 #include <limits>
+#include <list>
 #include <memory>
 #include <mutex>
 #include <numeric>
@@ -119,7 +120,22 @@ struct Options {
     int    queryWindowSize      = 250000;
     int    queryWindowOverlap   = 20000;
     int    saMaxContigMB        = 100;   // --sa-max-contig-mb: skip SA build above this threshold
-    int    maxRefMemoryMB       = 8192;  // --max-ref-memory-mb: cap total ref seq loaded
+    // --max-ref-memory-mb caps the *raw* reference sequence pool stored in
+    // the SimpleRefIndex; per-thread suffix-array caches are bounded
+    // independently by --single-ref-cache-mb (LRU).  Hitting this cap
+    // silently drops ref contigs from the search space, so we want it large
+    // enough to cover a full routed sub-graph on a typical fungal panel:
+    // 32 GiB fits ~30 multi-Gbp basidiomycete refs or ~2000 yeast refs in
+    // a single sub-graph load and is still well within a 128 GiB cgroup.
+    int    maxRefMemoryMB       = 32768; // --max-ref-memory-mb: cap total ref seq loaded
+    // --single-ref-cache-mb: per-query-thread cap on the SingleRefMemCache
+    // that holds suffix arrays for refs touched while calling SVs against a
+    // query.  Each cached SA is ~13x the raw seq bytes, so an unbounded cache
+    // crossed with `--threads` parallel queries blows past job memory on
+    // multi-Gbp ref panels.  When this cap is exceeded the LRU entry is
+    // evicted; 0 disables the cap (legacy behavior).
+    int    singleRefCacheMB     = 1024;
+    bool   noFlatRefFallback    = false; // --no-flat-ref-fallback: skip memory-heavy flat ref fallback
 
     // TOL three-layer
     bool        useTolHierarchical = false;
@@ -273,7 +289,9 @@ static void usage(const char* argv0) {
 "  --query-window-overlap INT (default 20000)\n"
 "  --threads INT            Parallel worker threads (default 1)\n"
 "  --sa-max-contig-mb INT   Skip SA build for ref contigs larger than N MB (default 100)\n"
-"  --max-ref-memory-mb INT  Cap total reference sequence memory in MB (default 8192)\n"
+"  --max-ref-memory-mb INT  Cap total reference sequence memory in MB (default 32768)\n"
+"  --single-ref-cache-mb INT Per-thread SA cache cap in MB (default 1024; 0 = unbounded)\n"
+"  --no-flat-ref-fallback Skip flat ref loading/fallback when hierarchical routing is enabled\n"
 "\n"
 "TOL three-layer hierarchical:\n"
 "  --tol-hierarchical       Enable the three-layer TOL pipeline\n"
@@ -423,6 +441,8 @@ static Options parse_args(int argc, char** argv) {
         else if (x == "--target-genome-size-mb")       o.targetGenomeSizeMB= std::stoi(need(x.c_str(),i));
         else if (x == "--sa-max-contig-mb")            o.saMaxContigMB     = std::stoi(need(x.c_str(),i));
         else if (x == "--max-ref-memory-mb")           o.maxRefMemoryMB    = std::stoi(need(x.c_str(),i));
+        else if (x == "--single-ref-cache-mb")         o.singleRefCacheMB  = std::stoi(need(x.c_str(),i));
+        else if (x == "--no-flat-ref-fallback")        o.noFlatRefFallback = true;
         else if (x == "--query-window-size")           o.queryWindowSize   = std::stoi(need(x.c_str(),i));
         else if (x == "--query-window-overlap")        o.queryWindowOverlap= std::stoi(need(x.c_str(),i));
         else if (x == "--threads")                     o.threads           = std::stoi(need(x.c_str(),i));
@@ -749,13 +769,22 @@ struct SingleRefMemIndex {
     tol::SuffixArray sa;
 };
 
+// LRU cache of per-ref suffix arrays.  Bounded by `cacheMaxBytes` (sum of
+// estimated SA + LCP + ISA + text bytes across cached entries) to keep the
+// per-thread footprint predictable when --threads parallel queries each
+// touch a large routed sub-graph.  Eviction order is least-recently-used.
 class SingleRefMemCache {
 public:
-    explicit SingleRefMemCache(size_t saMaxBytes = 0) : saMaxBytes_(saMaxBytes) {}
+    explicit SingleRefMemCache(size_t saMaxBytes = 0, size_t cacheMaxBytes = 0)
+        : saMaxBytes_(saMaxBytes), cacheMaxBytes_(cacheMaxBytes) {}
 
     SingleRefMemIndex& get(const RefContigInfo* info) {
         auto it = cache_.find(info);
-        if (it != cache_.end()) return it->second;
+        if (it != cache_.end()) {
+            // Hit: promote to LRU front.
+            lru_.splice(lru_.begin(), lru_, it->second.lruIt);
+            return it->second.idx;
+        }
 
         SingleRefMemIndex idx;
         idx.info = info;
@@ -772,13 +801,59 @@ public:
         // on find_mems() will receive no hits and fall through to alternative
         // paths (multi-ref chain or fallback callers).
 
-        auto [inserted, _] = cache_.emplace(info, std::move(idx));
-        return inserted->second;
+        const size_t entryBytes = estimate_entry_bytes(idx);
+        if (cacheMaxBytes_ > 0) {
+            evict_until_fits(entryBytes);
+        }
+
+        lru_.push_front(info);
+        Entry e{std::move(idx), lru_.begin(), entryBytes};
+        currentBytes_ += entryBytes;
+        auto [inserted, _] = cache_.emplace(info, std::move(e));
+        return inserted->second.idx;
     }
 
 private:
-    size_t saMaxBytes_ = 0;
-    std::unordered_map<const RefContigInfo*, SingleRefMemIndex> cache_;
+    struct Entry {
+        SingleRefMemIndex                                idx;
+        std::list<const RefContigInfo*>::iterator        lruIt;
+        size_t                                           bytes = 0;
+    };
+
+    static size_t estimate_entry_bytes(const SingleRefMemIndex& idx) {
+        // SA + LCP + ISA are vector<int> (4 bytes each), text is the
+        // concatenated reference (1 byte/char).  Constant overhead for the
+        // RefSeq metadata is negligible compared to multi-megabyte SAs.
+        const size_t intArrays = (idx.sa.sa.size() + idx.sa.lcp.size() + idx.sa.isa.size())
+                                 * sizeof(int);
+        return idx.sa.text.size() + intArrays;
+    }
+
+    void evict_until_fits(size_t incoming) {
+        // Always make room for the incoming entry; never evict everything if
+        // the single incoming entry is itself larger than the budget — accept
+        // the overrun rather than thrashing.
+        while (!lru_.empty()
+               && currentBytes_ + incoming > cacheMaxBytes_) {
+            const RefContigInfo* victim = lru_.back();
+            auto vit = cache_.find(victim);
+            if (vit == cache_.end()) {
+                // Defensive: keep LRU and map in sync even if we somehow get
+                // out of step (shouldn't happen but cheaper than crashing).
+                lru_.pop_back();
+                continue;
+            }
+            currentBytes_ -= vit->second.bytes;
+            lru_.pop_back();
+            cache_.erase(vit);
+        }
+    }
+
+    size_t saMaxBytes_      = 0;
+    size_t cacheMaxBytes_   = 0;
+    size_t currentBytes_    = 0;
+    std::list<const RefContigInfo*>                          lru_;
+    std::unordered_map<const RefContigInfo*, Entry>          cache_;
 };
 
 static bool try_mem_chain_call_single_ref_cached(
@@ -2481,8 +2556,9 @@ process_query(const std::string& qAsmPath,
     std::optional<SingleRefMemCache> singleRefMemCache;
     if (refIdx != nullptr) refCache.emplace(*refIdx);
     if (refIdx != nullptr) {
-        const size_t saMaxBytes = static_cast<size_t>(std::max(0, o.saMaxContigMB)) * 1024 * 1024;
-        singleRefMemCache.emplace(saMaxBytes);
+        const size_t saMaxBytes    = static_cast<size_t>(std::max(0, o.saMaxContigMB)) * 1024 * 1024;
+        const size_t cacheMaxBytes = static_cast<size_t>(std::max(0, o.singleRefCacheMB)) * 1024 * 1024;
+        singleRefMemCache.emplace(saMaxBytes, cacheMaxBytes);
     }
     auto add_candidates = [&](std::vector<VariantCallBridge>&& calls) {
         for (auto& c : calls) {
@@ -3052,7 +3128,18 @@ int main(int argc, char** argv) {
     if (o.tolAncestralAlign) tol::write_ancestral_tsv_header(anc_out);
 
     const tol::FederatedOptions fo = make_fed_opts(o);
-    const SimpleRefIndex simpleRefIdx = load_simple_ref_index(o);
+    std::optional<SimpleRefIndex> simpleRefIdx;
+    const bool skipFlatRefFallback = o.noFlatRefFallback && o.useTolHierarchical;
+    if (skipFlatRefFallback) {
+        if (!o.quiet)
+            std::cerr << "[info] --no-flat-ref-fallback: skipping flat reference "
+                         "index load; using hierarchical calls only\n";
+    } else {
+        if (o.noFlatRefFallback && !o.quiet)
+            std::cerr << "[warn] --no-flat-ref-fallback ignored because "
+                         "--tol-hierarchical is not enabled\n";
+        simpleRefIdx.emplace(load_simple_ref_index(o));
+    }
     std::optional<tol::AncestralManifestContext> ancestralCtx;
     if (o.tolAncestralAlign) {
         if (o.tolManifest.empty()) {
@@ -3079,7 +3166,29 @@ int main(int argc, char** argv) {
 
     std::unordered_set<std::string> gfa_seen;
     auto process_one = [&](const std::string& qpath) {
-        auto qr = process_query(qpath, o, fo, &simpleRefIdx);
+        QueryResult qr;
+        try {
+            qr = process_query(qpath, o, fo,
+                               simpleRefIdx ? &(*simpleRefIdx) : nullptr);
+        } catch (const std::bad_alloc&) {
+            if (!o.quiet)
+                std::cerr << "[warn] skipping " << qpath
+                          << ": std::bad_alloc while processing query\n";
+            size_t done = ++queries_done;
+            if (!o.quiet)
+                std::cerr << "[progress] " << done << '/' << n_queries
+                          << " queries, " << total_calls.load() << " calls\n";
+            return;
+        } catch (const std::exception& e) {
+            if (!o.quiet)
+                std::cerr << "[warn] skipping " << qpath
+                          << ": " << e.what() << '\n';
+            size_t done = ++queries_done;
+            if (!o.quiet)
+                std::cerr << "[progress] " << done << '/' << n_queries
+                          << " queries, " << total_calls.load() << " calls\n";
+            return;
+        }
 
         for (const auto& c : qr.calls) {
             int cur_id = sv_id++;

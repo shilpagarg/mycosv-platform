@@ -12,7 +12,7 @@
 # Or interactive:
 #   srun --mem=32G --cpus-per-task=32 --time=12:00:00 \
 #       bash retry_real_panels.sh experiments/real_data/20260428_182921 \
-#            te_rich_pathogen two_speed_pathogen amf_large cross_phylum_hgt
+#            compact_yeast amf_large te_rich_pathogen two_speed_pathogen
 #
 # If no panels are given, all panels under RUN_DIR are retried. Each panel/mode
 # writes to benchmark_<mode>_retry/ so the original outputs are preserved.
@@ -50,8 +50,9 @@ else
 fi
 
 if [[ ${#PANELS[@]} -eq 0 ]]; then
-  # Bootstrap missing panels (e.g. two_speed_pathogen) from a fresh prepare.
-  PANELS=(compact_yeast amf_large cross_phylum_hgt te_rich_pathogen two_speed_pathogen)
+  # Bootstrap the default expanded real-data matrix. Additional curated
+  # presets, such as cross_phylum_hgt, can still be retried explicitly.
+  PANELS=(compact_yeast amf_large te_rich_pathogen two_speed_pathogen)
 fi
 
 # Shared across retries and fresh prepares so large FASTA/GFF/FASTQ downloads
@@ -73,6 +74,7 @@ retry_one_panel() {
     REAL_MAX_ASMS_PER_SPECIES="${REAL_MAX_ASMS_PER_SPECIES:-3}"
     REAL_QUERIES_PER_SPECIES="${REAL_QUERIES_PER_SPECIES:-3}"
     REAL_MAX_QUERY_DOWNLOADS="${REAL_MAX_QUERY_DOWNLOADS:-6}"
+    REAL_READ_ACCESSIONS_PER_SPECIES="${REAL_READ_ACCESSIONS_PER_SPECIES:-1}"
     python3 run_real_fungal_benchmark.py prepare \
         --out-dir "${panel_dir}/prepared" \
         --panel "${panel}" \
@@ -82,7 +84,7 @@ retry_one_panel() {
         --max-ref-downloads "${REAL_MAX_REF_DOWNLOADS}" \
         --max-query-downloads "${REAL_MAX_QUERY_DOWNLOADS}" \
         --query-mode mixed \
-        --read-accessions-per-species 2 \
+        --read-accessions-per-species "${REAL_READ_ACCESSIONS_PER_SPECIES}" \
         --allow-no-queries \
         --data-cache-dir "${DATA_CACHE_DIR}" \
         2>&1 | tee "${panel_dir}/prepare.retry.log"

@@ -354,6 +354,7 @@ def test_run_mycosv_reuses_prebuilt_index(tmp_path: Path, monkeypatch):
     assert "--tol-build-index" not in cmd, "reuse path must NOT rebuild the index"
     assert str(prebuilt_idx.resolve()) in cmd
     assert str(prebuilt_reg.resolve()) in cmd
+    assert "--no-flat-ref-fallback" in cmd
 
 
 def test_run_mycosv_rejects_invalid_reuse_index(tmp_path: Path, monkeypatch):
