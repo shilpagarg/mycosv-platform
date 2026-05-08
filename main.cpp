@@ -2599,8 +2599,39 @@ process_query(const std::string& qAsmPath,
             qr.calls = filter_low_coverage_read_artifacts(std::move(qr.calls), prep.report);
         }
     } else {
+        // No flat-ref fallback active (--no-flat-ref-fallback + tol-hierarchical).
+        // candidates here only carry hierarchical calls; without refIdx we
+        // can't rerun candidate_priority_score, but we must still pick the
+        // BEST hierarchical candidate per query contig — taking front()
+        // discarded higher-scoring calls and was the headline driver of the
+        // ~9-call-per-query recall collapse on heavy panels (amf_large /
+        // te_rich_pathogen / two_speed_pathogen).
+        auto fallback_score = [](const VariantCallBridge& c) {
+            // Block score is the primary chain-support metric MycoSV reports;
+            // tie-break on |svlen| so larger structural events outrank tiny
+            // boundary noise when block scores are equal.
+            return c.blockScore +
+                   0.001 * static_cast<double>(std::abs(c.svlen)) +
+                   (c.type == "OFF_REF" && c.annotation == "NOVEL" ? 1.0 : 0.0);
+        };
         for (auto& kv : candidates) {
-            if (!kv.second.empty()) qr.calls.push_back(std::move(kv.second.front()));
+            if (kv.second.empty()) continue;
+            const VariantCallBridge* best = &kv.second.front();
+            double bestScore = fallback_score(*best);
+            for (auto it = kv.second.begin() + 1; it != kv.second.end(); ++it) {
+                const double s = fallback_score(*it);
+                if (s > bestScore) {
+                    best = &(*it);
+                    bestScore = s;
+                }
+            }
+            VariantCallBridge chosen = *best;
+            chosen.queryMode = modeLabel;
+            qr.calls.push_back(std::move(chosen));
+        }
+        if (prep.report.mode != query_input::QueryMode::ASSEMBLY) {
+            qr.calls = deduplicate_read_mode_events(std::move(qr.calls));
+            qr.calls = filter_low_coverage_read_artifacts(std::move(qr.calls), prep.report);
         }
     }
 

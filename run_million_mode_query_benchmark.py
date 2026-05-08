@@ -24,7 +24,22 @@ DEFAULT_ANALYZE = ROOT / "analyze_new_biology_candidates.py"
 
 
 def run(cmd: list[str], cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(cmd, cwd=str(cwd) if cwd else None, text=True, capture_output=True, check=True, timeout=7200)
+    # Capture as bytes then decode with errors="replace" so a non-UTF-8 byte
+    # in tool stderr (long-read FASTQ headers, comparator log warnings) cannot
+    # crash the wrapper before we inspect rc/stderr.
+    completed = subprocess.run(
+        cmd, cwd=str(cwd) if cwd else None,
+        capture_output=True, check=False, timeout=7200,
+    )
+    stdout_text = completed.stdout.decode("utf-8", errors="replace") if completed.stdout else ""
+    stderr_text = completed.stderr.decode("utf-8", errors="replace") if completed.stderr else ""
+    if completed.returncode != 0:
+        raise subprocess.CalledProcessError(
+            completed.returncode, completed.args, stdout_text, stderr_text,
+        )
+    return subprocess.CompletedProcess(
+        completed.args, completed.returncode, stdout_text, stderr_text,
+    )
 
 
 def compile_binary(main_cpp: Path, binary_path: Path) -> None:

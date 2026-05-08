@@ -10,6 +10,7 @@ import gzip
 import io
 import json
 import os
+import random
 import re
 import shutil
 import subprocess
@@ -39,6 +40,8 @@ NCBI_ASSEMBLY_SUMMARY = {
     "ncbi-refseq": "https://ftp.ncbi.nlm.nih.gov/genomes/refseq/fungi/assembly_summary.txt",
     "ncbi-genbank": "https://ftp.ncbi.nlm.nih.gov/genomes/genbank/fungi/assembly_summary.txt",
 }
+NCBI_BEST_SOURCE = "ncbi-best"
+NCBI_SOURCE_CHOICES = sorted([*NCBI_ASSEMBLY_SUMMARY, NCBI_BEST_SOURCE])
 
 PUBLIC_RESOURCE_LINKS: list[dict[str, str]] = [
     {
@@ -70,6 +73,16 @@ PUBLIC_RESOURCE_LINKS: list[dict[str, str]] = [
         "label": "ensembl_fungi",
         "url": "https://fungi.ensembl.org/index.html",
         "description": "Ensembl Fungi portal and public dumps",
+    },
+    {
+        "label": "ensembl_fungi_ftp",
+        "url": "https://fungi.ensembl.org/info/data/ftp/index.html",
+        "description": "Ensembl Fungi public FTP downloads for FASTA, GTF/GFF3, GenBank and other annotation files",
+    },
+    {
+        "label": "ncbi_datasets",
+        "url": "https://www.ncbi.nlm.nih.gov/datasets/",
+        "description": "NCBI Datasets genome packages and programmatic assembly download API",
     },
     {
         "label": "mycocosm",
@@ -137,10 +150,19 @@ ENA_FILEREPORT_FIELDS = [
     "fastq_ftp",
     "fastq_md5",
     "fastq_bytes",
+    "read_count",
+    "base_count",
     "submitted_ftp",
     "submitted_md5",
     "submitted_bytes",
 ]
+
+# Minimum read count for an ENA run to be considered for SV calling. Below this
+# the run is almost certainly a sentinel/test upload (e.g. SRR33624766 reported
+# 1 read) and would fail every comparator with "no alignments". Picked at 1 000
+# so a single MiSeq lane (~10⁶ reads) trivially passes while obvious junk like
+# "1 read" / "1000 reads" deposits don't get selected and waste a download.
+_ENA_MIN_READS = 1000
 
 PANEL_PRESETS: dict[str, list[dict[str, str]]] = {
     "compact_yeast": [
@@ -333,14 +355,26 @@ def run(
                 pass
 
         preexec_fn = _limit_child
-    return subprocess.run(
+    # Capture as bytes and decode manually with errors="replace": some tools
+    # (svim/sniffles/cutesv on long-read FASTQs with non-ASCII headers) emit
+    # non-UTF-8 bytes on stderr, which crashes text=True with UnicodeDecodeError
+    # before the wrapper can inspect rc/stderr_tail.
+    completed = subprocess.run(
         cmd,
         cwd=str(cwd) if cwd else None,
-        text=True,
         capture_output=True,
-        check=True,
+        check=False,
         timeout=timeout,
         preexec_fn=preexec_fn,
+    )
+    stdout_text = completed.stdout.decode("utf-8", errors="replace") if completed.stdout else ""
+    stderr_text = completed.stderr.decode("utf-8", errors="replace") if completed.stderr else ""
+    if completed.returncode != 0:
+        raise subprocess.CalledProcessError(
+            completed.returncode, completed.args, stdout_text, stderr_text,
+        )
+    return subprocess.CompletedProcess(
+        completed.args, completed.returncode, stdout_text, stderr_text,
     )
 
 
@@ -605,9 +639,19 @@ _HTTP_TIMEOUT = 300  # seconds; prevents hanging on slow/unresponsive NCBI
 # the bulk download loop sees.  4xx other than 429 are permanent (e.g. 404
 # for an assembly that doesn't expose a GFF) and are not retried.
 _HTTP_RETRY_STATUS = {429, 500, 502, 503, 504}
-_HTTP_MAX_ATTEMPTS = 5
-_HTTP_BACKOFF_BASE = 2.0  # seconds; doubles each attempt -> 2,4,8,16
-_HTTP_BACKOFF_CAP  = 60.0
+# 8 attempts at 2,4,8,16,32,60,60,60 = ~242 s end-to-end. The previous 5-attempt
+# schedule (max 30s total) gave up while NCBI's ftp.ncbi.nlm.nih.gov mirror was
+# still in a 503 burst — saw 4 hard failures (GCA_000507425_3, GCA_003184365_1,
+# GCA_020503465_1, GCA_051529335_1) in the prep run. Going to 8 attempts plus a
+# longer backoff cap keeps the failure rate near zero on a typical server hiccup
+# without blowing wall time on a permanent outage.
+_HTTP_MAX_ATTEMPTS = 8
+_HTTP_BACKOFF_BASE = 2.0
+_HTTP_BACKOFF_CAP  = 90.0
+# Max workers for ftp.ncbi.nlm.nih.gov — they tolerate ~8 concurrent streams
+# from a single client comfortably, but 16 (the previous default) was the
+# proximate cause of the 503 storm seen in 2026-05-06's run.
+_HTTP_MAX_PARALLEL_FTP_NCBI = 8
 
 
 def _http_retry_sleep(attempt: int, retry_after: str | None) -> float:
@@ -620,7 +664,11 @@ def _http_retry_sleep(attempt: int, retry_after: str | None) -> float:
                 return min(wait, _HTTP_BACKOFF_CAP)
         except ValueError:
             pass
-    return min(_HTTP_BACKOFF_BASE * (2 ** attempt), _HTTP_BACKOFF_CAP)
+    # Add small jitter so a thread-pool of N workers does not retry in lockstep
+    # and re-trigger the same 503 burst.
+    base = min(_HTTP_BACKOFF_BASE * (2 ** attempt), _HTTP_BACKOFF_CAP)
+    jitter = random.uniform(0.0, min(base * 0.25, 5.0))
+    return base + jitter
 
 
 def _http_open_with_retry(req: urllib.request.Request):
@@ -727,14 +775,18 @@ def maybe_gunzip(path: Path, keep_gz: bool = True) -> Path:
 
 
 def open_text_auto(path: Path):
+    # Use errors="replace" so malformed bytes inside ENA-fetched FASTQs (mixed
+    # encodings, partial gzip streams, or rare non-ASCII headers) don't kill
+    # the bounded-FASTQ writer or the comparator pipeline. Replacement chars
+    # only appear in headers/qual lines that downstream tools tolerate.
     try:
         with path.open("rb") as fh:
             magic = fh.read(2)
     except OSError:
         magic = b""
     if path.suffix == ".gz" or magic == b"\x1f\x8b":
-        return gzip.open(path, "rt", encoding="utf-8")
-    return path.open("r", encoding="utf-8")
+        return gzip.open(path, "rt", encoding="utf-8", errors="replace")
+    return path.open("r", encoding="utf-8", errors="replace")
 
 
 def _fastq_record_iter(path: Path):
@@ -935,6 +987,27 @@ def parse_assembly_summary(text: str) -> list[dict[str, str]]:
     return rows
 
 
+def ncbi_source_components(source: str) -> list[str]:
+    if source == NCBI_BEST_SOURCE:
+        return ["ncbi-refseq", "ncbi-genbank"]
+    if source not in NCBI_ASSEMBLY_SUMMARY:
+        raise ValueError(f"Unknown NCBI source {source!r}")
+    return [source]
+
+
+def assembly_summary_cache_path(cache_base: Path, source: str) -> Path:
+    return cache_base / "assembly_summaries" / f"{source}_fungi_assembly_summary.txt"
+
+
+def source_priority(row: dict[str, str]) -> int:
+    source = row.get("_catalog_source") or row.get("source_catalog") or ""
+    if source == "ncbi-refseq":
+        return 2
+    if source == "ncbi-genbank":
+        return 1
+    return 0
+
+
 def assembly_level_rank(level: str) -> int:
     level = (level or "").lower()
     if level == "complete genome":
@@ -948,7 +1021,7 @@ def assembly_level_rank(level: str) -> int:
     return 0
 
 
-def row_quality_key(row: dict[str, str]) -> tuple[int, int, int, int, str]:
+def row_quality_key(row: dict[str, str]) -> tuple[int, int, int, int, int, str]:
     refseq_category = (row.get("refseq_category") or "").lower()
     refscore = 0
     if refseq_category == "reference genome":
@@ -961,12 +1034,66 @@ def row_quality_key(row: dict[str, str]) -> tuple[int, int, int, int, str]:
     complete = 1 if (row.get("genome_rep") or "").lower() == "full" else 0
     release_date = row.get("seq_rel_date") or ""
     return (
-        refscore,
         latest,
         assembly_level_rank(row.get("assembly_level", "")),
         complete,
+        refscore,
+        source_priority(row),
         release_date,
     )
+
+
+def assembly_pair_key(row: dict[str, str]) -> str:
+    accession = (row.get("assembly_accession") or "").strip()
+    paired = (row.get("gbrs_paired_asm") or "").strip()
+    if paired and paired.lower() not in {"na", ".", "none"}:
+        return "|".join(sorted([accession, paired]))
+    return accession
+
+
+def deduplicate_best_assembly_rows(rows: list[dict[str, str]]) -> list[dict[str, str]]:
+    best_by_pair: dict[str, dict[str, str]] = {}
+    for row in rows:
+        key = assembly_pair_key(row)
+        if not key:
+            continue
+        current = best_by_pair.get(key)
+        if current is None or row_quality_key(row) > row_quality_key(current):
+            best_by_pair[key] = row
+    return list(best_by_pair.values())
+
+
+def fetch_ncbi_assembly_rows(
+    source: str,
+    cache_base: Path,
+    *,
+    progress: bool = False,
+) -> tuple[list[dict[str, str]], list[Path]]:
+    rows: list[dict[str, str]] = []
+    cache_paths: list[Path] = []
+    for component in ncbi_source_components(source):
+        summary_url = NCBI_ASSEMBLY_SUMMARY[component]
+        cache_path = assembly_summary_cache_path(cache_base, component)
+        cache_paths.append(cache_path)
+        if progress:
+            print(f"[1/4] Fetching NCBI assembly summary: {summary_url}", flush=True)
+        summary_text = http_get_text_cached(summary_url, cache_path)
+        parsed = parse_assembly_summary(summary_text)
+        for row in parsed:
+            row["_catalog_source"] = component
+        rows.extend(parsed)
+        if progress:
+            print(f"      parsed {len(parsed)} rows from {component}", flush=True)
+    if len(ncbi_source_components(source)) > 1:
+        before = len(rows)
+        rows = deduplicate_best_assembly_rows(rows)
+        if progress:
+            print(
+                f"      retained {len(rows)} best assemblies after RefSeq/GenBank pairing "
+                f"deduplication ({before} raw rows)",
+                flush=True,
+            )
+    return rows, cache_paths
 
 
 def species_label_for_row(row: dict[str, str]) -> str:
@@ -1002,6 +1129,22 @@ SPECIES_ALIASES: dict[str, list[str]] = {
     "candida tropicalis": ["[candida] tropicalis"],
     # Cryptococcus species complex split — keep both names recognised.
     "cryptococcus neoformans": ["cryptococcus neoformans var. grubii", "cryptococcus deneoformans"],
+    # Leptosphaeria maculans — split into species complex (LepmaJN3, LepmaPHW1
+    # etc.). NCBI assemblies still use `Leptosphaeria maculans` in
+    # organism_name but several MAGs / re-annotations use `Plenodomus lingam`.
+    # Adding both keeps the panel selection robust against the 2017 reclass.
+    "leptosphaeria maculans": [
+        "leptosphaeria maculans 'brassicae'",
+        "leptosphaeria maculans 'lepidii'",
+        "plenodomus lingam",
+    ],
+    # Ustilago maydis — modern teleomorph name is Mycosarcoma maydis (2018
+    # ICTF revision). NCBI assemblies still mostly carry `Ustilago maydis`
+    # but newer Mexican/U.S. plant-pathology submissions use Mycosarcoma.
+    "ustilago maydis": [
+        "mycosarcoma maydis",
+        "[ustilago] maydis",
+    ],
 }
 
 
@@ -1044,7 +1187,7 @@ def select_all_public_rows(
         if latest_only and (row.get("version_status") or "").lower() != "latest":
             continue
         selected.append(row)
-    selected.sort(key=lambda r: (species_group_key(r), row_quality_key(r)), reverse=True)
+    selected.sort(key=lambda r: (row_quality_key(r), species_group_key(r)), reverse=True)
     if max_total > 0:
         return selected[:max_total]
     return selected
@@ -1190,12 +1333,55 @@ def fetch_ncbi_biosample_phenotypes(
 
 
 def ncbi_download_targets(row: dict[str, str], include_gff: bool) -> list[tuple[str, str]]:
-    ftp_path = row["ftp_path"]
-    stem = ftp_path.rstrip("/").split("/")[-1]
+    ftp_path = row["ftp_path"].rstrip("/")
+    stem = ftp_path.split("/")[-1]
     targets = [(f"{ftp_path}/{stem}_genomic.fna.gz", f"{stem}_genomic.fna.gz")]
     if include_gff:
         targets.append((f"{ftp_path}/{stem}_genomic.gff.gz", f"{stem}_genomic.gff.gz"))
     return targets
+
+
+def ncbi_genbank_target(row: dict[str, str]) -> tuple[str, str]:
+    ftp_path = row["ftp_path"].rstrip("/")
+    stem = ftp_path.split("/")[-1]
+    return f"{ftp_path}/{stem}_genomic.gbff.gz", f"{stem}_genomic.gbff.gz"
+
+
+def download_ncbi_gene_annotation_source(
+    row: dict[str, str],
+    asm_name: str,
+    dest_dir: Path,
+    role_label: str,
+) -> Path | None:
+    """Download the best public gene-annotation source for one NCBI assembly.
+
+    NCBI's GenBank fungal assemblies often expose FASTA plus GenBank flatfiles
+    but no GFF. Prefer GFF when it exists; otherwise fall back to GBFF so we can
+    still mine gene/CDS coordinates. A missing/empty annotation source is not a
+    fatal download error because many GenBank assemblies are sequence-only.
+    """
+    gff_url, gff_filename = ncbi_download_targets(row, include_gff=True)[1]
+    try:
+        return materialize_entry(gff_url, dest_dir / gff_filename, keep_gz=True)
+    except urllib.error.HTTPError as exc:
+        if getattr(exc, "code", None) != 404:
+            raise
+    gbff_url, gbff_filename = ncbi_genbank_target(row)
+    try:
+        gbff = materialize_entry(gbff_url, dest_dir / gbff_filename, keep_gz=True)
+    except urllib.error.HTTPError as exc:
+        if getattr(exc, "code", None) == 404:
+            sys.stderr.write(
+                f"[gene-annot] no public gene annotation source for {role_label}{asm_name} "
+                "(NCBI has neither genomic.gff.gz nor genomic.gbff.gz)\n"
+            )
+            return None
+        raise
+    sys.stderr.write(
+        f"[gene-annot] no GFF for {role_label}{asm_name}; "
+        f"using NCBI GenBank flatfile fallback {gbff.name}\n"
+    )
+    return gbff
 
 
 # ============================================================================
@@ -1280,6 +1466,9 @@ def fetch_atlas_experiment_analytics(
     """
     cache_dir.mkdir(parents=True, exist_ok=True)
     cached = cache_dir / f"{experiment_accession}.analytics.tsv"
+    unavailable = cached.with_suffix(cached.suffix + ".unavailable")
+    if unavailable.exists():
+        return None
     if cached.exists() and cached.stat().st_size > 0:
         try:
             cached_text = cached.read_text(encoding="utf-8", errors="replace")
@@ -1299,6 +1488,11 @@ def fetch_atlas_experiment_analytics(
             f"[expression-atlas] {experiment_accession}: cached analytics "
             f"was not TSV; quarantined as {bad.name}\n"
         )
+        try:
+            unavailable.write_text("cached analytics was not a TSV\n", encoding="utf-8")
+        except OSError:
+            pass
+        return None
     url = (
         f"https://www.ebi.ac.uk/gxa/experiments/{experiment_accession}"
         f"/download/all-analytics?accessKey="
@@ -1317,9 +1511,16 @@ def fetch_atlas_experiment_analytics(
             bad.write_text(text, encoding="utf-8")
         except OSError:
             pass
+        try:
+            unavailable.write_text(
+                "analytics endpoint did not return a gene analytics TSV\n",
+                encoding="utf-8",
+            )
+        except OSError:
+            pass
         sys.stderr.write(
             f"[expression-atlas] {experiment_accession}: analytics endpoint "
-            f"did not return a gene analytics TSV; skipping\n"
+            f"did not return a gene analytics TSV; cached as unavailable\n"
         )
         return None
     cached.write_text(text, encoding="utf-8")
@@ -1610,8 +1811,162 @@ def _parse_gff_attributes(attr_field: str) -> dict[str, str]:
     return out
 
 
+_GBFF_GENE_TYPES = frozenset({
+    "gene",
+    "protein_coding_gene",
+    "pseudogene",
+    "cds",
+})
+
+
+def _annotation_source_kind(path: Path) -> str:
+    name = path.name.lower()
+    if name.endswith(".gbff") or name.endswith(".gbff.gz"):
+        return "gbff"
+    return "gff"
+
+
+def _parse_genbank_location(location: str) -> tuple[int, int, str] | None:
+    nums = [int(x) for x in re.findall(r"\d+", location)]
+    if not nums:
+        return None
+    start = min(nums)
+    end = max(nums)
+    strand = "-" if "complement" in location.lower() else "+"
+    return start, end, strand
+
+
+def _clean_genbank_qualifier_value(value: str) -> str:
+    value = value.strip()
+    if value.startswith('"') and value.endswith('"') and len(value) >= 2:
+        value = value[1:-1]
+    return value.replace('""', '"')
+
+
+def _flush_genbank_feature(
+    rows: list[dict[str, Any]],
+    seen: set[tuple[str, str, str]],
+    asm_name: str,
+    contig: str,
+    feature: dict[str, Any] | None,
+) -> None:
+    if not feature or not contig:
+        return
+    ftype = str(feature.get("type", "")).lower()
+    if ftype not in _GBFF_GENE_TYPES:
+        return
+    loc = _parse_genbank_location(str(feature.get("location", "")))
+    if loc is None:
+        return
+    start, end, strand = loc
+    quals: dict[str, str] = feature.get("qualifiers", {})
+    gene_id = (
+        quals.get("locus_tag")
+        or quals.get("gene")
+        or quals.get("old_locus_tag")
+        or quals.get("protein_id")
+        or quals.get("db_xref")
+        or ""
+    )
+    if not gene_id:
+        gene_id = f"{ftype}:{contig}:{start}-{end}:{strand}"
+    key = (asm_name, contig, gene_id)
+    if key in seen:
+        return
+    seen.add(key)
+    rows.append({
+        "query_asm": asm_name,
+        "query_contig": contig,
+        "gene_id": gene_id,
+        "gene_name": quals.get("gene") or quals.get("locus_tag") or gene_id,
+        "start": start,
+        "end": end,
+        "strand": strand,
+        "biotype": quals.get("gene_biotype") or quals.get("gbkey") or ftype,
+        "product": quals.get("product", ""),
+    })
+
+
+def gbff_to_gene_annotations(gbff_paths: list[tuple[str, Path]]) -> list[dict[str, Any]]:
+    """Parse NCBI GenBank flatfiles into the same row schema as GFF.
+
+    Many GenBank fungal assemblies expose a GBFF feature table but no public
+    GFF. This lightweight parser extracts gene/CDS spans without pulling in a
+    BioPython dependency for the benchmark environment.
+    """
+    rows: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, str]] = set()
+    feature_re = re.compile(r"^     (\S+)\s+(.+)$")
+    qualifier_re = re.compile(r"^                     /([^=]+)(?:=(.*))?$")
+    continuation_re = re.compile(r"^                     ([^/].*)$")
+    for asm_name, gbff_path in gbff_paths:
+        if not gbff_path.exists():
+            continue
+        opener = gzip.open if gbff_path.suffix == ".gz" else open
+        contig = ""
+        in_features = False
+        current: dict[str, Any] | None = None
+        current_qualifier: str | None = None
+        try:
+            with opener(gbff_path, "rt", encoding="utf-8", errors="replace") as fh:
+                for line in fh:
+                    line = line.rstrip("\n")
+                    if line.startswith("LOCUS"):
+                        _flush_genbank_feature(rows, seen, asm_name, contig, current)
+                        current = None
+                        current_qualifier = None
+                        in_features = False
+                        parts = line.split()
+                        contig = parts[1] if len(parts) > 1 else contig
+                        continue
+                    if line.startswith("VERSION"):
+                        parts = line.split()
+                        if len(parts) > 1:
+                            contig = parts[1]
+                        continue
+                    if line.startswith("FEATURES"):
+                        in_features = True
+                        continue
+                    if line.startswith("ORIGIN") or line == "//":
+                        _flush_genbank_feature(rows, seen, asm_name, contig, current)
+                        current = None
+                        current_qualifier = None
+                        in_features = False
+                        continue
+                    if not in_features:
+                        continue
+                    match = feature_re.match(line)
+                    if match:
+                        _flush_genbank_feature(rows, seen, asm_name, contig, current)
+                        current = {
+                            "type": match.group(1),
+                            "location": match.group(2).strip(),
+                            "qualifiers": {},
+                        }
+                        current_qualifier = None
+                        continue
+                    if current is None:
+                        continue
+                    qmatch = qualifier_re.match(line)
+                    if qmatch:
+                        qkey = qmatch.group(1).strip().lower()
+                        qval = _clean_genbank_qualifier_value(qmatch.group(2) or "")
+                        current["qualifiers"][qkey] = qval
+                        current_qualifier = qkey
+                        continue
+                    cmatch = continuation_re.match(line)
+                    if cmatch and current_qualifier:
+                        prev = current["qualifiers"].get(current_qualifier, "")
+                        cont = _clean_genbank_qualifier_value(cmatch.group(1))
+                        current["qualifiers"][current_qualifier] = f"{prev} {cont}".strip()
+        except OSError as exc:
+            sys.stderr.write(f"[gene-annot] skip {gbff_path}: {type(exc).__name__}: {exc}\n")
+            continue
+    return rows
+
+
 def gff_to_gene_annotations(gff_paths: list[tuple[str, Path]]) -> list[dict[str, Any]]:
-    """Convert a list of (asm_name, gff.gz path) tuples into the row schema
+    """Convert a list of (asm_name, annotation path) tuples into the row schema
     expected by analyze_new_biology_candidates.load_gene_annotations.
 
     Output columns: query_asm, query_contig, gene_id, gene_name, start, end.
@@ -1621,7 +1976,11 @@ def gff_to_gene_annotations(gff_paths: list[tuple[str, Path]]) -> list[dict[str,
     """
     rows: list[dict[str, Any]] = []
     seen: set[tuple[str, str, str]] = set()
+    gbff_paths: list[tuple[str, Path]] = []
     for asm_name, gff_path in gff_paths:
+        if _annotation_source_kind(gff_path) == "gbff":
+            gbff_paths.append((asm_name, gff_path))
+            continue
         if not gff_path.exists():
             continue
         opener = gzip.open if gff_path.suffix == ".gz" else open
@@ -1671,6 +2030,8 @@ def gff_to_gene_annotations(gff_paths: list[tuple[str, Path]]) -> list[dict[str,
         except OSError as exc:
             sys.stderr.write(f"[gene-annot] skip {gff_path}: {type(exc).__name__}: {exc}\n")
             continue
+    if gbff_paths:
+        rows.extend(gbff_to_gene_annotations(gbff_paths))
     return rows
 
 
@@ -1678,7 +2039,7 @@ def write_gene_annotations_tsv(out_path: Path, gff_paths: list[tuple[str, Path]]
     rows = gff_to_gene_annotations(gff_paths)
     if not rows:
         sys.stderr.write(
-            f"[gene-annot] no gene records parsed from {len(gff_paths)} GFF file(s); "
+            f"[gene-annot] no gene records parsed from {len(gff_paths)} annotation source(s); "
             f"skipping {out_path.name}\n"
         )
         return None
@@ -1782,7 +2143,13 @@ def sequence_kind_from_name(name: str) -> str:
         return "fastq"
     if lower.endswith((".fasta.gz", ".fa.gz", ".fna.gz", ".fasta", ".fa", ".fna")):
         return "fasta"
-    return "fastq"
+    # Older ENA submissions for PacBio RSII/Sequel I expose `.bas.h5`,
+    # `.bax.h5`, and `.metadata.xml` payloads via submitted_ftp. Earlier this
+    # function defaulted unknown extensions to "fastq", so the downloader
+    # happily concatenated the HDF5/XML bytes into a `.fastq` file and every
+    # downstream comparator died with `'utf-8' codec can't decode byte ...`.
+    # Return "unknown" so callers can filter explicitly.
+    return "unknown"
 
 
 def preferred_platforms_for_mode(query_mode: str) -> set[str]:
@@ -1844,6 +2211,17 @@ def _long_read_platform_score(row: dict[str, str]) -> int:
     return -1
 
 
+def _ena_read_count(row: dict[str, str]) -> int:
+    """Return the run's reported read_count, or 0 if missing/non-numeric."""
+    raw = (row.get("read_count") or "").strip()
+    if not raw:
+        return 0
+    try:
+        return int(raw)
+    except ValueError:
+        return 0
+
+
 def filter_ena_rows_for_mode(rows: list[dict[str, str]], query_mode: str) -> list[dict[str, str]]:
     preferred = preferred_platforms_for_mode(query_mode)
     if not preferred:
@@ -1855,6 +2233,12 @@ def filter_ena_rows_for_mode(rows: list[dict[str, str]], query_mode: str) -> lis
     # accessions for both short-reads and long-reads modes — the resulting
     # files were byte-identical, mislabeled, and broke downstream platform
     # detection in the SV callers.
+    # Drop runs with read_count below the noise floor — saw `SRR33624766: 1
+    # reads` in production, which is a sentinel ENA upload and aligns to nothing.
+    # When read_count is absent (older submissions), keep the row so we don't
+    # over-filter species with unreliable metadata.
+    matched = [row for row in matched
+               if _ena_read_count(row) == 0 or _ena_read_count(row) >= _ENA_MIN_READS]
     result = matched
     # For long reads, rank so PacBio HiFi > ONT PromethION > ONT MinION > PacBio CLR.
     if query_mode == "long-reads":
@@ -1904,18 +2288,23 @@ def select_ena_read_sources(run_rows: list[dict[str, str]], query_mode: str, max
     meta_rows: list[dict[str, str]] = []
     picked_runs = 0
     for row in filtered:
-        row_urls = split_values(row.get("fastq_ftp", ""))
-        if not row_urls:
-            submitted = [
-                item for item in split_values(row.get("submitted_ftp", ""))
-                if sequence_kind_from_name(item) in {"fastq", "fasta"}
-            ]
-            row_urls = submitted
+        # Only accept ENA's curated FASTQ mirrors. submitted_ftp can carry
+        # `.bas.h5`, `.bax.h5`, and `.metadata.xml` for older PacBio runs (e.g.
+        # ERR3500124), which the previous fallback happily concatenated into a
+        # `.fastq` file — every downstream caller then died with a UTF-8
+        # decode error. If fastq_ftp is empty we have no usable reads.
+        row_urls = [
+            item for item in split_values(row.get("fastq_ftp", ""))
+            if sequence_kind_from_name(item) == "fastq"
+        ]
         if not row_urls:
             continue
         picked_runs += 1
-        for item in row_urls:
-            urls.append(normalise_download_url(item if looks_like_url(item) else f"https://{item}"))
+        normalized_urls = [
+            normalise_download_url(item if looks_like_url(item) else f"https://{item}")
+            for item in row_urls
+        ]
+        urls.extend(normalized_urls)
         meta_rows.append({
             "run_accession": row.get("run_accession", "."),
             "study_accession": row.get("study_accession", "."),
@@ -1925,10 +2314,18 @@ def select_ena_read_sources(run_rows: list[dict[str, str]], query_mode: str, max
             "library_layout": row.get("library_layout", "."),
             "library_strategy": row.get("library_strategy", "."),
             "source_url": ena_filereport_url(row.get("run_accession") or row.get("study_accession") or row.get("sample_accession") or "."),
+            # Keep the exact file group for this run. Callers that retry
+            # run-by-run must preserve paired-end mates instead of zipping one
+            # metadata row against a flattened URL list.
+            "selected_urls": ";".join(normalized_urls),
         })
         if max_runs > 0 and picked_runs >= max_runs:
             break
     return urls, meta_rows
+
+
+def selected_urls_from_ena_meta(meta: dict[str, str]) -> list[str]:
+    return split_values(meta.get("selected_urls", ""))
 
 
 def merge_sequence_sources(sources: list[str], dest_prefix: Path) -> Path:
@@ -1942,10 +2339,27 @@ def merge_sequence_sources(sources: list[str], dest_prefix: Path) -> Path:
     if not sources:
         raise ValueError("No sequence sources were provided")
     kind = sequence_kind_from_name(sources[0])
+    if kind == "unknown":
+        raise ValueError(
+            f"Cannot identify sequence kind from filename: {sources[0]}. "
+            "Expected .fastq[.gz]/.fq[.gz]/.fasta[.gz]/.fa[.gz]/.fna[.gz]."
+        )
     suffix = ".fastq" if kind == "fastq" else ".fasta"
     out_path = dest_prefix.with_suffix(suffix)
     if out_path.exists() and out_path.stat().st_size > 0:
-        return out_path
+        if kind == "fastq":
+            try:
+                _validate_fastq_payload(out_path)
+            except ValueError as exc:
+                # Cached file from a previous run is corrupt (e.g. PacBio
+                # bas.h5 / metadata.xml saved as `.fastq`). Drop it so the
+                # caller can retry against a different ENA accession instead
+                # of silently re-using a 10 GB blob of garbage forever.
+                sys.stderr.write(f"[reads-mode] dropping corrupt cached payload: {exc}\n")
+                # _validate_fastq_payload already unlinked the file before
+                # raising — fall through to the re-download path.
+        if out_path.exists() and out_path.stat().st_size > 0:
+            return out_path
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with out_path.open("wb") as out_fh:
         for idx, src in enumerate(sources):
@@ -1984,7 +2398,38 @@ def merge_sequence_sources(sources: list[str], dest_prefix: Path) -> Path:
                     shutil.copyfileobj(in_fh, out_fh)
             if local_part != out_path and local_part.parent == dest_prefix.parent and local_part.exists():
                 local_part.unlink()
+    if kind == "fastq":
+        _validate_fastq_payload(out_path)
     return out_path
+
+
+def _validate_fastq_payload(path: Path) -> None:
+    """Sanity-check that a freshly merged FASTQ actually starts with `@`.
+
+    ENA `submitted_ftp` and a few legacy mirrors occasionally serve PacBio
+    `.bas.h5` / `.metadata.xml` payloads (XML preamble + HDF5 binary) that
+    look superficially like a generic blob. The previous code wrote those
+    bytes to a `.fastq` file and every downstream comparator then died with
+    `'utf-8' codec can't decode byte 0x89 in position N: invalid start byte`.
+    Rather than emit a corrupt file, fail fast so the caller can drop the
+    run and pick a different ENA accession.
+    """
+    try:
+        with path.open("rb") as fh:
+            head = fh.read(4)
+    except OSError:
+        return
+    if not head:
+        return
+    if head[:2] == b"\x1f\x8b":  # gzipped FASTQ — content checked at consumption.
+        return
+    if head[:1] != b"@":
+        path.unlink(missing_ok=True)
+        snippet = head.decode("ascii", errors="replace") if all(0x20 <= b < 0x7F or b in {0x09, 0x0A, 0x0D} for b in head) else head.hex()
+        raise ValueError(
+            f"Downloaded FASTQ at {path} does not start with '@' (got {snippet!r}); "
+            "ENA likely returned a non-FASTQ payload (e.g. PacBio bas.h5 or metadata.xml)."
+        )
 
 
 def materialize_query_input(
@@ -2182,12 +2627,7 @@ def prepare_from_ncbi(args: argparse.Namespace) -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
     cache_base = data_cache_base(args, out_dir)
     cache_base.mkdir(parents=True, exist_ok=True)
-    summary_url = NCBI_ASSEMBLY_SUMMARY[args.source]
-    summary_text = http_get_text_cached(
-        summary_url,
-        cache_base / "assembly_summaries" / f"{args.source}_fungi_assembly_summary.txt",
-    )
-    all_rows = parse_assembly_summary(summary_text)
+    all_rows, assembly_summary_caches = fetch_ncbi_assembly_rows(args.source, cache_base)
 
     selectors: list[dict[str, str]] = []
     if args.all_public_assemblies:
@@ -2230,10 +2670,26 @@ def prepare_from_ncbi(args: argparse.Namespace) -> int:
                 "version_status": row.get("version_status", ""),
                 "seq_rel_date": row.get("seq_rel_date", ""),
                 "ftp_path": row.get("ftp_path", ""),
+                "source_catalog": row.get("_catalog_source", args.source),
             })
     else:
         for sel in selectors:
             matches = select_species_rows(all_rows, sel["species"], args.max_assemblies_per_species)
+            if not matches:
+                # Surface this loudly so the operator does not silently lose a
+                # panel reference (e.g. Leptosphaeria maculans / Ustilago
+                # maydis disappeared from a previous run because no entry in
+                # assembly_summary started with those exact names — the
+                # species are present in NCBI but as `Plenodomus` synonyms or
+                # `Mycosarcoma maydis` / `[U.] maydis`. Add to SPECIES_ALIASES
+                # to recover them.
+                sys.stderr.write(
+                    f"[panel-select] WARNING: no NCBI assembly matched species "
+                    f"{sel['species']!r} for panel scenario={sel.get('scenario', '.')!r}. "
+                    f"Add a SPECIES_ALIASES entry if NCBI uses a different name today.\n"
+                )
+                sys.stderr.flush()
+                continue
             for row in matches:
                 tagged = dict(row)
                 tagged["_scenario"] = sel.get("scenario", ".")
@@ -2251,6 +2707,7 @@ def prepare_from_ncbi(args: argparse.Namespace) -> int:
                     "version_status": row.get("version_status", ""),
                     "seq_rel_date": row.get("seq_rel_date", ""),
                     "ftp_path": row.get("ftp_path", ""),
+                    "source_catalog": row.get("_catalog_source", args.source),
                 })
 
     if not selected_rows:
@@ -2261,7 +2718,7 @@ def prepare_from_ncbi(args: argparse.Namespace) -> int:
         catalog_rows,
         [
             "panel_species", "assembly_accession", "organism_name", "assembly_level",
-            "refseq_category", "version_status", "seq_rel_date", "ftp_path",
+            "refseq_category", "version_status", "seq_rel_date", "ftp_path", "source_catalog",
         ],
     )
 
@@ -2315,7 +2772,8 @@ def prepare_from_ncbi(args: argparse.Namespace) -> int:
     source_link_rows: list[dict[str, str]] = []
     species_benchmark_defaults: dict[str, dict[str, str]] = {}
     # Per-ref (asm_name, gff.gz path) pairs for the GFF -> gene_annotations.tsv
-    # converter. Populated only when the GFF download succeeds for a given ref.
+    # converter. Populated when either a GFF or GBFF annotation source succeeds
+    # for a given assembly.
     gff_pairs: list[tuple[str, Path]] = []
 
     by_species: dict[str, list[dict[str, str]]] = defaultdict(list)
@@ -2348,31 +2806,19 @@ def prepare_from_ncbi(args: argparse.Namespace) -> int:
                 break
             asm_name = row.get("assembly_accession", "").replace(".", "_")
             downloaded_fasta: Path | None = None
-            downloaded_gff: Path | None = None
-            for url, filename in ncbi_download_targets(row, include_gff=args.download_gff):
-                is_gff = filename.endswith("_genomic.gff.gz")
-                try:
-                    local = materialize_entry(url, refs_dir / filename, keep_gz=True)
-                except urllib.error.HTTPError as exc:
-                    # NCBI hosts GFF only for annotated assemblies (mostly RefSeq +
-                    # some GenBank). 404 on GFF is common; skip it without aborting
-                    # the whole prepare. FASTA 404 is fatal — the assembly is unusable.
-                    if is_gff and getattr(exc, "code", None) == 404:
-                        sys.stderr.write(
-                            f"[gene-annot] no GFF available for {asm_name} "
-                            f"(NCBI returned 404); skipping annotation for this ref\n"
-                        )
-                        continue
-                    raise
+            for url, filename in ncbi_download_targets(row, include_gff=False):
+                local = materialize_entry(url, refs_dir / filename, keep_gz=True)
                 if filename.endswith("_genomic.fna.gz"):
                     downloaded_fasta = local
-                elif is_gff:
-                    downloaded_gff = local
             if downloaded_fasta is None:
                 continue
             ref_downloads += 1
-            if downloaded_gff is not None:
-                gff_pairs.append((asm_name, downloaded_gff))
+            if args.download_gff:
+                annotation_source = download_ncbi_gene_annotation_source(
+                    row, asm_name, refs_dir, ""
+                )
+                if annotation_source is not None:
+                    gff_pairs.append((asm_name, annotation_source))
             if species_ref_local is None:
                 species_ref_local = downloaded_fasta
                 species_ref_asm = asm_name
@@ -2428,30 +2874,19 @@ def prepare_from_ncbi(args: argparse.Namespace) -> int:
                 break
             asm_name = row.get("assembly_accession", "").replace(".", "_")
             query_fasta: Path | None = None
-            query_gff_local: Path | None = None
-            for url, filename in ncbi_download_targets(row, include_gff=args.download_gff):
-                is_gff = filename.endswith("_genomic.gff.gz")
-                try:
-                    local = materialize_entry(url, queries_dir / filename, keep_gz=True)
-                except urllib.error.HTTPError as exc:
-                    # Same soft-fail policy as refs: missing GFF is normal for
-                    # GenBank-only assemblies; missing FASTA is fatal.
-                    if is_gff and getattr(exc, "code", None) == 404:
-                        sys.stderr.write(
-                            f"[gene-annot] no GFF available for query {asm_name} "
-                            f"(NCBI returned 404)\n"
-                        )
-                        continue
-                    raise
+            for url, filename in ncbi_download_targets(row, include_gff=False):
+                local = materialize_entry(url, queries_dir / filename, keep_gz=True)
                 if filename.endswith("_genomic.fna.gz"):
                     query_fasta = local
-                elif is_gff:
-                    query_gff_local = local
             if query_fasta is None:
                 continue
             query_downloads += 1
-            if query_gff_local is not None:
-                gff_pairs.append((asm_name, query_gff_local))
+            if args.download_gff:
+                annotation_source = download_ncbi_gene_annotation_source(
+                    row, asm_name, queries_dir, "query "
+                )
+                if annotation_source is not None:
+                    gff_pairs.append((asm_name, annotation_source))
             query_rows.append({
                 "query_asm": asm_name,
                 "query_mode": "assembly",
@@ -2467,7 +2902,7 @@ def prepare_from_ncbi(args: argparse.Namespace) -> int:
                 "family": lineage.get("family", "."),
                 "genus": lineage.get("genus", species.split()[0]),
                 "species": lineage.get("species", species),
-                "source": args.source,
+                "source": row.get("_catalog_source", args.source),
             })
             benchmark_map_rows.append({
                 "query_asm": asm_name,
@@ -2552,28 +2987,54 @@ def prepare_from_ncbi(args: argparse.Namespace) -> int:
                 continue
             sys.stderr.write(f"[reads-mode] {species!r}: ENA returned {len(ena_runs)} candidate runs\n")
             for read_mode in requested_read_modes:
-                urls, meta_rows = select_ena_read_sources(
-                    ena_runs, read_mode, args.read_accessions_per_species
+                # Pull up to 4x the requested count so we can retry past runs
+                # whose payloads fail FASTQ validation (e.g. PacBio bas.h5
+                # accessions whose fastq_ftp is empty drop out in
+                # select_ena_read_sources, but the fastq_ftp value can still
+                # point to mirrors that occasionally serve corrupt content).
+                pool_size = max(args.read_accessions_per_species * 4, args.read_accessions_per_species)
+                pool_urls, pool_meta = select_ena_read_sources(
+                    ena_runs, read_mode, pool_size
                 )
-                if not urls:
+                if not pool_urls:
                     sys.stderr.write(
                         f"[reads-mode] {species!r} mode={read_mode}: no eligible runs after platform filter\n"
+                    )
+                    continue
+                local_path = None
+                meta_rows: list[dict[str, str]] = []
+                # Each meta row carries the complete URL group for one run
+                # (including paired-end mates); walk run-by-run until one
+                # downloads and validates as FASTQ.
+                attempts = 0
+                for meta in pool_meta:
+                    if attempts >= args.read_accessions_per_species:
+                        break
+                    run_acc = meta["run_accession"]
+                    urls = selected_urls_from_ena_meta(meta)
+                    if not urls:
+                        continue
+                    asm_name = normalize_name(f"{species}_{read_mode}_{run_acc}")
+                    try:
+                        candidate_path = merge_sequence_sources(urls, queries_dir / asm_name)
+                    except Exception as exc:
+                        sys.stderr.write(
+                            f"[warn] {species}: ENA {read_mode} download failed for {run_acc}: {exc}\n"
+                        )
+                        continue
+                    local_path = candidate_path
+                    meta_rows = [meta]
+                    attempts += 1
+                    break  # one validated run is enough for this (species, mode)
+                if local_path is None:
+                    sys.stderr.write(
+                        f"[warn] {species}: no usable ENA {read_mode} run after validation; skipping\n"
                     )
                     continue
                 sys.stderr.write(
                     f"[reads-mode] {species!r} mode={read_mode}: picked {len(meta_rows)} run(s)\n"
                 )
-                # Bundle the selected FASTQs for the first picked run into a
-                # single local file so query_list.txt stays one-path-per-line
-                # (MycoSV reads that format).
                 asm_name = normalize_name(f"{species}_{read_mode}_{meta_rows[0]['run_accession']}")
-                try:
-                    local_path = merge_sequence_sources(urls, queries_dir / asm_name)
-                except Exception as exc:
-                    sys.stderr.write(
-                        f"[warn] {species}: ENA {read_mode} download failed: {exc}\n"
-                    )
-                    continue
                 query_rows.append({
                     "query_asm": asm_name,
                     "query_mode": read_mode,
@@ -2652,9 +3113,9 @@ def prepare_from_ncbi(args: argparse.Namespace) -> int:
                 json.dumps(phenotype_meta, indent=2, sort_keys=True), encoding="utf-8"
             )
 
-    # Auto-build prepared_dir/gene_annotations.tsv from any GFF.gz files we
-    # downloaded alongside ref FASTA. The benchmark step will pick this up
-    # automatically (no need for the caller to pass --gene-annotations-tsv).
+    # Auto-build prepared_dir/gene_annotations.tsv from any GFF/GBFF annotation
+    # sources we downloaded alongside FASTA. The benchmark step will pick this
+    # up automatically (no need for the caller to pass --gene-annotations-tsv).
     #
     # Indexing trick: the SV biology analyzer keys gene lookups by
     # (query_asm, contig), but our GFFs come from refs. Ref-coordinate calls
@@ -2781,7 +3242,8 @@ def prepare_from_ncbi(args: argparse.Namespace) -> int:
                 "allow_no_queries": bool(args.allow_no_queries),
                 "public_query_manifest": str(args.public_query_manifest) if args.public_query_manifest else "",
                 "data_cache_dir": str(cache_base),
-                "assembly_summary_cache": str(cache_base / "assembly_summaries" / f"{args.source}_fungi_assembly_summary.txt"),
+                "assembly_summary_cache": ";".join(str(p) for p in assembly_summary_caches),
+                "assembly_summary_caches": [str(p) for p in assembly_summary_caches],
                 "phenotypic_records_cached": len(phenotype_meta),
                 "expression_rows_written": expression_rows_written,
                 "ecological_rows_written": ecological_rows_written,
@@ -3559,11 +4021,11 @@ def _build_validation_bam(
         bam_sorted = work_dir / "validation.sorted.bam"
         if bam_sorted.exists() and (work_dir / "validation.sorted.bam.bai").exists():
             return bam_sorted, ref_fa_plain
-        with sam_path.open("w", encoding="utf-8") as sam_out:
+        with sam_path.open("wb") as sam_out:
             subprocess.run(
                 ["minimap2", "-ax", "asm5", "--cs", "-t", str(threads),
                  str(ref_fa_plain), str(query_fa)],
-                stdout=sam_out, stderr=subprocess.PIPE, text=True, check=True,
+                stdout=sam_out, stderr=subprocess.PIPE, check=True,
                 timeout=_TOOL_TIMEOUT,
             )
         try:
@@ -3699,6 +4161,7 @@ def run_mycosv(
     max_clade_genomes: int = 8,
     reuse_index_dir: Path | None = None,
     reuse_registry_dir: Path | None = None,
+    ref_list_override: Path | None = None,
 ) -> dict[str, str]:
     mycosv_dir = out_dir / "mycosv"
     mycosv_dir.mkdir(parents=True, exist_ok=True)
@@ -3736,11 +4199,26 @@ def run_mycosv(
                 f"[mycosv] reusing pre-built routing index at {idx_dir} "
                 f"(registry={reg_dir})\n"
             )
-            if "--no-flat-ref-fallback" not in caller_args:
+            # When the caller has narrowed --ref-list down to a small set of
+            # benchmark refs (one per held-out query), the flat-ref fallback
+            # can run cheaply and is required for anchored SV calls — without
+            # it hierarchical_call_assembly's Path A/B never see ref sequences
+            # and every contig falls through to Path C as SVTYPE=OFF_REF.
+            # Only suppress the fallback when the ref_list is the full
+            # routing corpus (~2000 NCBI assemblies).
+            if ref_list_override is None and "--no-flat-ref-fallback" not in caller_args:
                 caller_args.append("--no-flat-ref-fallback")
                 sys.stderr.write(
                     "[mycosv] disabling flat reference fallback for reused "
                     "hierarchical index to keep memory bounded\n"
+                )
+            elif ref_list_override is not None:
+                # Make sure a stale --no-flat-ref-fallback from extra_args
+                # cannot defeat the override below.
+                caller_args = [a for a in caller_args if a != "--no-flat-ref-fallback"]
+                sys.stderr.write(
+                    f"[mycosv] flat-ref fallback ENABLED against {ref_list_override} "
+                    "(benchmark-only ref subset; safe for memory)\n"
                 )
         else:
             idx_dir = mycosv_dir / "idx"
@@ -3761,12 +4239,14 @@ def run_mycosv(
                     "--tol-index-threads", str(threads),
                 ]
                 run_mycosv_command(build_cmd, cwd=ROOT)
+        ref_list_path = (ref_list_override.resolve() if ref_list_override is not None
+                         else (prepared_dir / "ref_list.txt").resolve())
         cmd = [
             str(binary_path.resolve()),
             "--tol-hierarchical",
             "--tol-index-dir", str(idx_dir.resolve()),
             "--tol-registry-dir", str(reg_dir.resolve()),
-            "--ref-list", str((prepared_dir / "ref_list.txt").resolve()),
+            "--ref-list", str(ref_list_path),
             "--query-list", str(query_list_path),
             "--out-prefix", str(out_prefix.resolve()),
             "--query-mode", mode,
@@ -3774,9 +4254,11 @@ def run_mycosv(
             *caller_args,
         ]
     else:
+        ref_list_path = (ref_list_override.resolve() if ref_list_override is not None
+                         else (prepared_dir / "ref_list.txt").resolve())
         cmd = [
             str(binary_path.resolve()),
-            "--ref-list", str((prepared_dir / "ref_list.txt").resolve()),
+            "--ref-list", str(ref_list_path),
             "--query-list", str(query_list_path),
             "--out-prefix", str(out_prefix.resolve()),
             "--query-mode", mode,
@@ -3871,19 +4353,22 @@ def run_syri_for_query(query_row: dict[str, str], out_dir: Path, threads: int) -
         return None
 
     sam_path = work_dir / "query_vs_ref.sam"
-    prefix = str(work_dir / "syri_")
-    with sam_path.open("w", encoding="utf-8") as sam_out:
+    # SyRI joins --dir and --prefix as plain strings before opening its log
+    # file, so an absolute --prefix combined with the default --dir (cwd) gets
+    # the doubled "<cwd>/<abs-prefix>" path that crashes dictConfig with
+    # "Unable to configure handler 'log_file'". Pass --dir explicitly and keep
+    # --prefix as a basename so the join always lands inside work_dir.
+    with sam_path.open("wb") as sam_out:
         subprocess.run(
             ["minimap2", "-ax", "asm5", "--eqx", "-t", str(threads), str(ref_fa_plain), str(query_fa_plain)],
             stdout=sam_out,
             stderr=subprocess.PIPE,
-            text=True,
             check=True,
             timeout=_TOOL_TIMEOUT,
         )
     try:
         run(["syri", "-c", str(sam_path), "-r", str(ref_fa_plain), "-q", str(query_fa_plain),
-             "-k", "-F", "S", "--prefix", prefix], cwd=ROOT)
+             "-k", "-F", "S", "--dir", str(work_dir), "--prefix", "syri_"], cwd=work_dir)
     except subprocess.CalledProcessError as exc:
         # SyRI rejects highly divergent pairs (e.g. cross-genus assemblies)
         # with a non-zero exit. Treat as "no comparator output" rather than
@@ -3925,30 +4410,31 @@ def run_minigraph_for_query(query_row: dict[str, str], out_dir: Path, threads: i
     graph_gfa = work_dir / "graph.gfa"
     bubble_bed = work_dir / "bubbles.bed"
     sample_bed = work_dir / "sample.bed"
-    with graph_gfa.open("w", encoding="utf-8") as out_fh:
+    # Binary-mode stdout-to-file: minigraph/gfatools emit text but the kernel
+    # path bypasses Python's text decoder, so non-UTF-8 bytes in a contig name
+    # (rare but observed on public ENA assemblies) don't kill the subprocess
+    # wrapper before the truth set lands on disk.
+    with graph_gfa.open("wb") as out_fh:
         subprocess.run(
             ["minigraph", "-cxggs", "-c", "-t", str(threads), *extra_args, str(ref_fa), str(query_fa)],
             stdout=out_fh,
             stderr=subprocess.PIPE,
-            text=True,
             check=True,
             timeout=_TOOL_TIMEOUT,
         )
-    with bubble_bed.open("w", encoding="utf-8") as out_fh:
+    with bubble_bed.open("wb") as out_fh:
         subprocess.run(
             ["gfatools", "bubble", str(graph_gfa)],
             stdout=out_fh,
             stderr=subprocess.PIPE,
-            text=True,
             check=True,
             timeout=_TOOL_TIMEOUT,
         )
-    with sample_bed.open("w", encoding="utf-8") as out_fh:
+    with sample_bed.open("wb") as out_fh:
         subprocess.run(
             ["minigraph", "-cxasm", "--call", "-t", str(threads), *extra_args, str(graph_gfa), str(query_fa)],
             stdout=out_fh,
             stderr=subprocess.PIPE,
-            text=True,
             check=True,
             timeout=_TOOL_TIMEOUT,
         )
@@ -4110,13 +4596,16 @@ def _minimap2_align_reads(
 
     # minimap2 -> SAM (minimap2 itself accepts .gz, but we feed the plain
     # file so the BAM @SQ matches what the SV caller will index later).
-    with sam_path.open("w", encoding="utf-8") as sam_out:
+    # Stream stdout straight to disk in binary mode so a non-ASCII byte in a
+    # public ENA FASTQ header (which surfaces verbatim in @PG / read-name SAM
+    # records) doesn't crash the wrapper with UnicodeDecodeError before svim /
+    # sniffles / cutesv even see the BAM.
+    with sam_path.open("wb") as sam_out:
         subprocess.run(
             ["minimap2", "-ax", preset, "-t", str(threads), str(ref_fa_plain), str(reads_path)],
             stdout=sam_out,
             stderr=subprocess.PIPE,
             timeout=_TOOL_TIMEOUT,
-            text=True,
             check=True,
         )
     # samtools sort -> BAM
@@ -4322,10 +4811,10 @@ def run_delly_for_query(query_row: dict[str, str], out_dir: Path, threads: int) 
     if not bcf_path.exists():
         return None
     # BCF -> text VCF so the generic loader can parse it.
-    with vcf_path.open("w", encoding="utf-8") as out_fh:
+    with vcf_path.open("wb") as out_fh:
         subprocess.run(
             ["bcftools", "view", str(bcf_path)],
-            stdout=out_fh, stderr=subprocess.PIPE, text=True, check=True,
+            stdout=out_fh, stderr=subprocess.PIPE, check=True,
             timeout=_TOOL_TIMEOUT,
         )
     return {"label": "delly", "vcf": str(vcf_path)}
@@ -4537,10 +5026,10 @@ def run_svim_asm_for_query(query_row: dict[str, str], out_dir: Path, threads: in
 
     sam_path = work_dir / "query_vs_ref.sam"
     bam_sorted = work_dir / "query_vs_ref.sorted.bam"
-    with sam_path.open("w", encoding="utf-8") as sam_out:
+    with sam_path.open("wb") as sam_out:
         subprocess.run(
             ["minimap2", "-ax", "asm5", "-t", str(threads), str(ref_fa_plain), str(query_fa)],
-            stdout=sam_out, stderr=subprocess.PIPE, text=True, check=True,
+            stdout=sam_out, stderr=subprocess.PIPE, check=True,
             timeout=_TOOL_TIMEOUT,
         )
     try:
@@ -4624,28 +5113,28 @@ def run_anchorwave_for_query(query_row: dict[str, str], out_dir: Path, threads: 
     vcf_path = work_dir / "anchorwave.vcf"
 
     # Step 1: minimap2 asm5 alignment as AnchorWave input seeds.
-    with sam_path.open("w", encoding="utf-8") as sam_out:
+    with sam_path.open("wb") as sam_out:
         subprocess.run(
             ["minimap2", "-ax", "asm5", "--cs", "-t", str(threads), str(ref_fa_plain), str(query_fa)],
-            stdout=sam_out, stderr=subprocess.PIPE, text=True, check=True,
+            stdout=sam_out, stderr=subprocess.PIPE, check=True,
             timeout=_TOOL_TIMEOUT,
         )
     # Step 2: SAM -> PAF via paftools for downstream AnchorWave refinement.
     try:
-        with paf_path.open("w", encoding="utf-8") as paf_out:
+        with paf_path.open("wb") as paf_out:
             subprocess.run(
                 [paftools, "sam2paf", str(sam_path)],
-                stdout=paf_out, stderr=subprocess.PIPE, text=True, check=True,
+                stdout=paf_out, stderr=subprocess.PIPE, check=True,
                 timeout=_TOOL_TIMEOUT,
             )
     except subprocess.CalledProcessError:
         return None
     # Step 3: sort PAF by target coordinates.
     try:
-        with sorted_paf.open("w", encoding="utf-8") as srt_out:
+        with sorted_paf.open("wb") as srt_out:
             subprocess.run(
                 ["sort", "-k6,6", "-k8,8n", str(paf_path)],
-                stdout=srt_out, stderr=subprocess.PIPE, text=True, check=True,
+                stdout=srt_out, stderr=subprocess.PIPE, check=True,
                 timeout=_TOOL_TIMEOUT,
             )
     except subprocess.CalledProcessError:
@@ -4656,10 +5145,10 @@ def run_anchorwave_for_query(query_row: dict[str, str], out_dir: Path, threads: 
     # alignments on repetitive fungal genomes; the CLI boundary here is the
     # SV VCF that results.
     try:
-        with vcf_path.open("w", encoding="utf-8") as vcf_out:
+        with vcf_path.open("wb") as vcf_out:
             subprocess.run(
                 [paftools, "call", "-f", str(ref_fa_plain), "-L", "50", str(sorted_paf)],
-                stdout=vcf_out, stderr=subprocess.PIPE, text=True, check=True,
+                stdout=vcf_out, stderr=subprocess.PIPE, check=True,
                 timeout=_TOOL_TIMEOUT,
             )
     except subprocess.CalledProcessError:
@@ -5069,6 +5558,35 @@ def benchmark_real_data(args: argparse.Namespace) -> int:
         encoding="utf-8",
     )
 
+    # Build a benchmark-scoped ref_list that contains only the references each
+    # mode-filtered query is supposed to be compared against. This is what
+    # unblocks the C++ flat-ref fallback in the million_real flow:
+    # prepared_dir/ref_list.txt holds ~2000 NCBI assemblies (the routing
+    # corpus), so for memory reasons we previously forced
+    # `--no-flat-ref-fallback`. With that flag set, hierarchical_call_assembly
+    # only had access to TolGlobal refs whose seqShared is empty for the
+    # routing-only index, so every contig fell through to Path C and emitted
+    # SVTYPE=OFF_REF — the multisample VCF then contained nothing else.
+    # The benchmark already names the truth reference per query in
+    # `benchmark_ref_fasta`; pass that small (≤ N_queries) set to the binary
+    # so the flat-ref fallback can anchor INS/DEL/INV/DUP/TRA against it.
+    bench_ref_list_path: Path | None = None
+    bench_refs: list[str] = []
+    seen_bench_refs: set[str] = set()
+    for row in query_manifest:
+        bench_ref = (row.get("benchmark_ref_fasta") or "").strip()
+        if not bench_ref or bench_ref == ".":
+            continue
+        if bench_ref in seen_bench_refs:
+            continue
+        if not Path(bench_ref).exists():
+            continue
+        seen_bench_refs.add(bench_ref)
+        bench_refs.append(bench_ref)
+    if bench_refs:
+        bench_ref_list_path = out_dir / "ref_list.benchmark.txt"
+        bench_ref_list_path.write_text("\n".join(bench_refs) + "\n", encoding="utf-8")
+
     compile_binary_if_needed(args.binary_path.resolve(), force=args.force_rebuild)
     mycosv_failed = False
     try:
@@ -5079,6 +5597,7 @@ def benchmark_real_data(args: argparse.Namespace) -> int:
             max_clade_genomes=args.max_clade_genomes,
             reuse_index_dir=getattr(args, "reuse_index_dir", None),
             reuse_registry_dir=getattr(args, "reuse_registry_dir", None),
+            ref_list_override=bench_ref_list_path,
         )
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
         # Don't abort the whole panel/mode pipeline when the binary crashes
@@ -5530,24 +6049,35 @@ def benchmark_real_data(args: argparse.Namespace) -> int:
             getattr(args, "validate_with_reads", False)
             and tool_path("samtools") is not None
             and tool_path("minimap2") is not None
-            and mycosv_ref_calls
         ):
-            val_dir = out_dir / "read_validation" / query_asm / "mycosv_reference"
-            kept_calls, support_rows = validate_calls_with_reads(
-                mycosv_ref_calls,
-                query_row,
-                val_dir,
-                threads=args.threads,
-                min_support=args.read_validation_min_support,
-                flank_bp=args.read_validation_flank_bp,
+            # When the routing index has no clade in common with the query
+            # (held-out MAGs in the million-real flow), MycoSV emits every
+            # event as OFF_REF with empty REFCONTIG, so mycosv_ref_calls is
+            # empty. Fall back to validating the query-coord calls so
+            # read_validated_truth.tsv still gets concrete support counts
+            # instead of remaining header-only. The validator already keys
+            # off coord_space to pick ref_contig vs. query_contig.
+            calls_to_validate = mycosv_ref_calls or mycosv_query_calls
+            validation_source = (
+                "mycosv_reference" if mycosv_ref_calls else "mycosv_query"
             )
-            read_validated_truth_rows.extend(support_rows)
-            summary_json["queries"][query_asm]["read_validation"] = {
-                "source": "mycosv_reference",
-                "input_calls": len(mycosv_ref_calls),
-                "read_validated": len(kept_calls),
-                "min_split_reads": args.read_validation_min_support,
-            }
+            if calls_to_validate:
+                val_dir = out_dir / "read_validation" / query_asm / validation_source
+                kept_calls, support_rows = validate_calls_with_reads(
+                    calls_to_validate,
+                    query_row,
+                    val_dir,
+                    threads=args.threads,
+                    min_support=args.read_validation_min_support,
+                    flank_bp=args.read_validation_flank_bp,
+                )
+                read_validated_truth_rows.extend(support_rows)
+                summary_json["queries"][query_asm]["read_validation"] = {
+                    "source": validation_source,
+                    "input_calls": len(calls_to_validate),
+                    "read_validated": len(kept_calls),
+                    "min_split_reads": args.read_validation_min_support,
+                }
 
     # If no comparator was available (e.g. all of pggb/minigraph/syri/svim_asm
     # missing on this host) the per-query exact benchmarks above produce zero
@@ -5687,15 +6217,11 @@ def prepare_million_real(args: argparse.Namespace) -> int:
     # (run_all_experiments.sh does this), it switches from line- to block-
     # buffered, so per-100 download progress was hidden for hours and made
     # the step look frozen even when it was making real progress.
-    summary_url = NCBI_ASSEMBLY_SUMMARY[args.source]
-    print(f"[1/4] Fetching NCBI assembly summary: {summary_url}", flush=True)
-    all_rows = parse_assembly_summary(
-        http_get_text_cached(
-            summary_url,
-            cache_dir / "assembly_summaries" / f"{args.source}_fungi_assembly_summary.txt",
-        )
+    all_rows, assembly_summary_caches = fetch_ncbi_assembly_rows(
+        args.source,
+        cache_dir,
+        progress=True,
     )
-    print(f"      parsed {len(all_rows)} rows from {args.source}", flush=True)
 
     selected = select_all_public_rows(
         all_rows,
@@ -5723,11 +6249,13 @@ def prepare_million_real(args: argparse.Namespace) -> int:
     # Parallel download. The serial loop spent ~3 h on ~3300/10000 rows in
     # production because every NCBI fetch was synchronous; threading is safe
     # since materialize_entry is per-URL and disk-cached. Workers are tunable
-    # via MILLION_REAL_DOWNLOAD_WORKERS — 16 saturates a typical RDS NIC
-    # without overrunning NCBI's per-IP rate limits. Cached rows return
-    # near-instantly so a re-launch after timeout naturally resumes.
+    # via MILLION_REAL_DOWNLOAD_WORKERS. Default lowered from 16 → 8 because
+    # 16 reliably hit ftp.ncbi.nlm.nih.gov's per-IP cap and cost ~565 retry
+    # rounds in the 2026-05-06 run; 8 still keeps the NIC saturated on a
+    # warmed cache but stays inside NCBI's well-behaved client window.
     download_workers = max(
-        1, int(os.environ.get("MILLION_REAL_DOWNLOAD_WORKERS", "16"))
+        1, int(os.environ.get("MILLION_REAL_DOWNLOAD_WORKERS",
+                              str(_HTTP_MAX_PARALLEL_FTP_NCBI)))
     )
     print(
         f"[3/4] Downloading up to {len(selected)} assemblies -> {refs_dir} "
@@ -5828,8 +6356,36 @@ def prepare_million_real(args: argparse.Namespace) -> int:
     query_manifest_rows: list[dict[str, str]] = []
     query_list_paths: list[str] = []
     if n_queries > 0:
-        stride = max(1, len(ref_manifest_rows) // n_queries)
-        query_indices = sorted({(i * stride) % len(ref_manifest_rows) for i in range(n_queries)})
+        # Exclude metagenomic / unidentified placeholders from the held-out
+        # pool. ENA's read-runs lookup returns 0 hits for taxa starting with
+        # "uncultured " / "unidentified " / "unclassified ", and the panel
+        # then prints `[reads-mode] skip 'uncultured Pseudogymnoascus': ENA
+        # filereport returned 0 runs` for every reads-mode pass. Filtering
+        # them up front avoids that noise + ensures every held-out query has
+        # a chance of matching public reads for read-level validation.
+        def _is_metagenomic_placeholder(species: str) -> bool:
+            sl = (species or "").strip().lower()
+            return any(sl.startswith(prefix) for prefix in (
+                "uncultured ", "unidentified ", "unclassified ", "environmental ",
+            ))
+
+        eligible_indices = [
+            i for i, r in enumerate(ref_manifest_rows)
+            if not _is_metagenomic_placeholder(r.get("clade_name", ""))
+        ]
+        if not eligible_indices:
+            eligible_indices = list(range(len(ref_manifest_rows)))
+        n_queries = min(n_queries, max(0, len(eligible_indices) - 1))
+        if n_queries == 0:
+            print(
+                "      [skip] no non-metagenomic assemblies left after filter; skipping holdout selection",
+                flush=True,
+            )
+            query_indices: list[int] = []
+        else:
+            stride = max(1, len(eligible_indices) // n_queries)
+            query_indices = sorted({eligible_indices[(i * stride) % len(eligible_indices)]
+                                    for i in range(n_queries)})
         # Lookup helpers indexed by lineage so we can pick the closest sibling.
         by_genus: dict[str, list[int]] = defaultdict(list)
         by_family: dict[str, list[int]] = defaultdict(list)
@@ -5842,14 +6398,26 @@ def prepare_million_real(args: argparse.Namespace) -> int:
 
         def pick_benchmark_ref(qi: int) -> str:
             qrow = ref_manifest_rows[qi]
+            # Prefer a non-metagenomic candidate at every taxonomic level
+            # before falling back to any candidate. A `uncultured ...`
+            # benchmark ref pairs the held-out query against a MAG of unknown
+            # assembly quality, which produces noisy SV truth — keep them as a
+            # last resort rather than the first match.
             for bucket, key in (
                 (by_genus, qrow.get("genus", ".") or "."),
                 (by_family, qrow.get("family", ".") or "."),
                 (by_phylum, qrow.get("phylum", ".") or "."),
             ):
-                for cand in bucket.get(key, []):
-                    if cand != qi and cand not in query_set:
-                        return ref_manifest_rows[cand]["fasta_path"]
+                cands = [c for c in bucket.get(key, [])
+                         if c != qi and c not in query_set]
+                if not cands:
+                    continue
+                clean = [c for c in cands
+                         if not _is_metagenomic_placeholder(
+                             ref_manifest_rows[c].get("clade_name", ""))]
+                if clean:
+                    return ref_manifest_rows[clean[0]]["fasta_path"]
+                return ref_manifest_rows[cands[0]]["fasta_path"]
             for cand in range(len(ref_manifest_rows)):
                 if cand != qi and cand not in query_set:
                     return ref_manifest_rows[cand]["fasta_path"]
@@ -5936,21 +6504,43 @@ def prepare_million_real(args: argparse.Namespace) -> int:
                 f"[reads-mode] {species!r}: ENA returned {len(ena_runs)} candidate runs\n"
             )
             for read_mode in requested_read_modes:
-                urls, meta_rows = select_ena_read_sources(ena_runs, read_mode, runs_per_query)
-                if not urls:
+                pool_size = max(runs_per_query * 4, runs_per_query)
+                pool_urls, pool_meta = select_ena_read_sources(ena_runs, read_mode, pool_size)
+                if not pool_urls:
                     sys.stderr.write(
                         f"[reads-mode] {species!r} mode={read_mode}: "
                         f"no eligible runs after platform filter\n"
                     )
                     continue
-                asm_name = normalize_name(
-                    f"{arow['query_asm']}_{read_mode}_{meta_rows[0].get('run_accession', 'na')}"
-                )
-                try:
-                    local_path = merge_sequence_sources(urls, queries_dir / asm_name)
-                except Exception as exc:
+                local_path = None
+                meta_rows: list[dict[str, str]] = []
+                asm_name = ""
+                attempts = 0
+                for meta in pool_meta:
+                    if attempts >= runs_per_query:
+                        break
+                    run_acc = meta.get("run_accession", "na")
+                    urls = selected_urls_from_ena_meta(meta)
+                    if not urls:
+                        continue
+                    candidate_name = normalize_name(
+                        f"{arow['query_asm']}_{read_mode}_{run_acc}"
+                    )
+                    try:
+                        local_path = merge_sequence_sources(urls, queries_dir / candidate_name)
+                    except Exception as exc:
+                        sys.stderr.write(
+                            f"[warn] reads download failed for {species} {read_mode} "
+                            f"{run_acc}: {exc}\n"
+                        )
+                        continue
+                    asm_name = candidate_name
+                    meta_rows = [meta]
+                    attempts += 1
+                    break
+                if local_path is None or not meta_rows:
                     sys.stderr.write(
-                        f"[warn] reads download failed for {species} {read_mode}: {exc}\n"
+                        f"[warn] {species}: no usable ENA {read_mode} run after validation; skipping\n"
                     )
                     continue
                 read_row = dict(arow)
@@ -6032,7 +6622,8 @@ def prepare_million_real(args: argparse.Namespace) -> int:
     summary = {
         "out_dir": str(out_dir),
         "data_cache_dir": str(cache_dir),
-        "assembly_summary_cache": str(cache_dir / "assembly_summaries" / f"{args.source}_fungi_assembly_summary.txt"),
+        "assembly_summary_cache": ";".join(str(p) for p in assembly_summary_caches),
+        "assembly_summary_caches": [str(p) for p in assembly_summary_caches],
         "source": args.source,
         "max_assemblies_requested": args.max_assemblies,
         "assemblies_downloaded": download_count,
@@ -6101,7 +6692,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="Download up to N real fungal assemblies from NCBI, build a real MycoSV routing index over them, and pad with synthetic decoys up to --target-centroids.",
     )
     smr.add_argument("--out-dir", type=Path, required=True)
-    smr.add_argument("--source", choices=sorted(NCBI_ASSEMBLY_SUMMARY), default="ncbi-refseq")
+    smr.add_argument(
+        "--source",
+        choices=NCBI_SOURCE_CHOICES,
+        default=NCBI_BEST_SOURCE,
+        help=(
+            "NCBI assembly source. ncbi-best combines RefSeq + GenBank, "
+            "deduplicates paired GCF/GCA assemblies, and keeps the best "
+            "latest/highest-level/full/curated record."
+        ),
+    )
     smr.add_argument("--max-assemblies", type=int, default=1000, help="Cap on real fungal assemblies to download. Use 0 for unlimited (not recommended for first runs).")
     smr.add_argument("--min-assembly-level", default="scaffold", choices=["contig", "scaffold", "chromosome", "complete genome"])
     smr.add_argument("--latest-only", action="store_true", help="Only keep version_status=latest rows.")
@@ -6154,7 +6754,16 @@ def build_parser() -> argparse.ArgumentParser:
 
     spp = sub.add_parser("prepare", help="Download a real fungal panel and write MycoSV-ready manifests.")
     spp.add_argument("--out-dir", type=Path, required=True)
-    spp.add_argument("--source", choices=sorted(NCBI_ASSEMBLY_SUMMARY), default="ncbi-refseq")
+    spp.add_argument(
+        "--source",
+        choices=NCBI_SOURCE_CHOICES,
+        default=NCBI_BEST_SOURCE,
+        help=(
+            "NCBI assembly source. ncbi-best combines RefSeq + GenBank, "
+            "deduplicates paired GCF/GCA assemblies, and keeps the best "
+            "latest/highest-level/full/curated record."
+        ),
+    )
     spp.add_argument("--panel", "--panels", dest="panels", action="append", choices=sorted(PANEL_PRESETS), default=[])
     spp.add_argument("--species", action="append", default=[], help="Override panels with explicit species names; may be used multiple times.")
     spp.add_argument("--all-public-assemblies", action="store_true", help="Select all public fungal assemblies from the chosen NCBI source instead of curated panels/species.")

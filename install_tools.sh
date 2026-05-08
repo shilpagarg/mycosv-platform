@@ -234,10 +234,23 @@ write_apptainer_wrapper() {
     local sif="$1"; shift
     local tool
     for tool in "$@"; do
-        cat > "$ENV_BIN/$tool" <<EOF2
+        if [[ "$tool" == "pggb" ]]; then
+            cat > "$ENV_BIN/$tool" <<EOF2
+#!/usr/bin/env bash
+# pggb's container can inherit host shell aliases/functions that make its
+# internal \`which time\` probe call debianutils \`which\` with unsupported
+# flags ("Illegal option --"). Start from a clean environment and a non-login
+# shell so the resolver uses the plain executable lookup path.
+exec apptainer exec --cleanenv --bind /mnt --bind /tmp "$sif" \\
+    env -i HOME=/tmp PATH=/usr/local/bin:/usr/bin:/bin LC_ALL=C \\
+    bash --noprofile --norc /usr/local/bin/pggb "\$@"
+EOF2
+        else
+            cat > "$ENV_BIN/$tool" <<EOF2
 #!/usr/bin/env bash
 exec apptainer exec --bind /mnt --bind /tmp "$sif" "$tool" "\$@"
 EOF2
+        fi
         chmod +x "$ENV_BIN/$tool"
     done
 }

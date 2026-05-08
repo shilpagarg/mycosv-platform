@@ -140,6 +140,13 @@ REPORT_TIMEOUT="${REPORT_TIMEOUT:-30m}"
 BENCHMARK_TIMEOUT_ASSEMBLY="${BENCHMARK_TIMEOUT_ASSEMBLY:-3h}"
 BENCHMARK_TIMEOUT_READS="${BENCHMARK_TIMEOUT_READS:-2h}"
 
+# Per-panel overrides. Puccinia genomes in te_rich_pathogen are ~80 Mbp and
+# ~85% TE content; even with cactus/pggb/anchorwave skipped, the surviving
+# minigraph + svim_asm + MycoSV combination consistently spills past 3h on a
+# single thread. Five hours empirically clears the matrix without reaching
+# the SLURM walltime.
+BENCHMARK_TIMEOUT_TE_RICH_PATHOGEN_ASSEMBLY="${BENCHMARK_TIMEOUT_TE_RICH_PATHOGEN_ASSEMBLY:-5h}"
+
 # Bound public-read comparator inputs. MycoSV caps read consumption internally,
 # but tools such as SVIM/Sniffles/cuteSV/Delly/Manta align the FASTQ path they
 # are given. These caps keep public ENA runs from dominating wall time.
@@ -148,11 +155,14 @@ MAX_COMPARATOR_LONG_READS="${MAX_COMPARATOR_LONG_READS:-20000}"
 
 # Comma-separated list of panel names whose assembly-mode benchmark should
 # skip cactus / pggb / anchorwave. These three are the heaviest comparators
-# on multi-Gbp inputs (AMF panel, te_rich_pathogen for Puccinia ~80 Mbp);
+# on multi-Gbp inputs (AMF panel, te_rich_pathogen for Puccinia ~80 Mbp,
+# two_speed_pathogen for Fusarium oxysporum ~60 Mbp + Zymoseptoria tritici);
 # skipping them cuts wall time enough that the matrix completes within
 # typical SLURM time limits while still leaving syri / minigraph / svim_asm
-# as truth comparators. Override or extend via env var.
-HEAVY_COMPARATOR_SKIP_PANELS="${HEAVY_COMPARATOR_SKIP_PANELS:-amf_large,te_rich_pathogen}"
+# as truth comparators. two_speed_pathogen was added 2026-05-06 after a SLURM
+# run timed out mid-cactus-on-Fusarium and starved the panel's short-reads
+# and long-reads modes. Override or extend via env var.
+HEAVY_COMPARATOR_SKIP_PANELS="${HEAVY_COMPARATOR_SKIP_PANELS:-amf_large,te_rich_pathogen,two_speed_pathogen}"
 
 # Real-data panels to run by default. compact_yeast + amf_large cover the
 # current baseline; te_rich_pathogen adds TE-rich full-SV stress; and
@@ -287,13 +297,14 @@ if [[ "$EXPERIMENT_TYPE" == "all" || "$EXPERIMENT_TYPE" == "million-real" ]]; th
   MILLION_REAL_INCLUDE_READS="${MILLION_REAL_INCLUDE_READS:-1}"
   MILLION_REAL_READ_MODES="${MILLION_REAL_READ_MODES:-both}"
   MILLION_REAL_READ_RUNS_PER_QUERY="${MILLION_REAL_READ_RUNS_PER_QUERY:-1}"
+  MILLION_REAL_NCBI_SOURCE="${MILLION_REAL_NCBI_SOURCE:-ncbi-best}"
 
   # ── 2a) prepare: download assemblies, build the routing index, hold out
   # ────── MILLION_REAL_QUERIES assemblies for the MycoSV-only benchmark.
   # python3 -u keeps stdout line-buffered under tee so progress is visible.
   prepare_cmd=(python3 -u run_real_fungal_benchmark.py prepare-million-real
       --out-dir "${MILLION_REAL_DIR}"
-      --source ncbi-genbank
+      --source "${MILLION_REAL_NCBI_SOURCE}"
       --max-assemblies "${MILLION_REAL_MAX_ASSEMBLIES}"
       --target-centroids "${MILLION_REAL_TARGET_CENTROIDS}"
       --min-assembly-level contig
@@ -468,10 +479,11 @@ if [[ "$EXPERIMENT_TYPE" == "all" || "$EXPERIMENT_TYPE" == "real" ]]; then
     REAL_QUERIES_PER_SPECIES="${REAL_QUERIES_PER_SPECIES:-3}"
     REAL_MAX_QUERY_DOWNLOADS="${REAL_MAX_QUERY_DOWNLOADS:-6}"
     REAL_READ_ACCESSIONS_PER_SPECIES="${REAL_READ_ACCESSIONS_PER_SPECIES:-1}"
+    REAL_NCBI_SOURCE="${REAL_NCBI_SOURCE:-ncbi-best}"
     prepare_panel_cmd=(python3 -u run_real_fungal_benchmark.py prepare
         --out-dir "${PANEL_DIR}/prepared" \
         --panel "${panel}" \
-        --source ncbi-genbank \
+        --source "${REAL_NCBI_SOURCE}" \
         --max-assemblies-per-species "${REAL_MAX_ASMS_PER_SPECIES}" \
         --querys-per-species "${REAL_QUERIES_PER_SPECIES}" \
         --max-ref-downloads "${REAL_MAX_REF_DOWNLOADS}" \
@@ -569,6 +581,17 @@ if [[ "$EXPERIMENT_TYPE" == "all" || "$EXPERIMENT_TYPE" == "real" ]]; then
       else
         bench_timeout="${BENCHMARK_TIMEOUT_READS}"
         read_validation_min_support="${REAL_READ_VALIDATION_MIN_SUPPORT_READS:-3}"
+      fi
+      # Per-panel/per-mode timeout overrides. te_rich_pathogen (Puccinia ~80 Mbp,
+      # ~85% TE content) consistently overruns the global 3h assembly cap even
+      # after we drop cactus/pggb/anchorwave — minigraph + svim_asm + MycoSV's
+      # own SA walker against multiple references is the bottleneck. Allow each
+      # panel/mode to claim its own budget without bumping the global default
+      # for fast panels like compact_yeast.
+      panel_mode_upper="$(echo "${panel}_${mode}" | tr '[:lower:]-' '[:upper:]_')"
+      panel_timeout_var="BENCHMARK_TIMEOUT_${panel_mode_upper}"
+      if [[ -n "${!panel_timeout_var:-}" ]]; then
+        bench_timeout="${!panel_timeout_var}"
       fi
       bench_cmd=(python3 -u run_real_fungal_benchmark.py benchmark
         --prepared-dir "${PANEL_DIR}/prepared"

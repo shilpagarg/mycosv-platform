@@ -78,6 +78,96 @@ def test_select_all_public_rows_filters_by_level_and_latest():
     assert [row["assembly_accession"] for row in selected] == ["GCF_1"]
 
 
+def test_ncbi_best_deduplicates_paired_refseq_genbank_and_prefers_best():
+    rows = [
+        {
+            "assembly_accession": "GCA_000001",
+            "gbrs_paired_asm": "GCF_000001",
+            "organism_name": "Saccharomyces cerevisiae S288C",
+            "assembly_level": "Complete Genome",
+            "version_status": "latest",
+            "genome_rep": "Full",
+            "refseq_category": "na",
+            "seq_rel_date": "2024/01/01",
+            "ftp_path": "https://ftp.ncbi.nlm.nih.gov/genomes/all/GCA_000001",
+            "_catalog_source": "ncbi-genbank",
+        },
+        {
+            "assembly_accession": "GCF_000001",
+            "gbrs_paired_asm": "GCA_000001",
+            "organism_name": "Saccharomyces cerevisiae S288C",
+            "assembly_level": "Complete Genome",
+            "version_status": "latest",
+            "genome_rep": "Full",
+            "refseq_category": "reference genome",
+            "seq_rel_date": "2024/01/01",
+            "ftp_path": "https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF_000001",
+            "_catalog_source": "ncbi-refseq",
+        },
+        {
+            "assembly_accession": "GCA_000002",
+            "gbrs_paired_asm": "na",
+            "organism_name": "Saccharomyces cerevisiae isolate X",
+            "assembly_level": "Scaffold",
+            "version_status": "latest",
+            "genome_rep": "Full",
+            "refseq_category": "na",
+            "seq_rel_date": "2025/01/01",
+            "ftp_path": "https://ftp.ncbi.nlm.nih.gov/genomes/all/GCA_000002",
+            "_catalog_source": "ncbi-genbank",
+        },
+    ]
+    deduped = rrfb.deduplicate_best_assembly_rows(rows)
+    assert {row["assembly_accession"] for row in deduped} == {"GCF_000001", "GCA_000002"}
+    selected = select_species_rows(deduped, "Saccharomyces cerevisiae", 2)
+    assert selected[0]["assembly_accession"] == "GCF_000001"
+
+
+def test_ncbi_download_targets_strip_trailing_ftp_slash():
+    row = {
+        "ftp_path": (
+            "https://ftp.ncbi.nlm.nih.gov/genomes/all/GCA/000/001/405/"
+            "GCA_000001405.29_GRCh38.p14/"
+        )
+    }
+    targets = rrfb.ncbi_download_targets(row, include_gff=True)
+    assert targets[0][0].endswith(
+        "/GCA_000001405.29_GRCh38.p14/GCA_000001405.29_GRCh38.p14_genomic.fna.gz"
+    )
+    assert "//GCA_000001405.29_GRCh38.p14_genomic" not in targets[0][0]
+
+
+def test_gff_to_gene_annotations_parses_gbff_fallback(tmp_path: Path):
+    gbff = tmp_path / "asm_genomic.gbff.gz"
+    text = """LOCUS       ABC123                1000 bp    DNA     linear   PLN 01-JAN-2000
+VERSION     ABC123.1
+FEATURES             Location/Qualifiers
+     source          1..1000
+                     /organism="Example fungus"
+     gene            complement(10..90)
+                     /locus_tag="GENE1"
+                     /gene="abc"
+                     /gene_biotype="protein_coding"
+     CDS             join(200..250,300..350)
+                     /locus_tag="GENE2"
+                     /product="example protein"
+ORIGIN
+//
+"""
+    with gzip.open(gbff, "wt", encoding="utf-8") as fh:
+        fh.write(text)
+
+    rows = rrfb.gff_to_gene_annotations([("GCA_TEST_1", gbff)])
+    by_id = {row["gene_id"]: row for row in rows}
+    assert by_id["GENE1"]["query_contig"] == "ABC123.1"
+    assert by_id["GENE1"]["start"] == 10
+    assert by_id["GENE1"]["end"] == 90
+    assert by_id["GENE1"]["strand"] == "-"
+    assert by_id["GENE2"]["start"] == 200
+    assert by_id["GENE2"]["end"] == 350
+    assert by_id["GENE2"]["product"] == "example protein"
+
+
 def test_load_mycosv_reference_calls_parses_ref_space(tmp_path: Path):
     vcf = tmp_path / "calls.vcf"
     vcf.write_text(
@@ -187,15 +277,28 @@ def test_score_callsets_does_not_mix_coordinate_spaces():
 
 def test_parse_ena_filereport_and_select_sources():
     text = (
-        "run_accession\tscientific_name\tinstrument_platform\tlibrary_layout\tfastq_ftp\tsubmitted_ftp\n"
-        "SRR1\tAspergillus fumigatus\tILLUMINA\tPAIRED\tftp.sra.ebi.ac.uk/vol1/fastq/SRR1_1.fastq.gz;ftp.sra.ebi.ac.uk/vol1/fastq/SRR1_2.fastq.gz\t\n"
-        "SRR2\tAspergillus fumigatus\tOXFORD_NANOPORE\tSINGLE\tftp.sra.ebi.ac.uk/vol1/fastq/SRR2.fastq.gz\t\n"
+        "run_accession\tscientific_name\tinstrument_platform\tlibrary_layout\tfastq_ftp\tread_count\tsubmitted_ftp\n"
+        "SRR1\tAspergillus fumigatus\tILLUMINA\tPAIRED\tftp.sra.ebi.ac.uk/vol1/fastq/SRR1_1.fastq.gz;ftp.sra.ebi.ac.uk/vol1/fastq/SRR1_2.fastq.gz\t100000\t\n"
+        "SRR2\tAspergillus fumigatus\tOXFORD_NANOPORE\tSINGLE\tftp.sra.ebi.ac.uk/vol1/fastq/SRR2.fastq.gz\t100000\t\n"
     )
     rows = parse_ena_filereport_text(text)
     urls, meta = select_ena_read_sources(rows, "short-reads", 2)
     assert len(urls) == 2
     assert all(url.startswith("https://ftp.sra.ebi.ac.uk/") for url in urls)
     assert meta[0]["run_accession"] == "SRR1"
+    assert meta[0]["selected_urls"].split(";") == urls
+
+
+def test_select_ena_sources_rejects_submitted_binary_and_tiny_runs():
+    rows = parse_ena_filereport_text(
+        "run_accession\tscientific_name\tinstrument_platform\tlibrary_layout\tfastq_ftp\tread_count\tsubmitted_ftp\n"
+        "BAD1\tRhizophagus irregularis\tPACBIO_SMRT\tSINGLE\t\t500000\tftp.sra.ebi.ac.uk/vol1/hdf5/BAD1.bas.h5\n"
+        "BAD2\tRhizophagus irregularis\tOXFORD_NANOPORE\tSINGLE\tftp.sra.ebi.ac.uk/vol1/fastq/BAD2.fastq.gz\t1\t\n"
+        "GOOD1\tRhizophagus irregularis\tOXFORD_NANOPORE\tSINGLE\tftp.sra.ebi.ac.uk/vol1/fastq/GOOD1.fastq.gz\t200000\t\n"
+    )
+    urls, meta = select_ena_read_sources(rows, "long-reads", 4)
+    assert urls == ["https://ftp.sra.ebi.ac.uk/vol1/fastq/GOOD1.fastq.gz"]
+    assert [row["run_accession"] for row in meta] == ["GOOD1"]
 
 
 def test_merge_sequence_sources_concatenates_gz_fastq(tmp_path: Path):
@@ -209,6 +312,18 @@ def test_merge_sequence_sources_concatenates_gz_fastq(tmp_path: Path):
     text = merged.read_text(encoding="utf-8")
     assert merged.suffix == ".fastq"
     assert "@a" in text and "@b" in text
+
+
+def test_merge_sequence_sources_rejects_non_fastq_payload(tmp_path: Path):
+    bad = tmp_path / "bad.fastq"
+    bad.write_bytes(b"\x89HDF\r\n\x1a\nnot fastq" + b"x" * 32)
+    try:
+        merge_sequence_sources([str(bad)], tmp_path / "bad_merged")
+    except ValueError as exc:
+        assert "does not start with '@'" in str(exc)
+    else:
+        raise AssertionError("expected non-FASTQ payload to fail validation")
+    assert not (tmp_path / "bad_merged.fastq").exists()
 
 
 def test_materialize_query_input_supports_direct_fastq_urls(tmp_path: Path):
