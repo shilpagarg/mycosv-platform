@@ -3,6 +3,7 @@
 
 import run_real_fungal_benchmark as rrfb
 from pathlib import Path
+import csv
 import gzip
 import math
 
@@ -169,6 +170,84 @@ ORIGIN
     assert by_id["GENE2"]["product"] == "example protein"
 
 
+def test_stream_gene_annotations_to_tsv_expands_aliases(tmp_path: Path):
+    """The streaming writer must (a) emit each parsed gene once per owner alias,
+    (b) cover ref aliases + per-benchmark query aliases, and (c) keep RSS low
+    by not retaining cross-source rows. We assert (a) and (b) here; (c) is what
+    the original implementation got wrong (it built every row in memory before
+    write_tsv'ing), so a regression on (a/b) is the only thing a unit test
+    can catch — memory blowup needs the live 2000-source workload to surface.
+    """
+    gff = tmp_path / "ref_asm_genomic.gff.gz"
+    gff_text = (
+        "##gff-version 3\n"
+        "contigA\tref\tgene\t100\t200\t.\t+\t.\tID=g1;Name=GENEA\n"
+        "contigA\tref\tgene\t300\t400\t.\t-\t.\tID=g2;Name=GENEB\n"
+        "contigB\tref\tCDS\t500\t600\t.\t+\t.\tID=cds1\n"  # filtered: ftype not in _GFF_GENE_TYPES
+    )
+    with gzip.open(gff, "wt", encoding="utf-8") as fh:
+        fh.write(gff_text)
+
+    out = tmp_path / "gene_annotations.tsv"
+    asm_aliases = {
+        "REF1": {"REF1", "REF1.fa", "REF1.fasta"},
+        "QUERY_A": {"QUERY_A", "QA.fna"},
+        "QUERY_B": {"QUERY_B"},
+    }
+    ref_to_queries = {"REF1": ["QUERY_A", "QUERY_B"]}
+
+    n = rrfb.stream_gene_annotations_to_tsv(
+        out, [("REF1", gff)], asm_aliases, ref_to_queries, progress_every=0,
+    )
+    assert n > 0
+    with out.open(encoding="utf-8") as fh:
+        reader = csv.DictReader(fh, delimiter="\t")
+        rows = list(reader)
+    # 2 genes × (3 ref aliases + 2 QA aliases + 1 QB alias) = 12 rows.
+    assert len(rows) == 12
+    owners_by_gene: dict[str, set[str]] = {}
+    for row in rows:
+        owners_by_gene.setdefault(row["gene_id"], set()).add(row["query_asm"])
+    assert owners_by_gene["g1"] == {"REF1", "REF1.fa", "REF1.fasta", "QUERY_A", "QA.fna", "QUERY_B"}
+    assert owners_by_gene["g2"] == owners_by_gene["g1"]
+
+
+def test_stream_gene_annotations_to_tsv_handles_empty_source(tmp_path: Path):
+    """A GBFF with no gene/CDS features (common for unannotated NCBI WGS
+    assemblies) must not abort the streaming write — earlier sources' rows
+    should stay on disk and the function must just keep going. Without this
+    behaviour prepare_million_real silently produced zero-row TSVs whenever
+    its 2000-source mix had even one barren GBFF.
+    """
+    gff = tmp_path / "ref_genomic.gff.gz"
+    with gzip.open(gff, "wt", encoding="utf-8") as fh:
+        fh.write("##gff-version 3\ncontigA\tref\tgene\t1\t100\t.\t+\t.\tID=g1\n")
+    barren_gbff = tmp_path / "barren_genomic.gbff.gz"
+    with gzip.open(barren_gbff, "wt", encoding="utf-8") as fh:
+        fh.write(
+            "LOCUS       SCAFFOLD              1000 bp    DNA     linear   CON 01-JAN-2024\n"
+            "VERSION     SCAFFOLD.1\n"
+            "FEATURES             Location/Qualifiers\n"
+            "     source          1..1000\n"
+            "                     /organism=\"Unannotated WGS\"\n"
+            "CONTIG      join(SCAFFOLD_PART_1.1:1..1000)\n"
+            "//\n"
+        )
+    out = tmp_path / "gene_annotations.tsv"
+    n = rrfb.stream_gene_annotations_to_tsv(
+        out,
+        [("REF_OK", gff), ("REF_BARREN", barren_gbff)],
+        asm_aliases={"REF_OK": {"REF_OK"}, "REF_BARREN": {"REF_BARREN"}},
+        ref_to_queries={},
+        progress_every=0,
+    )
+    assert n == 1
+    with out.open(encoding="utf-8") as fh:
+        reader = csv.DictReader(fh, delimiter="\t")
+        rows = list(reader)
+    assert [row["query_asm"] for row in rows] == ["REF_OK"]
+
+
 def test_load_mycosv_reference_calls_parses_ref_space(tmp_path: Path):
     vcf = tmp_path / "calls.vcf"
     vcf.write_text(
@@ -220,6 +299,34 @@ def test_load_mycosv_calls_parse_intrinsic_read_support(tmp_path: Path):
     assert query_calls[0].read_support == 12
     assert query_calls[1].read_support == 8
     assert ref_calls[0].read_support == 8
+
+
+def test_expand_to_multisample_vcf_uses_manifest_samples_for_empty_vcf(tmp_path: Path):
+    vcf = tmp_path / "calls.vcf"
+    vcf.write_text(
+        "##fileformat=VCFv4.3\n"
+        "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tSAMPLE\n",
+        encoding="utf-8",
+    )
+
+    out = rrfb.expand_to_multisample_vcf(
+        vcf,
+        tmp_path / "calls.multisample.vcf",
+        ["q1", "q2"],
+    )
+
+    header = [line for line in out.read_text(encoding="utf-8").splitlines() if line.startswith("#CHROM")][0]
+    assert header.endswith("\tFORMAT\tq1\tq2")
+
+
+def test_join_biology_findings_writes_header_when_candidates_missing(tmp_path: Path):
+    out = tmp_path / "biology_findings.tsv"
+
+    rrfb.join_biology_findings(None, [], {}, out)
+
+    text = out.read_text(encoding="utf-8")
+    assert text.startswith("query_asm\tquery_contig\tpos\tend\tsvtype")
+    assert "comparator_support_count" in text
 
 
 def test_load_mycosv_assembly_support_from_vcf(tmp_path: Path):
@@ -315,6 +422,81 @@ def test_calls_compatible_accepts_inv_whole_block_prediction():
     pred = NormalizedCall("q1", "ctg", 1000, 9000, "INV", 8000, "mycosv", coord_space="reference", ref_contig="chr1")
     assert rrfb.calls_compatible(truth, pred)
     assert score_callsets([truth], [pred])["tp"] == 1
+
+
+def test_tra_matching_requires_mate_breakpoint_when_present():
+    truth = NormalizedCall(
+        "q1", ".", 1000, 1000, "TRA", 1, "truth",
+        coord_space="reference", ref_contig="chr1",
+        mate_contig="chr2", mate_pos=5000, mate_end=5000,
+    )
+    local_only_wrong_mate = NormalizedCall(
+        "q1", ".", 1002, 1002, "TRA", 1, "mycosv",
+        coord_space="reference", ref_contig="chr1",
+        mate_contig="chr3", mate_pos=5000, mate_end=5000,
+    )
+    correct = NormalizedCall(
+        "q1", ".", 1002, 1002, "TRA", 1, "mycosv",
+        coord_space="reference", ref_contig="chr1",
+        mate_contig="chr2", mate_pos=5050, mate_end=5050,
+    )
+
+    assert not rrfb.calls_compatible(truth, local_only_wrong_mate)
+    assert rrfb.calls_compatible(truth, correct)
+    assert score_callsets([truth], [local_only_wrong_mate])["tp"] == 0
+    assert score_callsets([truth], [correct])["tp"] == 1
+
+
+def test_reference_vcf_loader_parses_bnd_alt_mate(tmp_path: Path):
+    vcf = tmp_path / "bnd.vcf"
+    vcf.write_text(
+        "##fileformat=VCFv4.3\n"
+        "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\n"
+        "chr1\t1000\tbnd1\tN\tN]chr2:5000]\t60\tPASS\tSVTYPE=BND\n",
+        encoding="utf-8",
+    )
+
+    calls = rrfb.load_reference_vcf_calls(vcf, "manta", "q1")
+
+    assert len(calls) == 1
+    assert calls[0].svtype == "TRA"
+    assert calls[0].mate_contig == "chr2"
+    assert calls[0].mate_pos == 5000
+
+
+def test_validate_tra_uses_mate_breakpoint_support(tmp_path: Path, monkeypatch):
+    ref = tmp_path / "ref.fa"
+    ref.write_text(">chr1\nACGT\n>chr2\nACGT\n", encoding="utf-8")
+    query_row = {
+        "query_asm": "q1",
+        "query_mode": "long-reads",
+        "path": str(ref),
+        "benchmark_ref_fasta": str(ref),
+    }
+    call = NormalizedCall(
+        "q1", ".", 1000, 1000, "TRA", 1, "truth",
+        coord_space="reference", ref_contig="chr1",
+        mate_contig="chr2", mate_pos=5000, mate_end=5000,
+    )
+    seen = []
+
+    def fake_support(_bam, contig, pos, end, **_kwargs):
+        seen.append((contig, pos, end))
+        return 0 if contig == "chr1" else 3
+
+    monkeypatch.setattr(rrfb, "_build_validation_bam", lambda *a, **k: (tmp_path / "x.bam", ref))
+    monkeypatch.setattr(rrfb, "_samtools_count_breakpoint_support", fake_support)
+
+    kept, rows = rrfb.validate_calls_with_reads(
+        [call], query_row, tmp_path / "validation",
+        threads=1, min_support=3, flank_bp=250,
+    )
+
+    assert kept == [call]
+    assert ("chr1", 1000, 1000) in seen
+    assert ("chr2", 5000, 5000) in seen
+    assert rows[0]["validation_support"] == 3
+    assert rows[0]["read_validated"] == "yes"
 
 
 def test_cigar_indels_support_reference_breakpoints():
@@ -949,5 +1131,8 @@ def test_benchmark_mycosv_only_validates_mycosv_reference_calls(tmp_path: Path, 
     readval = args.out_dir / "read_validated_truth.tsv"
     assert readval.exists()
     assert "mycosv" in readval.read_text(encoding="utf-8")
+    assert (vcf.with_suffix(".multisample.vcf")).exists()
+    assert (vcf.with_name("alls.multisample.vcf")).exists()
+    assert (args.out_dir / "biology_findings.tsv").exists()
     summary = json.loads((args.out_dir / "benchmark_summary.json").read_text(encoding="utf-8"))
     assert summary["queries"]["q1"]["read_validation"]["mycosv_reference"]["read_validated"] == 1

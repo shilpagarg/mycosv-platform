@@ -1634,32 +1634,73 @@ struct SvTypeFromChain {
             return res;
         }
 
-        // Compute cumulative query and reference gaps
+        // Compute cumulative query and reference gaps, and track the strongest
+        // local backward jump in reference coordinates. With repetitive query
+        // genomes (e.g. arbuscular mycorrhizal fungi) the LCP-expanded
+        // find_mems output adds noisy MEM pairs that push *cumulative* rGap
+        // back above -minSvLen, which masked tandem duplications and led the
+        // primary chain to misclassify them as INS. Detecting DUP on the
+        // strongest individual backward jump (with a small forward qGap, the
+        // tandem-dup signature) keeps DUP recall on those scenarios while
+        // leaving INS/DEL/INV detection unchanged.
         int qGap = 0, rGap = 0;
+        int dupPairIdx     = -1;
+        int dupPairBack    = 0;   // most negative consecutive rGap
+        int dupPairQGap    = 0;
         for (int i = 0; i + 1 < N; ++i) {
-            qGap += chain[static_cast<size_t>(i+1)].qPos -
-                    (chain[static_cast<size_t>(i)].qPos + chain[static_cast<size_t>(i)].len);
-            rGap += chain[static_cast<size_t>(i+1)].rPos -
-                    (chain[static_cast<size_t>(i)].rPos + chain[static_cast<size_t>(i)].len);
+            const int lqg = chain[static_cast<size_t>(i+1)].qPos -
+                            (chain[static_cast<size_t>(i)].qPos + chain[static_cast<size_t>(i)].len);
+            const int lrg = chain[static_cast<size_t>(i+1)].rPos -
+                            (chain[static_cast<size_t>(i)].rPos + chain[static_cast<size_t>(i)].len);
+            qGap += lqg;
+            rGap += lrg;
+            if (lrg < dupPairBack) {
+                dupPairBack = lrg;
+                dupPairIdx  = i;
+                dupPairQGap = lqg;
+            }
         }
 
         const int delta = qGap - rGap;
-        if (std::abs(delta) < minSvLen) return res;
 
-        // DUP: reference positions overlap (rGap < 0)
-        if (rGap < -minSvLen) {
+        // DUP: cumulative reference overlap, OR a single backward rPos jump
+        // ≥ minSvLen accompanied by a non-negative query gap (tandem-dup
+        // signature: q advances by ~svLen while r returns to the original
+        // copy's coordinates).
+        const bool cumulativeDup = (rGap < -minSvLen);
+        const bool perPairDup    = (dupPairIdx >= 0 &&
+                                    dupPairBack < -minSvLen &&
+                                    dupPairQGap >= -minSvLen &&
+                                    -dupPairBack >= dupPairQGap);
+        if (cumulativeDup || perPairDup) {
             const int ctgOff = (c0 > 0)
                 ? sa.contigEnd[static_cast<size_t>(c0) - 1] : 0;
-            res.type        = Type::DUP;
-            res.qBreakStart = chain[0].qPos;
-            res.qBreakEnd   = chain[static_cast<size_t>(N-1)].qPos +
-                              chain[static_cast<size_t>(N-1)].len - 1;  // 0-based inclusive
-            res.rBreakStart = chain[0].rPos - ctgOff;
-            res.rBreakEnd   = res.rBreakStart + (-rGap);
-            res.svLen       = -rGap;
+            res.type = Type::DUP;
+            if (cumulativeDup) {
+                res.qBreakStart = chain[0].qPos;
+                res.qBreakEnd   = chain[static_cast<size_t>(N-1)].qPos +
+                                  chain[static_cast<size_t>(N-1)].len - 1;
+                res.rBreakStart = chain[0].rPos - ctgOff;
+                res.rBreakEnd   = res.rBreakStart + (-rGap);
+                res.svLen       = -rGap;
+            } else {
+                // Anchor on the offending pair: the duplicated copy sits
+                // between chain[dupPairIdx] and chain[dupPairIdx+1] in
+                // query space, mapping back to chain[dupPairIdx+1].rPos in
+                // reference space.
+                res.qBreakStart = chain[static_cast<size_t>(dupPairIdx)].qPos +
+                                  chain[static_cast<size_t>(dupPairIdx)].len;
+                res.qBreakEnd   = chain[static_cast<size_t>(dupPairIdx + 1)].qPos +
+                                  chain[static_cast<size_t>(dupPairIdx + 1)].len - 1;
+                res.rBreakStart = chain[static_cast<size_t>(dupPairIdx + 1)].rPos - ctgOff;
+                res.rBreakEnd   = res.rBreakStart + (-dupPairBack);
+                res.svLen       = -dupPairBack;
+            }
             if (c0 >= 0) res.rContig = sa.contigName[static_cast<size_t>(c0)];
             return res;
         }
+
+        if (std::abs(delta) < minSvLen) return res;
 
         // INS / DEL: find the consecutive MEM pair with the dominant local gap
         // mismatch — that is where the SV actually sits, not necessarily chain[0].

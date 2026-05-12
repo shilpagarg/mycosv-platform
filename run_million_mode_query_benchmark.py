@@ -23,6 +23,39 @@ DEFAULT_BIN = ROOT / "fungi_graphsv_tol_bin"
 DEFAULT_ANALYZE = ROOT / "analyze_new_biology_candidates.py"
 
 
+_BIOLOGY_FINDINGS_EXTRA = [
+    "comparator_support_count",
+    "comparator_support_labels",
+    "mycosv_unique",
+]
+
+
+def _write_biology_findings_from_candidates(candidates_tsv: Path, out_tsv: Path) -> None:
+    """Promote biology_candidates.tsv to biology_findings.tsv.
+
+    The simulated / million-scale path has no algorithm-comparator runs, so
+    every MycoSV candidate is mycosv_unique by definition. Emitting the
+    findings file in this mode keeps downstream tooling (and per-SV-type
+    audits) consistent across simulated, real_data, and million_real
+    experiments.
+    """
+    with candidates_tsv.open(encoding="utf-8") as fin:
+        reader = csv.DictReader(fin, delimiter="\t")
+        fieldnames = list(reader.fieldnames or [])
+        for extra in _BIOLOGY_FINDINGS_EXTRA:
+            if extra not in fieldnames:
+                fieldnames.append(extra)
+        out_tsv.parent.mkdir(parents=True, exist_ok=True)
+        with out_tsv.open("w", encoding="utf-8", newline="") as fout:
+            writer = csv.DictWriter(fout, fieldnames=fieldnames, delimiter="\t")
+            writer.writeheader()
+            for row in reader:
+                row.setdefault("comparator_support_count", "0")
+                row.setdefault("comparator_support_labels", ".")
+                row.setdefault("mycosv_unique", "yes")
+                writer.writerow(row)
+
+
 def run(cmd: list[str], cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
     # Capture as bytes then decode with errors="replace" so a non-UTF-8 byte
     # in tool stderr (long-read FASTQ headers, comparator log warnings) cannot
@@ -440,6 +473,7 @@ def main() -> int:
         if DEFAULT_ANALYZE.exists():
             bio_dir = mode_dir / "biology"
             bio_dir.mkdir(parents=True, exist_ok=True)
+            candidates_tsv = bio_dir / "biology_candidates.tsv"
             try:
                 run([
                     sys.executable, str(DEFAULT_ANALYZE),
@@ -447,12 +481,21 @@ def main() -> int:
                     "--hits",           str(out_prefix.with_suffix(".hits.tsv")),
                     "--query-metadata", str(sim_dir / "query_metadata.tsv"),
                     "--phylum",         args.phylum,
-                    "--out-tsv",        str(bio_dir / "biology_candidates.tsv"),
+                    "--out-tsv",        str(candidates_tsv),
                     "--summary-json",   str(bio_dir / "biology_candidates.json"),
                     "--top-n",          "200",
                 ], cwd=ROOT)
             except subprocess.CalledProcessError:
                 pass  # biology analysis is non-fatal
+            # Mirror biology_candidates.tsv as biology_findings.tsv: the
+            # simulated path has no comparator-based support set, so every
+            # row gets comparator_support_count=0 / mycosv_unique=yes. This
+            # keeps the file present (and per-SV-type complete) for tools
+            # that look for biology_findings.tsv regardless of mode.
+            if candidates_tsv.exists() and candidates_tsv.stat().st_size > 0:
+                _write_biology_findings_from_candidates(
+                    candidates_tsv, mode_dir / "biology_findings.tsv",
+                )
 
         store_path = idx_dir / "routing_centroids.bin"
         skip_path = Path(str(store_path) + ".skip")

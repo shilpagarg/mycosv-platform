@@ -267,6 +267,9 @@ class NormalizedCall:
     ref_asm: str = "."
     ref_contig: str = "."
     read_support: int | None = None
+    mate_contig: str = "."
+    mate_pos: int = 0
+    mate_end: int = 0
 
 
 _TOOL_TIMEOUT = int(os.environ.get("MYCOSV_TOOL_TIMEOUT", "14400"))
@@ -1369,40 +1372,261 @@ def ncbi_genbank_target(row: dict[str, str]) -> tuple[str, str]:
     return f"{ftp_path}/{stem}_genomic.gbff.gz", f"{stem}_genomic.gbff.gz"
 
 
+# Ensembl Fungi FTP layout: /pub/fungi/<release>/gff3/<species_dir>/<File>.gff3.gz
+# `current` symlinks to the latest release. The release number is also baked
+# into the GFF filename (e.g. ...R64-1-1.62.gff3.gz for release 62), so we
+# discover it once from the directory listing of pub/fungi/ and cache it.
+#
+# Per-species index: species_EnsemblFungi.txt (TSV, ~300 KB) lists every
+# species directory along with its NCBI assembly_accession and taxonomy_id —
+# small enough to fetch once and re-use across panels. We deliberately do not
+# pull species_metadata_EnsemblFungi.json (376 MB) since it is overkill for
+# accession-keyed lookup.
+_ENSEMBL_FUNGI_FTP_BASE = "https://ftp.ensemblgenomes.ebi.ac.uk/pub/fungi/current"
+_ENSEMBL_FUNGI_SPECIES_TSV_URL = (
+    f"{_ENSEMBL_FUNGI_FTP_BASE}/species_EnsemblFungi.txt"
+)
+_ENSEMBL_FUNGI_PARENT_URL = "https://ftp.ensemblgenomes.ebi.ac.uk/pub/fungi/"
+
+
+def _ensembl_fungi_release(cache_dir: Path) -> str | None:
+    """Discover the current Ensembl Fungi release number (e.g. "62").
+
+    Cached under data_cache to avoid an HTTP roundtrip per prepare. Returns
+    None when the FTP listing is unreachable; the caller skips the Ensembl
+    fallback in that case.
+    """
+    cache_path = cache_dir / "ensembl_fungi_release.txt"
+    if cache_path.exists() and cache_path.stat().st_size > 0:
+        value = cache_path.read_text(encoding="utf-8").strip()
+        if value.isdigit():
+            return value
+    try:
+        listing = http_get_text(_ENSEMBL_FUNGI_PARENT_URL)
+    except Exception as exc:  # noqa: BLE001 - best-effort
+        sys.stderr.write(f"[ensembl-fungi] release discovery failed: {exc}\n")
+        return None
+    releases = sorted(
+        {int(m) for m in re.findall(r'href="release-(\d+)/"', listing)},
+        reverse=True,
+    )
+    if not releases:
+        return None
+    release = str(releases[0])
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    cache_path.write_text(release + "\n", encoding="utf-8")
+    return release
+
+
+def _ensembl_fungi_species_index(cache_dir: Path) -> dict[str, dict[str, str]]:
+    """Return Ensembl Fungi species TSV indexed by NCBI accession + taxid.
+
+    Empty dict on any fetch / parse failure: the Ensembl fallback is best-effort
+    and must never block the primary NCBI GFF + GBFF path.
+    """
+    cache_path = cache_dir / "ensembl_fungi_species.tsv"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    if not cache_path.exists() or cache_path.stat().st_size == 0:
+        try:
+            http_download(_ENSEMBL_FUNGI_SPECIES_TSV_URL, cache_path)
+        except Exception as exc:  # noqa: BLE001 - best-effort
+            sys.stderr.write(
+                f"[ensembl-fungi] species TSV fetch failed: {exc}\n"
+            )
+            return {}
+    index: dict[str, dict[str, str]] = {}
+    try:
+        with cache_path.open(encoding="utf-8") as fh:
+            # Header line begins with '#'; csv.DictReader can read it after
+            # stripping the leading '#'.
+            first = fh.readline().lstrip("#").rstrip("\n")
+            field_names = first.split("\t")
+            reader = csv.DictReader(fh, fieldnames=field_names, delimiter="\t")
+            for rec in reader:
+                if not isinstance(rec, dict):
+                    continue
+                # Keys we want to look up by: NCBI assembly_accession (with
+                # and without version), NCBI taxonomy_id.
+                acc = (rec.get("assembly_accession") or "").strip()
+                taxid = (rec.get("taxonomy_id") or "").strip()
+                if acc:
+                    index.setdefault(acc, rec)
+                    base = acc.split(".", 1)[0]
+                    if base and base != acc:
+                        index.setdefault(base, rec)
+                if taxid:
+                    index.setdefault(taxid, rec)
+    except (OSError, csv.Error) as exc:
+        sys.stderr.write(f"[ensembl-fungi] species TSV parse failed: {exc}\n")
+        return {}
+    return index
+
+
+_ENSEMBL_FUNGI_COLLECTION_RE = re.compile(r"^(fungi_[a-z0-9]+_collection)_core_")
+
+
+def _ensembl_fungi_collection(rec: dict[str, str]) -> str | None:
+    """Extract Ensembl's collection bucket from species_EnsemblFungi.txt's
+    core_db field. Top-level model species (S. cerevisiae, N. crassa, ...)
+    have no collection; non-model species are grouped under
+    fungi_<phylum><N>_collection (e.g. fungi_mucoromycota1_collection).
+    Without this hint, the GFF URL silently 404s for ~80 % of fungal asms.
+    """
+    core_db = (rec.get("core_db") or "").strip()
+    if not core_db:
+        return None
+    m = _ENSEMBL_FUNGI_COLLECTION_RE.match(core_db)
+    return m.group(1) if m else None
+
+
+def _ensembl_fungi_gff_url(
+    row: dict[str, str],
+    cache_dir: Path,
+) -> tuple[str, str] | None:
+    """Resolve an Ensembl Fungi GFF3 URL for one NCBI assembly row.
+
+    Returns (url, filename) or None if the assembly has no Ensembl Fungi
+    counterpart, the release cannot be discovered, or the species index is
+    unreachable. The URL points at the whole-genome GFF
+    (`<Species>.<assembly>.<release>.gff3.gz`); per-chromosome files are
+    skipped because the downstream parser expects a single GFF per asm.
+    """
+    release = _ensembl_fungi_release(cache_dir)
+    if release is None:
+        return None
+    index = _ensembl_fungi_species_index(cache_dir)
+    if not index:
+        return None
+    acc = (row.get("assembly_accession") or "").strip()
+    candidates: list[str] = []
+    if acc:
+        candidates.append(acc)
+        candidates.append(acc.split(".", 1)[0])
+    for key in ("taxid", "species_taxid"):
+        v = (row.get(key) or "").strip()
+        if v:
+            candidates.append(v)
+    rec: dict[str, str] | None = None
+    for key in candidates:
+        if key and key in index:
+            rec = index[key]
+            break
+    if rec is None:
+        return None
+    species_dir = (rec.get("species") or "").strip().lower()
+    assembly = (rec.get("assembly") or "").strip()
+    if not species_dir or not assembly:
+        return None
+    # The whole-genome GFF filename is "<Species_Cap>.<assembly>.<release>.gff3.gz".
+    # Capitalize only the first character (Ensembl convention: do NOT title-case
+    # each word — strain suffixes like "_cen_pk113_7d_gca_000269885" must stay
+    # lowercase).
+    species_cap = species_dir[:1].upper() + species_dir[1:]
+    filename = f"{species_cap}.{assembly}.{release}.gff3.gz"
+    collection = _ensembl_fungi_collection(rec)
+    if collection:
+        url = f"{_ENSEMBL_FUNGI_FTP_BASE}/gff3/{collection}/{species_dir}/{filename}"
+    else:
+        url = f"{_ENSEMBL_FUNGI_FTP_BASE}/gff3/{species_dir}/{filename}"
+    return url, filename
+
+
+# Tally of per-asm annotation outcomes. download_ncbi_gene_annotation_source
+# used to emit one stderr line per assembly without a NCBI GFF (1400+ lines
+# in a 2000-assembly run, drowning real errors). The function now records
+# (kind, asm_name) tuples here; the caller prints a single summary line.
+ANNOTATION_SOURCE_TALLY: dict[str, list[str]] = {
+    "ncbi_gff": [],
+    "ensembl_fungi_gff": [],
+    "ncbi_gbff": [],
+    "none": [],
+}
+
+
+def reset_annotation_source_tally() -> None:
+    for k in ANNOTATION_SOURCE_TALLY:
+        ANNOTATION_SOURCE_TALLY[k].clear()
+
+
+def annotation_source_summary() -> str:
+    counts = {k: len(v) for k, v in ANNOTATION_SOURCE_TALLY.items()}
+    total = sum(counts.values())
+    if total == 0:
+        return ""
+    parts = [
+        f"ncbi_gff={counts['ncbi_gff']}",
+        f"ensembl_fungi_gff={counts['ensembl_fungi_gff']}",
+        f"ncbi_gbff={counts['ncbi_gbff']}",
+        f"none={counts['none']}",
+    ]
+    return f"gene_annotation_sources: total={total}  " + "  ".join(parts)
+
+
 def download_ncbi_gene_annotation_source(
     row: dict[str, str],
     asm_name: str,
     dest_dir: Path,
     role_label: str,
+    *,
+    ensembl_cache_dir: Path | None = None,
 ) -> Path | None:
     """Download the best public gene-annotation source for one NCBI assembly.
 
-    NCBI's GenBank fungal assemblies often expose FASTA plus GenBank flatfiles
-    but no GFF. Prefer GFF when it exists; otherwise fall back to GBFF so we can
-    still mine gene/CDS coordinates. A missing/empty annotation source is not a
-    fatal download error because many GenBank assemblies are sequence-only.
+    Preference order:
+      1. NCBI GFF3 (genomic.gff.gz)               — when NCBI auto-annotated it
+      2. Ensembl Fungi GFF3 (species_metadata)    — for GenBank-only assemblies
+                                                    Ensembl re-annotates
+      3. NCBI GenBank flatfile (genomic.gbff.gz)  — gene/CDS records embedded
+                                                    in the deposited record
+
+    A missing/empty annotation source is not a fatal download error: many
+    GenBank assemblies are sequence-only. Per-assembly outcomes are recorded
+    in ANNOTATION_SOURCE_TALLY so the caller can emit a single end-of-stage
+    summary instead of 1000+ informational stderr lines.
     """
     gff_url, gff_filename = ncbi_download_targets(row, include_gff=True)[1]
     try:
-        return materialize_entry(gff_url, dest_dir / gff_filename, keep_gz=True)
+        path = materialize_entry(gff_url, dest_dir / gff_filename, keep_gz=True)
+        ANNOTATION_SOURCE_TALLY["ncbi_gff"].append(asm_name)
+        return path
     except urllib.error.HTTPError as exc:
         if getattr(exc, "code", None) != 404:
             raise
+
+    if ensembl_cache_dir is not None:
+        ens = _ensembl_fungi_gff_url(row, ensembl_cache_dir)
+        if ens is not None:
+            ens_url, ens_filename = ens
+            try:
+                path = materialize_entry(ens_url, dest_dir / ens_filename, keep_gz=True)
+                ANNOTATION_SOURCE_TALLY["ensembl_fungi_gff"].append(asm_name)
+                return path
+            except urllib.error.HTTPError as exc:
+                # 404 here is normal (Ensembl may list the species but not
+                # ship a GFF in `current`); any other HTTP error falls through
+                # to the NCBI GBFF path rather than blocking the assembly.
+                if getattr(exc, "code", None) not in {404, 403}:
+                    sys.stderr.write(
+                        f"[ensembl-fungi] {asm_name}: {exc} ({ens_url})\n"
+                    )
+            except Exception as exc:  # noqa: BLE001 - best-effort fallback
+                sys.stderr.write(
+                    f"[ensembl-fungi] {asm_name}: {exc}\n"
+                )
+
     gbff_url, gbff_filename = ncbi_genbank_target(row)
     try:
         gbff = materialize_entry(gbff_url, dest_dir / gbff_filename, keep_gz=True)
     except urllib.error.HTTPError as exc:
         if getattr(exc, "code", None) == 404:
+            ANNOTATION_SOURCE_TALLY["none"].append(asm_name)
             sys.stderr.write(
                 f"[gene-annot] no public gene annotation source for {role_label}{asm_name} "
-                "(NCBI has neither genomic.gff.gz nor genomic.gbff.gz)\n"
+                "(NCBI has no GFF/GBFF; Ensembl Fungi did not match)\n"
             )
             return None
         raise
-    sys.stderr.write(
-        f"[gene-annot] no GFF for {role_label}{asm_name}; "
-        f"using NCBI GenBank flatfile fallback {gbff.name}\n"
-    )
+    ANNOTATION_SOURCE_TALLY["ncbi_gbff"].append(asm_name)
     return gbff
 
 
@@ -2107,6 +2331,12 @@ def gff_to_gene_annotations(gff_paths: list[tuple[str, Path]]) -> list[dict[str,
     return rows
 
 
+GENE_ANNOTATION_COLUMNS = [
+    "query_asm", "query_contig", "gene_id", "gene_name",
+    "start", "end", "strand", "biotype", "product",
+]
+
+
 def write_gene_annotations_tsv(out_path: Path, gff_paths: list[tuple[str, Path]]) -> Path | None:
     rows = gff_to_gene_annotations(gff_paths)
     if not rows:
@@ -2115,15 +2345,71 @@ def write_gene_annotations_tsv(out_path: Path, gff_paths: list[tuple[str, Path]]
             f"skipping {out_path.name}\n"
         )
         return None
-    write_tsv(
-        out_path,
-        rows,
-        ["query_asm", "query_contig", "gene_id", "gene_name", "start", "end", "strand", "biotype", "product"],
-    )
+    write_tsv(out_path, rows, GENE_ANNOTATION_COLUMNS)
     sys.stderr.write(
         f"[gene-annot] wrote {len(rows)} gene records to {out_path}\n"
     )
     return out_path
+
+
+def stream_gene_annotations_to_tsv(
+    out_path: Path,
+    gff_pairs: list[tuple[str, Path]],
+    asm_aliases: dict[str, set[str]],
+    ref_to_queries: dict[str, list[str]],
+    progress_every: int = 100,
+) -> int:
+    """Stream gene rows source-by-source straight to disk with alias expansion.
+
+    The non-streaming path used to collect every parsed gene from every
+    GFF/GBFF source plus its alias duplicates into a single in-memory list
+    before calling write_tsv. With 2000 GBFF sources (~10K genes each) and
+    per-row alias expansion to ~3-5 owners, that materialised 60M+ dicts and
+    OOM-killed prepare_million_real under the 12 GiB cgroup cap before any
+    TSV bytes hit disk. Streaming bounds memory to one source (~10K rows)
+    at a time.
+
+    Returns the number of rows written (header excluded).
+    """
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    sources_total = len(gff_pairs)
+    sources_processed = 0
+    sources_with_records = 0
+    total_rows = 0
+    with out_path.open("w", newline="", encoding="utf-8") as fh:
+        writer = csv.DictWriter(fh, fieldnames=GENE_ANNOTATION_COLUMNS, delimiter="\t")
+        writer.writeheader()
+        for asm_name, annot_path in gff_pairs:
+            source_rows = gff_to_gene_annotations([(asm_name, annot_path)])
+            sources_processed += 1
+            if source_rows:
+                sources_with_records += 1
+                owners = set(asm_aliases.get(asm_name, {asm_name}))
+                for q_asm in ref_to_queries.get(asm_name, []):
+                    owners.update(asm_aliases.get(q_asm, {q_asm}))
+                # Per-source (owner, contig, gene_id) dedup is sufficient: each
+                # source has a unique asm_name so cross-source duplicates are
+                # impossible by construction.
+                seen: set[tuple[str, str, str]] = set()
+                for gene_row in source_rows:
+                    contig = gene_row["query_contig"]
+                    gene_id = gene_row["gene_id"]
+                    for owner in owners:
+                        key = (owner, contig, gene_id)
+                        if key in seen:
+                            continue
+                        seen.add(key)
+                        out_row = dict(gene_row)
+                        out_row["query_asm"] = owner
+                        writer.writerow(out_row)
+                        total_rows += 1
+            if progress_every and sources_processed % progress_every == 0:
+                print(
+                    f"      gene_annotations: parsed {sources_processed}/{sources_total} sources "
+                    f"({sources_with_records} non-empty), wrote {total_rows} rows so far",
+                    flush=True,
+                )
+    return total_rows
 
 
 def parse_ena_filereport_text(text: str) -> list[dict[str, str]]:
@@ -2722,6 +3008,7 @@ def prepare_from_ncbi(args: argparse.Namespace) -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
     cache_base = data_cache_base(args, out_dir)
     cache_base.mkdir(parents=True, exist_ok=True)
+    reset_annotation_source_tally()
     all_rows, assembly_summary_caches = fetch_ncbi_assembly_rows(args.source, cache_base)
 
     selectors: list[dict[str, str]] = []
@@ -2910,7 +3197,8 @@ def prepare_from_ncbi(args: argparse.Namespace) -> int:
             ref_downloads += 1
             if args.download_gff:
                 annotation_source = download_ncbi_gene_annotation_source(
-                    row, asm_name, refs_dir, ""
+                    row, asm_name, refs_dir, "",
+                    ensembl_cache_dir=cache_base,
                 )
                 if annotation_source is not None:
                     gff_pairs.append((asm_name, annotation_source))
@@ -2978,7 +3266,8 @@ def prepare_from_ncbi(args: argparse.Namespace) -> int:
             query_downloads += 1
             if args.download_gff:
                 annotation_source = download_ncbi_gene_annotation_source(
-                    row, asm_name, queries_dir, "query "
+                    row, asm_name, queries_dir, "query ",
+                    ensembl_cache_dir=cache_base,
                 )
                 if annotation_source is not None:
                     gff_pairs.append((asm_name, annotation_source))
@@ -3256,32 +3545,19 @@ def prepare_from_ncbi(args: argparse.Namespace) -> int:
             q_asm = bm.get("query_asm", "")
             if ref_asm and q_asm:
                 ref_to_queries[ref_asm].append(q_asm)
-        ref_rows = gff_to_gene_annotations(gff_pairs)
-        all_rows: list[dict[str, Any]] = []
-        seen: set[tuple[str, str, str]] = set()
-        for ref_row in ref_rows:
-            owners = set(asm_aliases.get(ref_row["query_asm"], {ref_row["query_asm"]}))
-            for q_asm in ref_to_queries.get(ref_row["query_asm"], []):
-                owners.update(asm_aliases.get(q_asm, {q_asm}))
-            for owner in owners:
-                key = (owner, ref_row["query_contig"], ref_row["gene_id"])
-                if key in seen:
-                    continue
-                seen.add(key)
-                duped = dict(ref_row)
-                duped["query_asm"] = owner
-                all_rows.append(duped)
-        if all_rows:
-            write_tsv(
-                gene_annotations_path,
-                all_rows,
-                ["query_asm", "query_contig", "gene_id", "gene_name", "start", "end", "strand", "biotype", "product"],
-            )
+        gene_annotations_count = stream_gene_annotations_to_tsv(
+            gene_annotations_path, gff_pairs, asm_aliases, ref_to_queries,
+        )
+        if gene_annotations_count:
             sys.stderr.write(
-                f"[gene-annot] wrote {len(all_rows)} gene records "
+                f"[gene-annot] wrote {gene_annotations_count} gene records "
                 f"(ref-keyed + per-query / FASTA-basename aliases) to {gene_annotations_path}\n"
             )
-            gene_annotations_count = len(all_rows)
+        else:
+            try:
+                gene_annotations_path.unlink()
+            except FileNotFoundError:
+                pass
 
     # Stitch the cached Expression Atlas / FungalTraits data into the
     # per-panel TSVs the analyzer auto-picks-up at benchmark time. Building
@@ -3374,6 +3650,34 @@ def parse_info_field(field: str) -> dict[str, str]:
     return info
 
 
+_BND_ALT_RE = re.compile(r"[\[\]]([^:\[\]]+):(\d+)[\[\]]")
+
+
+def _parse_bnd_alt_mate(alt: str) -> tuple[str, int] | None:
+    m = _BND_ALT_RE.search(alt or "")
+    if not m:
+        return None
+    try:
+        return m.group(1), int(m.group(2))
+    except ValueError:
+        return None
+
+
+def _mate_fields(info: dict[str, str], alt: str = "") -> tuple[str, int, int]:
+    mate_contig = info.get("CHR2") or info.get("MATE_CONTIG") or "."
+    mate_pos = _parse_int_field(info.get("POS2") or info.get("END2"))
+    if (not mate_contig or mate_contig == "." or mate_pos is None) and ("[" in alt or "]" in alt):
+        parsed = _parse_bnd_alt_mate(alt)
+        if parsed is not None:
+            mate_contig, mate_pos = parsed
+    mate_end = _parse_int_field(info.get("END2"))
+    if mate_pos is None:
+        mate_pos = 0
+    if mate_end is None:
+        mate_end = mate_pos
+    return mate_contig or ".", mate_pos, mate_end
+
+
 def qasm_matches_observed(expected: str, observed: str) -> bool:
     expected_norm = normalize_name(expected)
     observed_norm = normalize_name(observed)
@@ -3434,6 +3738,7 @@ def load_mycosv_query_calls(vcf_path: Path, query_asm: str) -> list[NormalizedCa
             pos = int(fields[1])
             end = int(info.get("END", pos))
             svlen = int(info.get("SVLEN", end - pos + 1))
+            mate_contig, mate_pos, mate_end = _mate_fields(info, fields[4])
             rows.append(NormalizedCall(
                 query_asm=query_asm,
                 query_contig=fields[0],
@@ -3448,6 +3753,9 @@ def load_mycosv_query_calls(vcf_path: Path, query_asm: str) -> list[NormalizedCa
                 ref_asm=info.get("CLADE", "."),
                 ref_contig=info.get("REFCONTIG", "."),
                 read_support=_mycosv_intrinsic_read_support(info, fields[0]),
+                mate_contig=mate_contig,
+                mate_pos=mate_pos,
+                mate_end=mate_end,
             ))
     return rows
 
@@ -3474,6 +3782,7 @@ def load_mycosv_reference_calls(vcf_path: Path, query_asm: str) -> list[Normaliz
             pos = int(ref_pos_raw)
             end = int(info.get("REFEND", pos))
             svlen = int(info.get("SVLEN", max(1, end - pos + 1)))
+            mate_contig, mate_pos, mate_end = _mate_fields(info, fields[4])
             rows.append(NormalizedCall(
                 query_asm=query_asm,
                 query_contig=fields[0],
@@ -3488,6 +3797,9 @@ def load_mycosv_reference_calls(vcf_path: Path, query_asm: str) -> list[Normaliz
                 ref_asm=info.get("CLADE", "."),
                 ref_contig=ref_contig,
                 read_support=_mycosv_intrinsic_read_support(info, fields[0]),
+                mate_contig=mate_contig,
+                mate_pos=mate_pos,
+                mate_end=mate_end,
             ))
     return rows
 
@@ -3526,6 +3838,12 @@ def load_normalized_calls_tsv(path: Path, label: str) -> list[NormalizedCall]:
                 element_class=row.get("element_class", "NONE"),
                 ref_asm=row.get("ref_asm", "."),
                 ref_contig=ref_contig,
+                mate_contig=row.get("mate_contig") or row.get("chr2") or ".",
+                mate_pos=int(float(row.get("mate_pos") or row.get("pos2") or 0)),
+                mate_end=int(float(
+                    row.get("mate_end") or row.get("end2")
+                    or row.get("mate_pos") or row.get("pos2") or 0
+                )),
             ))
     return rows
 
@@ -3640,6 +3958,7 @@ def load_reference_vcf_calls(path: Path, label: str, query_asm: str) -> list[Nor
             # Skip sub-SV-size events (paftools emits SNV/MNV-like rows too).
             if svtype in {"INS", "DEL", "DUP", "INV"} and svlen < _REF_VCF_MIN_SV_BP:
                 continue
+            mate_contig, mate_pos, mate_end = _mate_fields(info, alt_allele)
             rows.append(NormalizedCall(
                 query_asm=query_asm,
                 query_contig=".",
@@ -3653,6 +3972,9 @@ def load_reference_vcf_calls(path: Path, label: str, query_asm: str) -> list[Nor
                 element_class=info.get("EC", "NONE"),
                 ref_asm=info.get("REFASM", "."),
                 ref_contig=fields[0],
+                mate_contig=mate_contig,
+                mate_pos=mate_pos,
+                mate_end=mate_end,
             ))
     return rows
 
@@ -3741,6 +4063,10 @@ def _call_span_contains(span_call: NormalizedCall, pos: int, *, pad: int = 0) ->
     return (span_call.pos - pad) <= pos <= (_call_span_end(span_call) + pad)
 
 
+def _has_mate(call: NormalizedCall) -> bool:
+    return call.mate_contig not in {"", "."} and call.mate_pos > 0
+
+
 def calls_compatible(truth: NormalizedCall, pred: NormalizedCall) -> bool:
     if truth.coord_space != pred.coord_space:
         return False
@@ -3763,6 +4089,16 @@ def calls_compatible(truth: NormalizedCall, pred: NormalizedCall) -> bool:
         denom = max(abs(truth.svlen), 1)
         if abs(abs(truth.svlen) - abs(pred.svlen)) / denom > tol_frac:
             return False
+    if canonical_group(truth.svtype) == "TRA" or canonical_group(pred.svtype) == "TRA":
+        truth_has_mate = _has_mate(truth)
+        pred_has_mate = _has_mate(pred)
+        if truth_has_mate or pred_has_mate:
+            if not (truth_has_mate and pred_has_mate):
+                return False
+            if truth.mate_contig != pred.mate_contig:
+                return False
+            if abs(truth.mate_pos - pred.mate_pos) > tol_bp:
+                return False
     return True
 
 
@@ -3775,7 +4111,14 @@ def call_distance(truth: NormalizedCall, pred: NormalizedCall) -> int:
     else:
         pos_d = abs(truth.pos - pred.pos)
     len_d = 0 if canonical_group(truth.svtype) == "TRA" else abs(abs(truth.svlen) - abs(pred.svlen))
-    return pos_d + len_d
+    mate_d = 0
+    if (
+        (canonical_group(truth.svtype) == "TRA" or canonical_group(pred.svtype) == "TRA")
+        and _has_mate(truth)
+        and _has_mate(pred)
+    ):
+        mate_d = abs(truth.mate_pos - pred.mate_pos)
+    return pos_d + len_d + mate_d
 
 
 def build_consensus_truth(
@@ -4288,6 +4631,16 @@ def validate_calls_with_reads(
             svtype=call.svtype, svlen=call.svlen,
             flank_bp=flank_bp, min_clip=30,
         )
+        if call.svtype == "TRA" and _has_mate(call):
+            mate_support = _samtools_count_breakpoint_support(
+                bam_sorted,
+                call.mate_contig,
+                call.mate_pos,
+                call.mate_end or call.mate_pos,
+                svtype=call.svtype, svlen=call.svlen,
+                flank_bp=flank_bp, min_clip=30,
+            )
+            validation_support = max(validation_support, mate_support)
         effective_support = max(validation_support, intrinsic or 0)
         validated = effective_support >= min_support
         rows.append(support_row(
@@ -4469,11 +4822,32 @@ def _lift_calls_to_benchmark_ref(
             new_pos, new_end = new_end, new_pos
         if new_contig not in bench_contigs:
             continue
+        mate_contig = call.mate_contig
+        mate_pos = call.mate_pos
+        mate_end = call.mate_end
+        if _has_mate(call):
+            lifted_mate = _lift_pos(table, call.mate_contig, call.mate_pos)
+            if lifted_mate is None:
+                continue
+            lifted_mate_end = (
+                _lift_pos(table, call.mate_contig, call.mate_end or call.mate_pos)
+                or lifted_mate
+            )
+            mate_contig = lifted_mate[0]
+            mate_pos = lifted_mate[1]
+            mate_end = lifted_mate_end[1]
+            if mate_end < mate_pos:
+                mate_pos, mate_end = mate_end, mate_pos
+            if mate_contig not in bench_contigs:
+                continue
         out.append(replace(
             call,
             pos=new_pos,
             end=new_end,
             ref_contig=new_contig,
+            mate_contig=mate_contig,
+            mate_pos=mate_pos,
+            mate_end=mate_end,
         ))
     return out
 
@@ -5617,6 +5991,14 @@ def join_biology_findings(
     out_path: Path,
 ) -> None:
     if candidates_tsv is None or not candidates_tsv.exists():
+        write_tsv(
+            out_path,
+            [],
+            [
+                "query_asm", "query_contig", "pos", "end", "svtype", "svlen",
+                "annotation", "element_class", *BIOLOGY_FINDINGS_EXTRA_FIELDS,
+            ],
+        )
         return
     rows: list[dict[str, Any]] = []
     fieldnames: list[str] = []
@@ -6019,9 +6401,14 @@ def benchmark_real_data(args: argparse.Namespace) -> int:
     # provenance only in the QASM info field).
     try:
         vcf_path = Path(mycosv_paths["vcf"])
-        expand_to_multisample_vcf(
-            vcf_path, vcf_path.with_suffix(".multisample.vcf")
+        multisample_vcf = expand_to_multisample_vcf(
+            vcf_path,
+            vcf_path.with_suffix(".multisample.vcf"),
+            [row["query_asm"] for row in query_manifest],
         )
+        alls_multisample_vcf = vcf_path.with_name("alls.multisample.vcf")
+        if alls_multisample_vcf != multisample_vcf:
+            shutil.copyfile(multisample_vcf, alls_multisample_vcf)
     except Exception as exc:
         sys.stderr.write(f"[multisample-vcf] expand failed: {exc}\n")
 
@@ -6499,6 +6886,15 @@ def benchmark_real_data(args: argparse.Namespace) -> int:
                     pred_calls=supported_preds,
                 ))
 
+        # Flush per-query so a mid-loop SLURM timeout / OOM leaves the TSV
+        # populated with whatever was validated so far, instead of just the
+        # header placeholder written at line ~6354.
+        write_tsv(
+            out_dir / "read_validated_truth.tsv",
+            read_validated_truth_rows,
+            READ_VALIDATION_FIELDS,
+        )
+
     # If no comparator was available (e.g. all of pggb/minigraph/syri/svim_asm
     # missing on this host) the per-query exact benchmarks above produce zero
     # rows, leaving exact_benchmark_summary.tsv header-only and the merged
@@ -6638,6 +7034,7 @@ def prepare_million_real(args: argparse.Namespace) -> int:
     registry_dir = out_dir / "registry"
     index_dir.mkdir(parents=True, exist_ok=True)
     registry_dir.mkdir(parents=True, exist_ok=True)
+    reset_annotation_source_tally()
 
     # Step 1: pull the NCBI assembly summary and select up to --max-assemblies
     # fungal rows. We reuse select_all_public_rows so the quality/sorting
@@ -6748,7 +7145,8 @@ def prepare_million_real(args: argparse.Namespace) -> int:
         if download_gff:
             try:
                 annotation_source = download_ncbi_gene_annotation_source(
-                    row, asm_name, refs_dir, ""
+                    row, asm_name, refs_dir, "",
+                    ensembl_cache_dir=cache_dir,
                 )
             except Exception as exc:
                 sys.stderr.write(
@@ -6764,6 +7162,19 @@ def prepare_million_real(args: argparse.Namespace) -> int:
     download_count = 0
     gff_count = 0
     last_progress_t = time.monotonic()
+    # Pre-warm the Ensembl Fungi caches BEFORE the ThreadPoolExecutor starts:
+    # the release-discovery + species-TSV downloads write shared files under
+    # cache_dir, and N workers racing on first-fetch would all call
+    # http_download() against the same .part file. Warming serially upfront
+    # populates the on-disk cache, after which every worker hits the fast
+    # path. Errors here are non-fatal — _ensembl_fungi_gff_url tolerates a
+    # missing index and falls through to NCBI GBFF.
+    if download_gff:
+        try:
+            _ensembl_fungi_release(cache_dir)
+            _ensembl_fungi_species_index(cache_dir)
+        except Exception as exc:  # noqa: BLE001 - best-effort warm-up
+            sys.stderr.write(f"[ensembl-fungi] cache warm-up failed: {exc}\n")
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
     with ThreadPoolExecutor(max_workers=download_workers) as pool:
@@ -6797,6 +7208,9 @@ def prepare_million_real(args: argparse.Namespace) -> int:
     if not ref_manifest_rows:
         raise RuntimeError("No assemblies were successfully downloaded — aborting indexing.")
     print(f"      downloaded/cached {download_count} assemblies (examined {examined})", flush=True)
+    annot_summary = annotation_source_summary()
+    if annot_summary:
+        print(f"      {annot_summary}", flush=True)
 
     # ── Hold out a small subset as MycoSV-only benchmark queries ─────────────
     # The downstream `benchmark` sub-command is fed by query_manifest.tsv +
@@ -7206,38 +7620,29 @@ def prepare_million_real(args: argparse.Namespace) -> int:
             q_asm = bm.get("query_asm", "")
             if ref_asm and q_asm:
                 ref_to_queries[ref_asm].append(q_asm)
-        ref_rows = gff_to_gene_annotations(gff_pairs)
-        all_rows: list[dict[str, Any]] = []
-        seen: set[tuple[str, str, str]] = set()
-        for gene_row in ref_rows:
-            owners = set(asm_aliases.get(gene_row["query_asm"], {gene_row["query_asm"]}))
-            for q_asm in ref_to_queries.get(gene_row["query_asm"], []):
-                owners.update(asm_aliases.get(q_asm, {q_asm}))
-            for owner in owners:
-                key = (owner, gene_row["query_contig"], gene_row["gene_id"])
-                if key in seen:
-                    continue
-                seen.add(key)
-                duped = dict(gene_row)
-                duped["query_asm"] = owner
-                all_rows.append(duped)
-        if all_rows:
-            write_tsv(
-                gene_annotations_path,
-                all_rows,
-                ["query_asm", "query_contig", "gene_id", "gene_name", "start", "end", "strand", "biotype", "product"],
-            )
+        print(
+            f"      gene_annotations: streaming {len(gff_pairs)} GFF/GBFF sources "
+            f"-> {gene_annotations_path}",
+            flush=True,
+        )
+        gene_annotations_count = stream_gene_annotations_to_tsv(
+            gene_annotations_path, gff_pairs, asm_aliases, ref_to_queries,
+        )
+        if gene_annotations_count:
             print(
-                f"      gene_annotations: wrote {len(all_rows)} gene records "
+                f"      gene_annotations: wrote {gene_annotations_count} gene records "
                 f"(from {len(gff_pairs)} GFF/GBFF sources) -> {gene_annotations_path}",
                 flush=True,
             )
-            gene_annotations_count = len(all_rows)
         else:
             sys.stderr.write(
                 f"[gene-annot] no gene records parsed from {len(gff_pairs)} annotation source(s); "
                 f"skipping gene_annotations.tsv\n"
             )
+            try:
+                gene_annotations_path.unlink()
+            except FileNotFoundError:
+                pass
 
     # Step 4: build the real routing index by invoking the MycoSV binary, then
     # pad with synthetic decoys up to --target-centroids if requested.

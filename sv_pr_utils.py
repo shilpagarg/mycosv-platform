@@ -765,7 +765,11 @@ def score_pr(truth_vcf: Path,
     return summary
 
 
-def expand_to_multisample_vcf(src_vcf: Path, dst_vcf: Path) -> Path:
+def expand_to_multisample_vcf(
+    src_vcf: Path,
+    dst_vcf: Path,
+    sample_names: list[str] | None = None,
+) -> Path:
     """Rewrite a single-sample MycoSV VCF as a multi-sample one.
 
     The MycoSV binary emits one SAMPLE column with each row's per-query
@@ -777,6 +781,10 @@ def expand_to_multisample_vcf(src_vcf: Path, dst_vcf: Path) -> Path:
     """
     samples: list[str] = []
     seen: set[str] = set()
+    for asm in sample_names or []:
+        if asm and asm not in seen:
+            seen.add(asm)
+            samples.append(asm)
     with src_vcf.open(encoding="utf-8") as fh:
         for line in fh:
             if line.startswith("#") or not line.strip():
@@ -790,7 +798,7 @@ def expand_to_multisample_vcf(src_vcf: Path, dst_vcf: Path) -> Path:
                 seen.add(asm)
                 samples.append(asm)
     if not samples:
-        # Nothing to expand — copy through as-is.
+        # Nothing to expand and no manifest sample list — copy through as-is.
         dst_vcf.write_text(src_vcf.read_text(encoding="utf-8"), encoding="utf-8")
         return dst_vcf
     sample_index = {asm: i for i, asm in enumerate(samples)}
