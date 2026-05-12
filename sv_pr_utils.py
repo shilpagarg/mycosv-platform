@@ -250,12 +250,35 @@ def compatible(truth: dict[str, Any], pred: dict[str, Any]) -> bool:
     if truth.get("qasm") and pred.get("qasm") and truth["qasm"] != pred["qasm"]:
         return False
 
-    del_group = {"DEL", "INS", "DUP", "TDEL", "TANDEM_DUP"}
-    inv_group = {"INV", "TRA", "TRA_INTER", "TRA_INTRA"}
+    # Bug-fix (2026-05-12): the previous groupings were dangerously over-
+    # permissive — DEL was bucketed with INS and DUP, and INV was bucketed
+    # with TRA. That meant a DEL truth event would score as TP against an
+    # INS prediction at the same locus, and an INV truth event would
+    # score as TP against a TRA prediction. Combined with the per-type
+    # stats below (TP keyed by truth.type, FP keyed by pred.type), the
+    # simulated PR metrics silently reported inflated recall for one
+    # type while attributing the matched-but-wrong predictions as FP on
+    # another type. Replace with the conservative groupings every other
+    # SV benchmark uses (Truvari, sveval): keep DEL, INV, OFF_REF strict;
+    # accept INS↔DUP and the TRA_* family as biologically equivalent.
+    type_groups = (
+        {"DEL", "TDEL"},
+        {"INS", "DUP", "TANDEM_DUP"},
+        {"INV"},
+        {"TRA", "TRA_INTER", "TRA_INTRA"},
+        {"OFF_REF"},
+    )
+
+    def _group_of(t: str) -> frozenset[str]:
+        for g in type_groups:
+            if t in g:
+                return frozenset(g)
+        return frozenset({t})
+
     if truth["type"] != pred["type"]:
-        if not ((truth["type"] in del_group and pred["type"] in del_group) or
-                (truth["type"] in inv_group and pred["type"] in inv_group)):
+        if _group_of(truth["type"]) != _group_of(pred["type"]):
             return False
+    inv_group = {"INV", "TRA", "TRA_INTER", "TRA_INTRA"}
 
     pred_mode = pred.get("qmode", "") or "assembly"
     pred_locus = pred["chrom"]

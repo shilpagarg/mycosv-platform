@@ -109,6 +109,76 @@ def test_new_biology_candidate_report_accepts_caller_te_aliases(tmp_path: Path) 
     assert rows[0]['functional_example'] == 'methylation-silenced Hop insertion at the b1 locus'
 
 
+def test_new_biology_candidate_report_resolves_qasm_and_downsample_alias(tmp_path: Path) -> None:
+    vcf = tmp_path / 'calls.vcf'
+    vcf.write_text(
+        '##fileformat=VCFv4.3\n'
+        '#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tSAMPLE\n'
+        'ctgA\t100\t.\tN\t<DEL>\t60\tPASS\tSVTYPE=DEL;END=250;ANNOT=NONE;EC=NONE;QASM=asm1.20000\tGT\t0/1\n'
+    )
+    hits = tmp_path / 'calls.hits.tsv'
+    hits.write_text(
+        'query_asm\tquery_contig\ttype\tref_asm\tref_contig\tpos\tend\tsvlen\tblock_score\tanchors\tgenotype\tgq\tannotation\talignment_mode\tquery_mode\n'
+    )
+    meta = tmp_path / 'query_metadata.tsv'
+    meta.write_text(
+        'query_asm\tscenario\tlifestyle\tarchitecture\n'
+        'asm1\tte_rich_pathogen\tplant_pathogen\tte_rich\n'
+    )
+    out_tsv = tmp_path / 'new_biology.tsv'
+    out_json = tmp_path / 'new_biology.json'
+    run([
+        'python3', str(SCRIPT),
+        '--vcf', str(vcf),
+        '--hits', str(hits),
+        '--query-metadata', str(meta),
+        '--out-tsv', str(out_tsv),
+        '--summary-json', str(out_json),
+        '--phylum', 'Basidiomycota',
+        '--top-n', '10',
+    ])
+    rows = list(csv.DictReader(out_tsv.open(), delimiter='\t'))
+    assert rows
+    assert rows[0]['query_asm'] == 'asm1.20000'
+    assert rows[0]['scenario'] == 'te_rich_pathogen'
+    assert rows[0]['candidate_type'] == 'structural_sv_signal'
+
+
+def test_new_biology_candidate_report_keeps_svtype_diversity(tmp_path: Path) -> None:
+    vcf = tmp_path / 'calls.vcf'
+    lines = [
+        '##fileformat=VCFv4.3\n',
+        '#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tSAMPLE\n',
+    ]
+    for i in range(20):
+        lines.append(
+            f'off{i}\t1\t.\tN\t<OFF_REF>\t60\tPASS\tSVTYPE=OFF_REF;END=300;ANNOT=NOVEL;EC=RIP;QASM=asm1\tGT\t0/1\n'
+        )
+    lines.append('del1\t500\t.\tN\t<DEL>\t60\tPASS\tSVTYPE=DEL;END=700;ANNOT=NONE;EC=NONE;QASM=asm1\tGT\t0/1\n')
+    lines.append('inv1\t900\t.\tN\t<INV>\t60\tPASS\tSVTYPE=INV;END=1200;ANNOT=NONE;EC=NONE;QASM=asm1\tGT\t0/1\n')
+    vcf.write_text(''.join(lines))
+    hits = tmp_path / 'calls.hits.tsv'
+    hits.write_text(
+        'query_asm\tquery_contig\ttype\tref_asm\tref_contig\tpos\tend\tsvlen\tblock_score\tanchors\tgenotype\tgq\tannotation\talignment_mode\tquery_mode\n'
+    )
+    meta = tmp_path / 'query_metadata.tsv'
+    meta.write_text('query_asm\tscenario\tlifestyle\tarchitecture\nasm1\tpathogenic\tplant_pathogen\tte_rich\n')
+    out_tsv = tmp_path / 'new_biology.tsv'
+    out_json = tmp_path / 'new_biology.json'
+    run([
+        'python3', str(SCRIPT),
+        '--vcf', str(vcf),
+        '--hits', str(hits),
+        '--query-metadata', str(meta),
+        '--out-tsv', str(out_tsv),
+        '--summary-json', str(out_json),
+        '--phylum', 'Ascomycota',
+        '--top-n', '6',
+    ])
+    svtypes = {row['svtype'] for row in csv.DictReader(out_tsv.open(), delimiter='\t')}
+    assert {'OFF_REF', 'DEL', 'INV'} <= svtypes
+
+
 def test_new_biology_candidate_report_uses_direct_expression_support(tmp_path: Path) -> None:
     vcf = tmp_path / 'calls.vcf'
     vcf.write_text(

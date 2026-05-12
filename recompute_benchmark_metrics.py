@@ -21,6 +21,7 @@ from collections import defaultdict
 from pathlib import Path
 
 from run_real_fungal_benchmark import (
+    DEFAULT_DATA_CACHE,
     NormalizedCall,
     build_consensus_truth,
     fasta_contig_names,
@@ -30,6 +31,9 @@ from run_real_fungal_benchmark import (
     load_reference_vcf_calls,
     load_syri_query_calls,
     score_callsets,
+    _emit_per_svtype_rows,
+    _lift_calls_to_benchmark_ref,
+    tool_path,
     write_agreement_summary,
 )
 
@@ -126,6 +130,8 @@ def recompute_for_mode(panel_dir: Path, mode: str) -> bool:
     if not out_dir.exists():
         return False
     prepared_dir = panel_dir / "prepared"
+    if not prepared_dir.exists():
+        prepared_dir = panel_dir
     mycosv_vcf = out_dir / "mycosv" / "calls.vcf"
     if not mycosv_vcf.exists():
         sys.stderr.write(f"[skip] no mycosv VCF at {mycosv_vcf}\n")
@@ -154,6 +160,7 @@ def recompute_for_mode(panel_dir: Path, mode: str) -> bool:
 
     agreement_rows: list[dict] = []
     summary_json: dict = {"mode": mode, "queries": {}}
+    lift_cache_dir = out_dir / "lift_cache"
     for q in query_manifest:
         qasm = q["query_asm"]
         mq = mycosv_calls_by_query.get(qasm, {}).get("query", [])
@@ -164,6 +171,22 @@ def recompute_for_mode(panel_dir: Path, mode: str) -> bool:
             if bench_ref not in {"", "."}
             else frozenset()
         )
+        # Lift mycosv sibling-clade refs onto benchmark_ref_fasta for reads
+        # modes so per-comparator PR scoring is apples to apples. Mirrors the
+        # online benchmark() path; the cached PAF is reused if present.
+        if (
+            mode in {"long-reads", "short-reads"}
+            and bench_contigs
+            and bench_ref not in {"", "."}
+            and tool_path("minimap2") is not None
+        ):
+            mr_all = _lift_calls_to_benchmark_ref(
+                mr_all,
+                Path(bench_ref),
+                DEFAULT_DATA_CACHE,
+                lift_cache_dir / qasm,
+                threads=4,
+            )
         mr = (
             [c for c in mr_all if c.ref_contig in bench_contigs]
             if bench_contigs
@@ -189,41 +212,45 @@ def recompute_for_mode(panel_dir: Path, mode: str) -> bool:
 
         truth_for_query = truth_sets.get(qasm, {})
 
-        def _row(qasm_, coord_space, label, truth_calls, pred_calls, m):
-            return {
-                "query_asm": qasm_,
-                "coordinate_space": coord_space,
-                "truth_label": label,
-                "method": "mycosv",
-                "truth_calls": len(truth_calls),
-                "pred_calls": len(pred_calls),
-                "tp": m["tp"],
-                "fp": m["fp"],
-                "fn": m["fn"],
-                "precision": m["precision"],
-                "recall": m["recall"],
-                "f1": m["f1"],
-                "prec_lo95": m["precision_ci95"][0],
-                "prec_hi95": m["precision_ci95"][1],
-                "rec_lo95": m["recall_ci95"][0],
-                "rec_hi95": m["recall_ci95"][1],
-            }
-
         for (coord_space, label), truth_calls in truth_for_query.items():
             pred_calls = mr if coord_space == "reference" else mq
             m = score_callsets(truth_calls, pred_calls)
-            agreement_rows.append(
-                _row(qasm, coord_space, label, truth_calls, pred_calls, m)
-            )
+            agreement_rows.extend(_emit_per_svtype_rows(
+                query_asm=qasm,
+                coord_space=coord_space,
+                truth_label=label,
+                method="mycosv",
+                truth_calls=truth_calls,
+                pred_calls=pred_calls,
+            ))
             summary_json["queries"][qasm]["exact_benchmarks"][coord_space][label] = m
+
+            supported_preds = [
+                c for c in pred_calls
+                if c.read_support is not None and c.read_support >= 1
+            ]
+            if supported_preds:
+                agreement_rows.extend(_emit_per_svtype_rows(
+                    query_asm=qasm,
+                    coord_space=coord_space,
+                    truth_label=label,
+                    method="mycosv_read_supported",
+                    truth_calls=truth_calls,
+                    pred_calls=supported_preds,
+                ))
 
         for (coord_space, label), truth_calls in truth_for_query.items():
             if coord_space != "reference":
                 continue
             m_any = score_callsets(truth_calls, mr_all)
-            agreement_rows.append(
-                _row(qasm, "reference_any_clade", label, truth_calls, mr_all, m_any)
-            )
+            agreement_rows.extend(_emit_per_svtype_rows(
+                query_asm=qasm,
+                coord_space="reference_any_clade",
+                truth_label=label,
+                method="mycosv",
+                truth_calls=truth_calls,
+                pred_calls=mr_all,
+            ))
             summary_json["queries"][qasm]["exact_benchmarks"]["reference_any_clade"][
                 label
             ] = m_any
@@ -243,10 +270,43 @@ def recompute_for_mode(panel_dir: Path, mode: str) -> bool:
             pred_calls = mr if coord_space == "reference" else mq
             m_c = score_callsets(consensus, pred_calls)
             label = f"consensus_2of_{len(ref_labels)}"
-            agreement_rows.append(
-                _row(qasm, coord_space, label, consensus, pred_calls, m_c)
-            )
+            agreement_rows.extend(_emit_per_svtype_rows(
+                query_asm=qasm,
+                coord_space=coord_space,
+                truth_label=label,
+                method="mycosv",
+                truth_calls=consensus,
+                pred_calls=pred_calls,
+            ))
             summary_json["queries"][qasm]["exact_benchmarks"][coord_space][label] = m_c
+
+    if not agreement_rows:
+        for q in query_manifest:
+            qasm = q["query_asm"]
+            for coord_space, preds in (
+                ("query", mycosv_calls_by_query.get(qasm, {}).get("query", [])),
+                ("reference", mycosv_calls_by_query.get(qasm, {}).get("reference", [])),
+            ):
+                agreement_rows.append({
+                    "query_asm": qasm,
+                    "coordinate_space": coord_space,
+                    "truth_label": "no_comparator",
+                    "svtype": "ALL",
+                    "method": "mycosv",
+                    "truth_calls": float("nan"),
+                    "pred_calls": len(preds),
+                    "tp": float("nan"),
+                    "fp": float("nan"),
+                    "fn": float("nan"),
+                    "precision": float("nan"),
+                    "recall": float("nan"),
+                    "f1": float("nan"),
+                    "prec_lo95": float("nan"),
+                    "prec_hi95": float("nan"),
+                    "rec_lo95": float("nan"),
+                    "rec_hi95": float("nan"),
+                    "status": "no_truth",
+                })
 
     tsv_path = out_dir / "exact_benchmark_summary.tsv"
     write_agreement_summary(tsv_path, agreement_rows)

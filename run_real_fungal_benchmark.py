@@ -22,7 +22,7 @@ import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -223,7 +223,10 @@ READ_VALIDATION_FIELDS = [
     "source",
     "coord_space",
     "read_support",
+    "validation_support",
+    "support_source",
     "read_validated",
+    "status",
 ]
 
 # ── Long-read platform detection ───────────────────────────────────────────
@@ -263,6 +266,7 @@ class NormalizedCall:
     element_class: str = "NONE"
     ref_asm: str = "."
     ref_contig: str = "."
+    read_support: int | None = None
 
 
 _TOOL_TIMEOUT = int(os.environ.get("MYCOSV_TOOL_TIMEOUT", "14400"))
@@ -736,7 +740,25 @@ def http_download(url: str, dest: Path) -> Path:
     tmp = dest.with_suffix(dest.suffix + ".part")
     try:
         with _http_open_with_retry(req) as resp, tmp.open("wb") as out:
+            content_length = resp.getheader("Content-Length")
             shutil.copyfileobj(resp, out)
+        # Validate Content-Length when the server advertised one. ENA / NCBI
+        # mirrors occasionally close the connection after writing a partial
+        # stream without raising IncompleteRead, which previously cached a
+        # truncated .gz that later blew up at decompress time as
+        # "Compressed file ended before the end-of-stream marker was reached".
+        if content_length is not None:
+            try:
+                expected = int(content_length)
+            except ValueError:
+                expected = None
+            if expected is not None:
+                got = tmp.stat().st_size
+                if got != expected:
+                    tmp.unlink(missing_ok=True)
+                    raise IOError(
+                        f"Truncated download for {url}: got {got} bytes, expected {expected}"
+                    )
         tmp.rename(dest)
     except Exception:
         if tmp.exists():
@@ -1792,6 +1814,56 @@ def write_tsv(path: Path, rows: list[dict[str, Any]], fieldnames: list[str]) -> 
         writer.writerows(rows)
 
 
+MYCOSV_HITS_FIELDS = [
+    "query_asm", "query_contig", "type", "ref_asm", "ref_contig",
+    "ref_pos", "ref_end", "pos", "end", "svlen", "block_score", "anchors",
+    "genotype", "gq", "annotation", "alignment_mode", "query_mode",
+    "fused_posterior_alt", "fused_logodds_alt", "fused_effective_depth",
+    "fused_layers", "read_support",
+]
+
+
+def write_mycosv_failure_outputs(out_prefix: Path, reason: str) -> dict[str, str]:
+    out_prefix.parent.mkdir(parents=True, exist_ok=True)
+    vcf_path = out_prefix.with_suffix(".vcf")
+    hits_path = out_prefix.with_suffix(".hits.tsv")
+    gfa_path = out_prefix.with_suffix(".gfa")
+    safe_reason = reason.replace("\n", " ").replace("\t", " ")
+    vcf_path.write_text(
+        "##fileformat=VCFv4.3\n"
+        "##source=fungi_graphsv_tol_v3\n"
+        f"##mycosv_status=failed:{safe_reason}\n"
+        "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tSAMPLE\n",
+        encoding="utf-8",
+    )
+    write_tsv(hits_path, [{
+        "query_asm": ".",
+        "query_contig": ".",
+        "type": "NO_CALLS",
+        "ref_asm": ".",
+        "ref_contig": ".",
+        "ref_pos": 0,
+        "ref_end": 0,
+        "pos": 0,
+        "end": 0,
+        "svlen": 0,
+        "block_score": 0,
+        "anchors": 0,
+        "genotype": "./.",
+        "gq": 0,
+        "annotation": f"MYCOSV_FAILED:{safe_reason}",
+        "alignment_mode": "diagnostic",
+        "query_mode": ".",
+        "fused_posterior_alt": 0,
+        "fused_logodds_alt": 0,
+        "fused_effective_depth": 0,
+        "fused_layers": 0,
+        "read_support": -1,
+    }], MYCOSV_HITS_FIELDS)
+    gfa_path.write_text(f"H\tVN:Z:1.0\tST:Z:MYCOSV_FAILED\tRS:Z:{safe_reason}\n", encoding="utf-8")
+    return {"vcf": str(vcf_path), "hits": str(hits_path), "gfa": str(gfa_path)}
+
+
 _GFF_GENE_TYPES: frozenset[str] = frozenset({
     # NCBI / Ensembl Fungi gene-level feature types we want to surface to the
     # SV biology analyzer. ncRNA / tRNA / rRNA are deliberately excluded — the
@@ -2382,20 +2454,28 @@ def merge_sequence_sources(sources: list[str], dest_prefix: Path) -> Path:
                 raise ValueError(
                     f"Downloaded part looks truncated ({part_size} bytes) for {src}"
                 )
-            with local_part.open("rb") as in_fh:
-                # Strip a leading gzip header by streaming through gzip if the
-                # part is gz-magic but the merged output is plain text. This
-                # preserves the "one plain FASTQ" output contract for the C++
-                # binary while still tolerating gz parts (materialize_entry
-                # with keep_gz=False already gunzips, so this is belt-and-
-                # suspenders for mixed mirrors).
-                if in_fh.read(2) == b"\x1f\x8b":
-                    in_fh.seek(0)
-                    with gzip.open(in_fh, "rb") as gz_fh:
-                        shutil.copyfileobj(gz_fh, out_fh)
-                else:
-                    in_fh.seek(0)
-                    shutil.copyfileobj(in_fh, out_fh)
+            try:
+                with local_part.open("rb") as in_fh:
+                    # Strip a leading gzip header by streaming through gzip if the
+                    # part is gz-magic but the merged output is plain text. This
+                    # preserves the "one plain FASTQ" output contract for the C++
+                    # binary while still tolerating gz parts (materialize_entry
+                    # with keep_gz=False already gunzips, so this is belt-and-
+                    # suspenders for mixed mirrors).
+                    if in_fh.read(2) == b"\x1f\x8b":
+                        in_fh.seek(0)
+                        with gzip.open(in_fh, "rb") as gz_fh:
+                            shutil.copyfileobj(gz_fh, out_fh)
+                    else:
+                        in_fh.seek(0)
+                        shutil.copyfileobj(in_fh, out_fh)
+            except (EOFError, OSError, gzip.BadGzipFile):
+                # The cached part is a corrupt/truncated gzip — drop it so the
+                # next pool URL (or a future re-run) re-downloads instead of
+                # repeatedly failing on the same broken bytes.
+                if local_part != out_path and local_part.parent == dest_prefix.parent and local_part.exists():
+                    local_part.unlink()
+                raise
             if local_part != out_path and local_part.parent == dest_prefix.parent and local_part.exists():
                 local_part.unlink()
     if kind == "fastq":
@@ -2498,6 +2578,17 @@ def materialize_query_input(
                 "species": row.get("species") or row.get("scientific_name") or ".",
             })
 
+    # When the query came from an ENA read run, propagate the platform /
+    # layout / accession from the first selected meta row so the manifest
+    # schema lines up with the prepare_from_ncbi / prepare_million_real
+    # outputs. The benchmark step uses instrument_platform to gate reads-
+    # mode aligner choice (5008/5086) and emitting the column unconditionally
+    # avoids a schema mismatch when callers concat manifests across paths.
+    first_ena_meta: dict[str, str] = {}
+    for sr in source_rows:
+        if sr.get("source_type") == "ena_read_run":
+            first_ena_meta = sr
+            break
     query_row = {
         "query_asm": asm_name,
         "query_mode": query_mode,
@@ -2514,6 +2605,9 @@ def materialize_query_input(
         "genus": row.get("genus") or ".",
         "species": row.get("species") or row.get("scientific_name") or ".",
         "source": row.get("source") or default_source,
+        "instrument_platform": row.get("instrument_platform") or first_ena_meta.get("instrument_platform") or ".",
+        "library_layout": row.get("library_layout") or first_ena_meta.get("library_layout") or ".",
+        "run_accession": row.get("run_accession") or first_ena_meta.get("source_accession") or ".",
     }
     return query_row, str(local_path), source_rows
 
@@ -2597,6 +2691,7 @@ def prepare_from_custom_manifest(args: argparse.Namespace) -> int:
             "query_asm", "query_mode", "path", "scenario", "lifestyle", "architecture",
             "benchmark_ref_asm", "benchmark_ref_fasta", "phylum", "class", "order",
             "family", "genus", "species", "source",
+            "instrument_platform", "library_layout", "run_accession",
         ],
     )
     write_tsv(
@@ -3287,6 +3382,40 @@ def qasm_matches_observed(expected: str, observed: str) -> bool:
     return observed_norm.startswith(expected_norm + "_") or expected_norm.startswith(observed_norm + "_")
 
 
+def _parse_int_field(value: str | None) -> int | None:
+    if value is None or value == "":
+        return None
+    try:
+        return int(float(value))
+    except ValueError:
+        return None
+
+
+def _parse_pseudocontig_support_name(name: str) -> int | None:
+    for tag in ("_n", "_mf"):
+        pos = name.rfind(tag)
+        if pos < 0:
+            continue
+        start = pos + len(tag)
+        end = start
+        while end < len(name) and name[end].isdigit():
+            end += 1
+        if end == start:
+            continue
+        try:
+            return int(name[start:end])
+        except ValueError:
+            continue
+    return None
+
+
+def _mycosv_intrinsic_read_support(info: dict[str, str], query_contig: str) -> int | None:
+    support = _parse_int_field(info.get("SUPPORT"))
+    if support is not None:
+        return support
+    return _parse_pseudocontig_support_name(query_contig)
+
+
 def load_mycosv_query_calls(vcf_path: Path, query_asm: str) -> list[NormalizedCall]:
     rows: list[NormalizedCall] = []
     if not vcf_path.exists():
@@ -3318,6 +3447,7 @@ def load_mycosv_query_calls(vcf_path: Path, query_asm: str) -> list[NormalizedCa
                 element_class=info.get("EC", "NONE"),
                 ref_asm=info.get("CLADE", "."),
                 ref_contig=info.get("REFCONTIG", "."),
+                read_support=_mycosv_intrinsic_read_support(info, fields[0]),
             ))
     return rows
 
@@ -3357,6 +3487,7 @@ def load_mycosv_reference_calls(vcf_path: Path, query_asm: str) -> list[Normaliz
                 element_class=info.get("EC", "NONE"),
                 ref_asm=info.get("CLADE", "."),
                 ref_contig=ref_contig,
+                read_support=_mycosv_intrinsic_read_support(info, fields[0]),
             ))
     return rows
 
@@ -3719,6 +3850,18 @@ def match_calls(truth_calls: list[NormalizedCall], pred_calls: list[NormalizedCa
 
 
 def score_callsets(truth_calls: list[NormalizedCall], pred_calls: list[NormalizedCall]) -> dict[str, Any]:
+    if not truth_calls:
+        return {
+            "tp": float("nan"),
+            "fp": float("nan"),
+            "fn": float("nan"),
+            "precision": float("nan"),
+            "recall": float("nan"),
+            "f1": float("nan"),
+            "precision_ci95": (float("nan"), float("nan")),
+            "recall_ci95": (float("nan"), float("nan")),
+            "status": "no_truth",
+        }
     used, missed_truth = match_calls(truth_calls, pred_calls)
     tp = len(used)
     fn = len(missed_truth)
@@ -3735,6 +3878,7 @@ def score_callsets(truth_calls: list[NormalizedCall], pred_calls: list[Normalize
         "f1": f1,
         "precision_ci95": wilson_ci(tp, tp + fp),
         "recall_ci95": wilson_ci(tp, tp + fn),
+        "status": "ok",
     }
 
 
@@ -3807,6 +3951,7 @@ def _emit_per_svtype_rows(
             "prec_hi95": m["precision_ci95"][1],
             "rec_lo95": m["recall_ci95"][0],
             "rec_hi95": m["recall_ci95"][1],
+            "status": m.get("status", "ok"),
         })
     return rows
 
@@ -4060,46 +4205,277 @@ def validate_calls_with_reads(
     breakpoint. per_call_support_rows is the per-SV evidence record for the
     on-disk read_validated_truth.tsv (always written even for dropped calls).
     """
-    aligned = _build_validation_bam(query_row, work_dir, threads)
-    rows: list[dict[str, Any]] = []
-    if aligned is None:
-        for call in truth_calls:
-            rows.append({
-                "query_asm": query_row.get("query_asm", "."),
-                "ref_contig": call.ref_contig if call.coord_space == "reference" else call.query_contig,
-                "pos": call.pos,
-                "end": call.end,
-                "svtype": call.svtype,
-                "source": call.source,
-                "coord_space": call.coord_space,
-                "read_support": -1,           # -1 == no validation BAM available
-                "read_validated": "unknown",
-            })
-        return list(truth_calls), rows
-    bam_sorted, _ref_plain = aligned
-    kept: list[NormalizedCall] = []
-    for call in truth_calls:
-        contig = call.ref_contig if call.coord_space == "reference" and call.ref_contig not in {"", "."} else call.query_contig
-        support = _samtools_count_breakpoint_support(
-            bam_sorted, contig, call.pos, call.end,
-            svtype=call.svtype, svlen=call.svlen,
-            flank_bp=flank_bp, min_clip=30,
-        )
-        validated = support >= min_support
-        rows.append({
+    def internal_support(call: NormalizedCall) -> int | None:
+        return call.read_support if call.source == "mycosv" and call.read_support is not None else None
+
+    def support_source(call: NormalizedCall, intrinsic: int | None) -> str:
+        if intrinsic is None:
+            return "external_validation"
+        mode = (query_row.get("query_mode") or "assembly").lower()
+        if mode == "assembly":
+            return "mycosv_assembly_anchors"
+        if mode == "long-reads":
+            return "mycosv_long_read_cluster"
+        if mode == "short-reads":
+            return "mycosv_short_read_kmer"
+        return "mycosv_internal"
+
+    def support_row(
+        call: NormalizedCall,
+        *,
+        intrinsic: int | None,
+        validation_support: int | None,
+        validated: bool | None,
+        status: str,
+    ) -> dict[str, Any]:
+        return {
             "query_asm": query_row.get("query_asm", "."),
-            "ref_contig": contig,
+            "ref_contig": call.ref_contig if call.coord_space == "reference" else call.query_contig,
             "pos": call.pos,
             "end": call.end,
             "svtype": call.svtype,
             "source": call.source,
             "coord_space": call.coord_space,
-            "read_support": support,
-            "read_validated": "yes" if validated else "no",
-        })
+            "read_support": intrinsic if intrinsic is not None else -1,
+            "validation_support": validation_support if validation_support is not None else -1,
+            "support_source": support_source(call, intrinsic),
+            "read_validated": "yes" if validated else ("unknown" if validated is None else "no"),
+            "status": status,
+        }
+
+    aligned = _build_validation_bam(query_row, work_dir, threads)
+    rows: list[dict[str, Any]] = []
+    if aligned is None:
+        has_intrinsic_support = any(internal_support(call) is not None for call in truth_calls)
+        for call in truth_calls:
+            intrinsic = internal_support(call)
+            validated = intrinsic is not None and intrinsic >= min_support
+            rows.append(support_row(
+                call,
+                intrinsic=intrinsic,
+                validation_support=None,
+                validated=validated if intrinsic is not None else None,
+                status="validation_unavailable",
+            ))
+        kept = [
+            call for call in truth_calls
+            if internal_support(call) is not None
+            and internal_support(call) >= min_support
+        ]
+        if has_intrinsic_support:
+            return kept, rows
+        return list(truth_calls), rows
+    bam_sorted, _ref_plain = aligned
+    kept: list[NormalizedCall] = []
+    for call in truth_calls:
+        intrinsic = internal_support(call)
+        mode = (query_row.get("query_mode") or "assembly").lower()
+        if call.source == "mycosv" and call.coord_space == "query" and mode == "assembly":
+            validated = intrinsic is not None and intrinsic >= min_support
+            rows.append(support_row(
+                call,
+                intrinsic=intrinsic,
+                validation_support=None,
+                validated=validated if intrinsic is not None else None,
+                status="query_space_not_reference_validated",
+            ))
+            if validated:
+                kept.append(call)
+            continue
+        contig = call.ref_contig if call.coord_space == "reference" and call.ref_contig not in {"", "."} else call.query_contig
+        validation_support = _samtools_count_breakpoint_support(
+            bam_sorted, contig, call.pos, call.end,
+            svtype=call.svtype, svlen=call.svlen,
+            flank_bp=flank_bp, min_clip=30,
+        )
+        effective_support = max(validation_support, intrinsic or 0)
+        validated = effective_support >= min_support
+        rows.append(support_row(
+            call,
+            intrinsic=intrinsic,
+            validation_support=validation_support,
+            validated=validated,
+            status="validated" if validated else "not_validated",
+        ))
         if validated:
             kept.append(call)
     return kept, rows
+
+
+# ============================================================================
+# Reads-mode liftover: translate mycosv's sibling-clade REFCONTIG/REFPOS into
+# benchmark_ref_fasta coordinates so per-comparator PR scoring is apples to
+# apples.
+#
+# In reads modes mycosv's pangenomic routing picks the closest clade per
+# region and reports REFPOS against THAT clade. The truth callers (sniffles,
+# cutesv, delly, manta) only see benchmark_ref_fasta, so a call reported on
+# NC_012864.1 (S. cerevisiae) at pos 10567 cannot be matched against a
+# sniffles call on NC_089928.1 (the user-chosen ref) without coordinate
+# translation. We minimap2-asm5 align the sibling clade FASTA to benchmark
+# ref, parse the PAF, and translate REFCONTIG/REFPOS/REFEND for each call.
+# PAFs are cached in <out_dir>/lift_cache/ so a re-run of the same panel
+# does not pay the alignment cost twice.
+# ============================================================================
+
+
+def _clade_fasta_path(clade_name: str, data_cache_dir: Path) -> Path | None:
+    """Resolve a mycosv INFO CLADE= field (basename like
+    'GCF_000026945.1_ASM2694v1_genomic.fna') to its cached FASTA path.
+    """
+    if not clade_name or clade_name in {".", "OFF_REFERENCE"}:
+        return None
+    refs_dir = data_cache_dir / "refs"
+    candidates = [
+        refs_dir / clade_name,
+        refs_dir / f"{clade_name}.gz",
+    ]
+    for cand in candidates:
+        if cand.exists():
+            return cand
+    return None
+
+
+def _ensure_clade_to_bench_paf(
+    clade_fasta: Path,
+    benchmark_ref_fasta: Path,
+    cache_dir: Path,
+    threads: int,
+) -> Path | None:
+    if not tool_path("minimap2"):
+        return None
+    if not clade_fasta.exists() or not benchmark_ref_fasta.exists():
+        return None
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    stem = f"{clade_fasta.name.replace('.gz', '').replace('.fna', '').replace('.fasta', '')}"
+    bench_stem = f"{benchmark_ref_fasta.name.replace('.gz', '').replace('.fna', '').replace('.fasta', '')}"
+    paf_path = cache_dir / f"{stem}__to__{bench_stem}.paf"
+    if paf_path.exists() and paf_path.stat().st_size > 0:
+        return paf_path
+    tmp_path = paf_path.with_suffix(".paf.part")
+    # asm20 (≥80 % identity, divergence ≤20 %) captures cross-species fungal
+    # synteny — Saccharomyces sensu stricto, Candida sister lineages, Puccinia
+    # rusts — that asm5 (intra-species) misses. Without it the lift drops most
+    # sibling-clade calls because mycosv routes broadly across the family tree.
+    try:
+        with tmp_path.open("wb") as out:
+            subprocess.run(
+                ["minimap2", "-cx", "asm20", "--secondary=no", "-t", str(threads),
+                 str(benchmark_ref_fasta), str(clade_fasta)],
+                stdout=out, stderr=subprocess.PIPE, check=True,
+                timeout=_TOOL_TIMEOUT,
+            )
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
+        tmp_path.unlink(missing_ok=True)
+        return None
+    tmp_path.rename(paf_path)
+    return paf_path
+
+
+def _load_lift_table(paf_path: Path) -> dict[str, list[tuple[int, int, str, int, int, int]]]:
+    """Parse a PAF into {query_contig: [(qs, qe, tname, ts, te, strand), …]}
+    sorted by qs. Strand is +1 / -1.
+    """
+    table: dict[str, list[tuple[int, int, str, int, int, int]]] = defaultdict(list)
+    with paf_path.open() as fh:
+        for line in fh:
+            cols = line.rstrip("\n").split("\t")
+            if len(cols) < 12:
+                continue
+            try:
+                qs = int(cols[2])
+                qe = int(cols[3])
+                ts = int(cols[7])
+                te = int(cols[8])
+            except ValueError:
+                continue
+            qname = cols[0]
+            tname = cols[5]
+            strand = 1 if cols[4] == "+" else -1
+            table[qname].append((qs, qe, tname, ts, te, strand))
+    for q in table:
+        table[q].sort(key=lambda r: r[0])
+    return dict(table)
+
+
+def _lift_pos(
+    lift_table: dict[str, list[tuple[int, int, str, int, int, int]]],
+    qname: str,
+    qpos: int,
+) -> tuple[str, int] | None:
+    intervals = lift_table.get(qname)
+    if not intervals:
+        return None
+    # Walk linearly — n_intervals per contig is small in practice (asm5 emits
+    # one block per contiguous syntenic block). Binary search is only a win
+    # for >>100 blocks, which would itself signal an unstable alignment.
+    for qs, qe, tname, ts, te, strand in intervals:
+        if qs <= qpos <= qe:
+            offset = qpos - qs
+            if strand > 0:
+                return tname, ts + offset
+            return tname, te - offset
+    return None
+
+
+def _lift_calls_to_benchmark_ref(
+    calls: list[NormalizedCall],
+    benchmark_ref_fasta: Path,
+    data_cache_dir: Path,
+    cache_dir: Path,
+    threads: int,
+) -> list[NormalizedCall]:
+    """Return a new list of calls with REFCONTIG/REFPOS/REFEND translated to
+    benchmark_ref_fasta coords, where possible. Calls already on a contig
+    that belongs to benchmark_ref_fasta pass through unchanged. Calls whose
+    clade FASTA cannot be located, or whose breakpoint cannot be lifted, are
+    dropped — they had no apples-to-apples comparison anyway.
+    """
+    if not calls:
+        return []
+    bench_contigs = fasta_contig_names(benchmark_ref_fasta)
+    lift_tables_by_clade: dict[str, dict | None] = {}
+    out: list[NormalizedCall] = []
+    for call in calls:
+        if call.coord_space != "reference":
+            out.append(call)
+            continue
+        if call.ref_contig in bench_contigs:
+            out.append(call)
+            continue
+        clade = call.ref_asm or "."
+        if clade in {".", "", "OFF_REFERENCE"}:
+            continue
+        if clade not in lift_tables_by_clade:
+            clade_fa = _clade_fasta_path(clade, data_cache_dir)
+            if clade_fa is None:
+                lift_tables_by_clade[clade] = None
+            else:
+                paf = _ensure_clade_to_bench_paf(
+                    clade_fa, benchmark_ref_fasta, cache_dir, threads
+                )
+                lift_tables_by_clade[clade] = _load_lift_table(paf) if paf else None
+        table = lift_tables_by_clade.get(clade)
+        if not table:
+            continue
+        lifted_start = _lift_pos(table, call.ref_contig, call.pos)
+        if lifted_start is None:
+            continue
+        lifted_end = _lift_pos(table, call.ref_contig, call.end) or lifted_start
+        new_contig = lifted_start[0]
+        new_pos = lifted_start[1]
+        new_end = lifted_end[1]
+        if new_end < new_pos:
+            new_pos, new_end = new_end, new_pos
+        if new_contig not in bench_contigs:
+            continue
+        out.append(replace(
+            call,
+            pos=new_pos,
+            end=new_end,
+            ref_contig=new_contig,
+        ))
+    return out
 
 
 def compile_binary_if_needed(binary_path: Path, force: bool = False) -> None:
@@ -4167,6 +4543,13 @@ def run_mycosv(
     mycosv_dir.mkdir(parents=True, exist_ok=True)
     out_prefix = mycosv_dir / "calls"
     caller_args = list(extra_args)
+    if ref_list_override is not None:
+        # A benchmark-scoped ref list contains only the per-query comparator
+        # references, so the flat reference fallback is both cheap and needed
+        # for anchored reference-coordinate calls. Heavy real-data invocations
+        # may pass --no-flat-ref-fallback by default; drop it here in every
+        # hierarchical path, not only the reused-index path below.
+        caller_args = [a for a in caller_args if a != "--no-flat-ref-fallback"]
     if mode == "short-reads" and "--max-reads" not in caller_args:
         caller_args.extend(["--max-reads", "150000"])
     if mode == "long-reads" and "--max-reads" not in caller_args:
@@ -4213,9 +4596,6 @@ def run_mycosv(
                     "hierarchical index to keep memory bounded\n"
                 )
             elif ref_list_override is not None:
-                # Make sure a stale --no-flat-ref-fallback from extra_args
-                # cannot defeat the override below.
-                caller_args = [a for a in caller_args if a != "--no-flat-ref-fallback"]
                 sys.stderr.write(
                     f"[mycosv] flat-ref fallback ENABLED against {ref_list_override} "
                     "(benchmark-only ref subset; safe for memory)\n"
@@ -4348,7 +4728,7 @@ def run_syri_for_query(query_row: dict[str, str], out_dir: Path, threads: int) -
         )
         _log_comparator_failure(
             out_dir, "syri", query_asm,
-            f"skipped:fragmented_query qry_contigs={qry_n} ref_contigs={ref_n}",
+            f"skipped_incompatible_chromosome_count qry_contigs={qry_n} ref_contigs={ref_n}",
         )
         return None
 
@@ -4678,6 +5058,7 @@ def run_svim_for_query(query_row: dict[str, str], out_dir: Path, threads: int) -
     except subprocess.CalledProcessError:
         vcf_path = _existing_variants_vcf(svim_out)
         if vcf_path is None:
+            _log_comparator_failure(out_dir, "svim", query_asm, "failed_no_vcf")
             return None
         sys.stderr.write(
             f"[warn] svim exited non-zero for {query_asm}, but produced "
@@ -4686,6 +5067,7 @@ def run_svim_for_query(query_row: dict[str, str], out_dir: Path, threads: int) -
         return {"label": "svim", "vcf": str(vcf_path)}
     vcf_path = _existing_variants_vcf(svim_out)
     if vcf_path is None:
+        _log_comparator_failure(out_dir, "svim", query_asm, "failed_no_vcf")
         return None
     return {"label": "svim", "vcf": str(vcf_path)}
 
@@ -5055,6 +5437,7 @@ def run_svim_asm_for_query(query_row: dict[str, str], out_dir: Path, threads: in
     except subprocess.CalledProcessError:
         vcf_path = _existing_variants_vcf(svim_out)
         if vcf_path is None:
+            _log_comparator_failure(out_dir, "svim_asm", query_asm, "failed_no_vcf")
             return None
         sys.stderr.write(
             f"[warn] svim-asm exited non-zero for {query_asm}, but produced "
@@ -5064,6 +5447,7 @@ def run_svim_asm_for_query(query_row: dict[str, str], out_dir: Path, threads: in
 
     vcf_path = _existing_variants_vcf(svim_out)
     if vcf_path is None:
+        _log_comparator_failure(out_dir, "svim_asm", query_asm, "failed_no_vcf")
         return None
     return {"label": "svim_asm", "vcf": str(vcf_path)}
 
@@ -5178,7 +5562,7 @@ def write_agreement_summary(path: Path, rows: list[dict[str, Any]]) -> None:
             "query_asm", "coordinate_space", "truth_label", "svtype", "method",
             "truth_calls", "pred_calls",
             "tp", "fp", "fn", "precision", "recall", "f1",
-            "prec_lo95", "prec_hi95", "rec_lo95", "rec_hi95",
+            "prec_lo95", "prec_hi95", "rec_lo95", "rec_hi95", "status",
         ],
     )
 
@@ -5191,6 +5575,8 @@ def maybe_run_candidate_analysis(
     phylum: str,
     expression_tsv: Path | None,
     gene_annotations_tsv: Path | None,
+    ecological_traits_tsv: Path | None,
+    fungaltraits_csv: Path | None,
     ancestral_tsv: Path | None,
 ) -> tuple[Path | None, Path | None]:
     if not DEFAULT_ANALYZE.exists():
@@ -5211,6 +5597,10 @@ def maybe_run_candidate_analysis(
         cmd.extend(["--expression-tsv", str(expression_tsv.resolve())])
     if gene_annotations_tsv:
         cmd.extend(["--gene-annotations", str(gene_annotations_tsv.resolve())])
+    if ecological_traits_tsv:
+        cmd.extend(["--ecological-traits", str(ecological_traits_tsv.resolve())])
+    if fungaltraits_csv:
+        cmd.extend(["--fungaltraits-csv", str(fungaltraits_csv.resolve())])
     if ancestral_tsv:
         cmd.extend(["--ancestral", str(ancestral_tsv.resolve())])
     try:
@@ -5608,15 +5998,8 @@ def benchmark_real_data(args: argparse.Namespace) -> int:
         # status still get written for the visualization report.
         mycosv_failed = True
         out_prefix = out_dir / "mycosv" / "calls"
-        out_prefix.parent.mkdir(parents=True, exist_ok=True)
-        for ext in (".vcf", ".hits.tsv", ".gfa"):
-            out_prefix.with_suffix(ext).touch(exist_ok=True)
-        mycosv_paths = {
-            "vcf": str(out_prefix.with_suffix(".vcf")),
-            "hits": str(out_prefix.with_suffix(".hits.tsv")),
-            "gfa": str(out_prefix.with_suffix(".gfa")),
-        }
         rc = getattr(exc, "returncode", "timeout")
+        mycosv_paths = write_mycosv_failure_outputs(out_prefix, f"rc={rc}")
         marker = out_dir / "MYCOSV_FAILED.txt"
         marker.write_text(
             f"MycoSV binary failed (rc={rc}). Continuing benchmark with an "
@@ -5811,6 +6194,7 @@ def benchmark_real_data(args: argparse.Namespace) -> int:
         "mode": args.mode,
         "prepared_dir": str(prepared_dir),
         "mycosv_paths": mycosv_paths,
+        "mycosv_status": "failed" if mycosv_failed else "ok",
         "queries": {},
         "tool_status": {
             "minimap2": bool(tool_path("minimap2")),
@@ -5831,6 +6215,10 @@ def benchmark_real_data(args: argparse.Namespace) -> int:
         },
     }
 
+    data_cache_dir = (
+        getattr(args, "data_cache_dir", None) or DEFAULT_DATA_CACHE
+    ).resolve()
+    lift_cache_dir = out_dir / "lift_cache"
     for query_row in query_manifest:
         query_asm = query_row["query_asm"]
         mycosv_query_calls = mycosv_calls_by_query.get(query_asm, {}).get("query", [])
@@ -5841,10 +6229,30 @@ def benchmark_real_data(args: argparse.Namespace) -> int:
         # (minigraph, syri, svim-asm, anchorwave, …) only see one reference.
         # For a fair pairwise PR comparison, restrict MycoSV's reference calls
         # to those whose REFCONTIG belongs to this query's benchmark_ref_fasta.
+        # In reads modes (long-reads, short-reads) the comparators map reads
+        # to a *single* benchmark_ref_fasta, while mycosv's pangenomic routing
+        # picks the closest clade per pseudocontig — so a call reported on
+        # NC_012864.1 (S. cerevisiae) at REFPOS=10567 cannot match a sniffles
+        # call on NC_089928.1 (the user-chosen ref) without lifting. minimap2
+        # asm5 align each sibling clade to the benchmark ref (cached PAF), then
+        # translate REFCONTIG/REFPOS/REFEND before the bench_contigs filter.
         bench_ref = query_row.get("benchmark_ref_fasta") or "."
         bench_contigs: frozenset[str] = frozenset()
         if bench_ref not in {"", "."}:
             bench_contigs = fasta_contig_names(Path(bench_ref))
+        query_mode_row = (query_row.get("query_mode") or args.mode or "assembly").lower()
+        if (
+            query_mode_row in {"long-reads", "short-reads"}
+            and bench_contigs
+            and tool_path("minimap2") is not None
+        ):
+            mycosv_ref_calls_all = _lift_calls_to_benchmark_ref(
+                mycosv_ref_calls_all,
+                Path(bench_ref),
+                data_cache_dir,
+                lift_cache_dir / query_asm,
+                threads=args.threads,
+            )
         if bench_contigs:
             mycosv_ref_calls = [c for c in mycosv_ref_calls_all if c.ref_contig in bench_contigs]
         else:
@@ -6039,29 +6447,22 @@ def benchmark_real_data(args: argparse.Namespace) -> int:
                         pred_calls=cmp_calls,
                     ))
 
-        # Always validate MycoSV's own reference-coordinate predictions
-        # against the held-out reads/assembly. Previously this branch only
-        # ran in --mycosv-only mode, so the regular real-data flow had
-        # comparator truth sets in read_validated_truth.tsv but nothing
-        # tagged source=mycosv. With the gate lifted, every panel/mode
-        # now reports concrete read_support counts for MycoSV's own calls.
-        if (
-            getattr(args, "validate_with_reads", False)
-            and tool_path("samtools") is not None
-            and tool_path("minimap2") is not None
-        ):
-            # When the routing index has no clade in common with the query
-            # (held-out MAGs in the million-real flow), MycoSV emits every
-            # event as OFF_REF with empty REFCONTIG, so mycosv_ref_calls is
-            # empty. Fall back to validating the query-coord calls so
-            # read_validated_truth.tsv still gets concrete support counts
-            # instead of remaining header-only. The validator already keys
-            # off coord_space to pick ref_contig vs. query_contig.
-            calls_to_validate = mycosv_ref_calls or mycosv_query_calls
-            validation_source = (
-                "mycosv_reference" if mycosv_ref_calls else "mycosv_query"
-            )
-            if calls_to_validate:
+        # Always validate MycoSV's own predictions against the held-out
+        # reads/assembly. Validate reference and query coordinate calls
+        # separately: a query may have a few anchored REF calls plus many
+        # OFF_REF query-space calls, and the old `ref_calls or query_calls`
+        # fallback silently skipped the latter.
+        if getattr(args, "validate_with_reads", False):
+            read_validation_summary: dict[str, Any] = {
+                "min_split_reads": args.read_validation_min_support,
+            }
+            supported_preds_by_coord: dict[str, list[NormalizedCall]] = {}
+            for validation_source, calls_to_validate in (
+                ("mycosv_reference", mycosv_ref_calls),
+                ("mycosv_query", mycosv_query_calls),
+            ):
+                if not calls_to_validate:
+                    continue
                 val_dir = out_dir / "read_validation" / query_asm / validation_source
                 kept_calls, support_rows = validate_calls_with_reads(
                     calls_to_validate,
@@ -6072,12 +6473,31 @@ def benchmark_real_data(args: argparse.Namespace) -> int:
                     flank_bp=args.read_validation_flank_bp,
                 )
                 read_validated_truth_rows.extend(support_rows)
-                summary_json["queries"][query_asm]["read_validation"] = {
-                    "source": validation_source,
+                coord_key = "reference" if validation_source.endswith("reference") else "query"
+                supported_preds_by_coord[coord_key] = kept_calls
+                read_validation_summary[validation_source] = {
                     "input_calls": len(calls_to_validate),
                     "read_validated": len(kept_calls),
-                    "min_split_reads": args.read_validation_min_support,
                 }
+
+            if read_validation_summary.keys() - {"min_split_reads"}:
+                summary_json["queries"][query_asm]["read_validation"] = read_validation_summary
+
+            # Diagnostic scoring row: same truth, but MycoSV predictions
+            # filtered to read-supported calls. This tells apart low F1 caused
+            # by unsupported predictions from low F1 despite read support.
+            for (coord_space, label), truth_calls in truth_for_query.items():
+                supported_preds = supported_preds_by_coord.get(coord_space)
+                if supported_preds is None:
+                    continue
+                agreement_rows.extend(_emit_per_svtype_rows(
+                    query_asm=query_asm,
+                    coord_space=coord_space,
+                    truth_label=label,
+                    method="mycosv_read_supported",
+                    truth_calls=truth_calls,
+                    pred_calls=supported_preds,
+                ))
 
     # If no comparator was available (e.g. all of pggb/minigraph/syri/svim_asm
     # missing on this host) the per-query exact benchmarks above produce zero
@@ -6119,6 +6539,7 @@ def benchmark_real_data(args: argparse.Namespace) -> int:
                     "prec_hi95": float("nan"),
                     "rec_lo95": float("nan"),
                     "rec_hi95": float("nan"),
+                    "status": "no_truth",
                 })
 
     write_agreement_summary(out_dir / "exact_benchmark_summary.tsv", agreement_rows)
@@ -6173,6 +6594,12 @@ def benchmark_real_data(args: argparse.Namespace) -> int:
         if candidate.exists():
             expression_tsv = candidate
             sys.stderr.write(f"[expression] using {candidate}\n")
+    ecological_traits_tsv = prepared_dir / "ecological_traits.tsv"
+    if not ecological_traits_tsv.exists():
+        ecological_traits_tsv = None
+    fungaltraits_csv = data_cache_dir / "fungaltraits.csv"
+    if not fungaltraits_csv.exists():
+        fungaltraits_csv = None
 
     candidates_tsv, _ = maybe_run_candidate_analysis(
         out_dir,
@@ -6182,6 +6609,8 @@ def benchmark_real_data(args: argparse.Namespace) -> int:
         phylum_label,
         expression_tsv,
         gene_annotations_tsv,
+        ecological_traits_tsv,
+        fungaltraits_csv,
         args.ancestral_tsv,
     )
     join_biology_findings(candidates_tsv, all_mycosv_calls, support_by_key, out_dir / "biology_findings.tsv")
@@ -6265,11 +6694,19 @@ def prepare_million_real(args: argparse.Namespace) -> int:
     ref_manifest_rows: list[dict[str, str]] = []
     ref_list_paths: list[str] = []
     source_link_rows: list[dict[str, str]] = []
+    # Per-asm gene-annotation source path (GFF preferred, GBFF fallback) so
+    # the prepared dir can grow a gene_annotations.tsv the benchmark step
+    # auto-picks up via load_gene_annotations(). Only populated when
+    # --million-real-download-gff is on.
+    gff_pairs: list[tuple[str, Path]] = []
+    download_gff = bool(getattr(args, "million_real_download_gff", False))
 
-    def _download_one(row: dict[str, str]) -> tuple[dict[str, str] | None, dict[str, str] | None]:
+    def _download_one(
+        row: dict[str, str],
+    ) -> tuple[dict[str, str] | None, dict[str, str] | None, tuple[str, Path] | None]:
         asm_name = row.get("assembly_accession", "").replace(".", "_")
         if not asm_name:
-            return None, None
+            return None, None, None
         lineage = taxonomy_cache.get(row.get("taxid", ""), {})
         fasta_path: Path | None = None
         for url, filename in ncbi_download_targets(row, include_gff=False):
@@ -6284,7 +6721,7 @@ def prepare_million_real(args: argparse.Namespace) -> int:
                 fasta_path = None
             break
         if fasta_path is None or not fasta_path.exists():
-            return None, None
+            return None, None, None
         species = lineage.get("species") or row.get("organism_name", ".") or "."
         manifest_row = {
             "asm_name": asm_name,
@@ -6307,10 +6744,25 @@ def prepare_million_real(args: argparse.Namespace) -> int:
             "local_path": str(fasta_path),
             "species": species,
         }
-        return manifest_row, source_row
+        gff_pair: tuple[str, Path] | None = None
+        if download_gff:
+            try:
+                annotation_source = download_ncbi_gene_annotation_source(
+                    row, asm_name, refs_dir, ""
+                )
+            except Exception as exc:
+                sys.stderr.write(
+                    f"[warn] gene-annot fetch failed for {asm_name}: {exc}\n"
+                )
+                sys.stderr.flush()
+                annotation_source = None
+            if annotation_source is not None:
+                gff_pair = (asm_name, annotation_source)
+        return manifest_row, source_row, gff_pair
 
     examined = 0
     download_count = 0
+    gff_count = 0
     last_progress_t = time.monotonic()
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -6319,21 +6771,25 @@ def prepare_million_real(args: argparse.Namespace) -> int:
         for fut in as_completed(futures):
             examined += 1
             try:
-                manifest_row, source_row = fut.result()
+                manifest_row, source_row, gff_pair = fut.result()
             except Exception as exc:
                 sys.stderr.write(f"[warn] download worker raised: {exc}\n")
                 sys.stderr.flush()
                 manifest_row = source_row = None
+                gff_pair = None
             if manifest_row is not None and source_row is not None:
                 ref_manifest_rows.append(manifest_row)
                 ref_list_paths.append(manifest_row["fasta_path"])
                 source_link_rows.append(source_row)
                 download_count += 1
+                if gff_pair is not None:
+                    gff_pairs.append(gff_pair)
+                    gff_count += 1
             now = time.monotonic()
             if examined % 200 == 0 or (now - last_progress_t) >= 60.0:
                 print(
                     f"      ... examined {examined}/{len(selected)} "
-                    f"available={download_count}",
+                    f"available={download_count} gff={gff_count}",
                     flush=True,
                 )
                 last_progress_t = now
@@ -6450,6 +6906,16 @@ def prepare_million_real(args: argparse.Namespace) -> int:
         # Drop queries from the ref/hierarchy manifest so the index doesn't
         # see its own truth (would silently boost recall).
         keep_mask = [i not in query_set for i in range(len(ref_manifest_rows))]
+        # Bug-fix: source_link_rows for the held-out asms were appended with
+        # role="ref" inside _download_one (we don't know the holdout decision
+        # at that point). Re-tag them to role="query" so public_data_links
+        # / source_links honestly reflect the manifest. Without this, every
+        # downstream join against role="query" misses the assembly query
+        # rows entirely.
+        held_out_asm_names = {ref_manifest_rows[qi]["asm_name"] for qi in query_indices}
+        for sl in source_link_rows:
+            if sl.get("role") == "ref" and sl.get("query_asm") in held_out_asm_names:
+                sl["role"] = "query"
         ref_manifest_rows = [r for r, k in zip(ref_manifest_rows, keep_mask) if k]
         ref_list_paths = [p for p, k in zip(ref_list_paths, keep_mask) if k]
         print(
@@ -6590,11 +7056,188 @@ def prepare_million_real(args: argparse.Namespace) -> int:
         (out_dir / "query_list.txt").write_text(
             "\n".join(query_list_paths) + "\n", encoding="utf-8"
         )
+    source_link_columns = [
+        "query_asm", "role", "query_mode", "source_type",
+        "source_accession", "source_url", "local_path", "species",
+    ]
+    write_tsv(out_dir / "source_links.tsv", source_link_rows, source_link_columns)
+    # Mirror under the per-panel name so downstream tools that look up
+    # `prepared/public_data_links.tsv` (the per-panel convention) succeed
+    # without an extra rename step.
+    write_tsv(out_dir / "public_data_links.tsv", source_link_rows, source_link_columns)
+    write_public_resource_links(out_dir / "public_resource_links.tsv")
+
+    # selected_catalog.tsv mirrors the per-panel prepare output: a flat row
+    # per NCBI assembly considered for the index, including the ones held
+    # out as queries. Lets operators reproduce/audit the selection without
+    # re-running fetch_ncbi_assembly_rows.
     write_tsv(
-        out_dir / "source_links.tsv",
-        source_link_rows,
-        ["query_asm", "role", "query_mode", "source_type", "source_accession", "source_url", "local_path", "species"],
+        out_dir / "selected_catalog.tsv",
+        [
+            {
+                "panel_species": species_label_for_row(row),
+                "assembly_accession": row.get("assembly_accession", ""),
+                "organism_name": row.get("organism_name", ""),
+                "assembly_level": row.get("assembly_level", ""),
+                "refseq_category": row.get("refseq_category", ""),
+                "version_status": row.get("version_status", ""),
+                "seq_rel_date": row.get("seq_rel_date", ""),
+                "ftp_path": row.get("ftp_path", ""),
+                "source_catalog": row.get("_catalog_source", args.source),
+            }
+            for row in selected
+        ],
+        [
+            "panel_species", "assembly_accession", "organism_name", "assembly_level",
+            "refseq_category", "version_status", "seq_rel_date", "ftp_path", "source_catalog",
+        ],
     )
+
+    # benchmark_reference_map.tsv: one row per query asm, pointing at the
+    # benchmark-ref fasta that read-level validation will align against. We
+    # already computed `benchmark_ref_fasta` per held-out query above, plus
+    # any reads-mode children inherit the same ref via dict(arow), so this
+    # is a direct projection of query_manifest_rows.
+    benchmark_map_rows = [
+        {
+            "query_asm": qrow.get("query_asm", "."),
+            "benchmark_ref_asm": qrow.get("benchmark_ref_asm", "."),
+            "benchmark_ref_fasta": qrow.get("benchmark_ref_fasta", "."),
+            "species": qrow.get("species", "."),
+        }
+        for qrow in query_manifest_rows
+    ]
+    if benchmark_map_rows:
+        write_tsv(
+            out_dir / "benchmark_reference_map.tsv",
+            benchmark_map_rows,
+            ["query_asm", "benchmark_ref_asm", "benchmark_ref_fasta", "species"],
+        )
+
+    # phenotypic_metadata.json + ecological_traits.tsv mirror the per-panel
+    # prepare path: pull BioSample phenotype attributes for the selected
+    # rows and join FungalTraits onto the held-out species set so the
+    # biology analyzer / visualization report pick up substrate /
+    # primary_lifestyle / etc. without manual flags. Caches live under
+    # data_cache so subsequent runs are no-ops; first run pays the network.
+    phenotype_meta: dict[str, dict[str, str]] = {}
+    ecological_rows_written = 0
+    if getattr(args, "million_real_phenotypes", False):
+        biosample_ids = sorted({row.get("biosample", "") for row in selected if row.get("biosample")})
+        phenotype_cache_path = cache_dir / "phenotypic_metadata.json"
+        if biosample_ids:
+            try:
+                phenotype_meta = fetch_ncbi_biosample_phenotypes(
+                    biosample_ids, cache_path=phenotype_cache_path,
+                )
+                print(
+                    f"      phenotype: cached {len(phenotype_meta)} BioSample records "
+                    f"-> {phenotype_cache_path}",
+                    flush=True,
+                )
+            except Exception as exc:
+                sys.stderr.write(
+                    f"[warn] phenotype lookup failed: {type(exc).__name__}: {exc}; "
+                    f"continuing without phenotypic_metadata.json\n"
+                )
+                phenotype_meta = {}
+        if phenotype_meta:
+            (out_dir / "phenotypic_metadata.json").write_text(
+                json.dumps(phenotype_meta, indent=2, sort_keys=True), encoding="utf-8"
+            )
+        try:
+            fungaltraits_csv = fetch_fungaltraits_table(cache_dir)
+        except Exception as exc:
+            sys.stderr.write(
+                f"[warn] fungaltraits fetch failed: {type(exc).__name__}: {exc}; "
+                f"continuing without ecological_traits.tsv\n"
+            )
+            fungaltraits_csv = None
+        species_to_query_asms: dict[str, list[str]] = defaultdict(list)
+        for qrow in query_manifest_rows:
+            sp = qrow.get("species") or "."
+            species_to_query_asms[sp].append(qrow.get("query_asm", "."))
+        if species_to_query_asms:
+            ecological_rows_written = write_ecological_summary_tsv(
+                fungaltraits_csv,
+                species_to_query_asms,
+                out_dir / "ecological_traits.tsv",
+            )
+            if ecological_rows_written:
+                print(
+                    f"      ecological_traits: joined {ecological_rows_written} "
+                    f"trait records -> {out_dir / 'ecological_traits.tsv'}",
+                    flush=True,
+                )
+
+    # gene_annotations.tsv: aggregate every GFF/GBFF source we materialised
+    # during the parallel download. Same alias-expansion trick as the
+    # per-panel prepare path so analyze_new_biology_candidates' lookup
+    # against (query_asm, ref_contig) always hits a row when the gene
+    # exists in the ref annotation, regardless of whether the call was
+    # written under the manifest asm_name or the FASTA basename.
+    gene_annotations_count = 0
+    if gff_pairs:
+        gene_annotations_path = out_dir / "gene_annotations.tsv"
+        asm_aliases: dict[str, set[str]] = defaultdict(set)
+        for ref_row in ref_manifest_rows:
+            asm = ref_row.get("asm_name", "")
+            if not asm:
+                continue
+            asm_aliases[asm].add(asm)
+            fasta_path = ref_row.get("fasta_path", "")
+            if fasta_path:
+                basename = Path(fasta_path).name
+                if basename.endswith(".gz"):
+                    basename = basename[:-3]
+                asm_aliases[asm].add(basename)
+        for q_row in query_manifest_rows:
+            q_asm = q_row.get("query_asm", "")
+            q_path = q_row.get("path", "")
+            if q_asm and q_path:
+                basename = Path(q_path).name
+                if basename.endswith(".gz"):
+                    basename = basename[:-3]
+                asm_aliases[q_asm].add(q_asm)
+                asm_aliases[q_asm].add(basename)
+        ref_to_queries: dict[str, list[str]] = defaultdict(list)
+        for bm in benchmark_map_rows:
+            ref_asm = bm.get("benchmark_ref_asm", "")
+            q_asm = bm.get("query_asm", "")
+            if ref_asm and q_asm:
+                ref_to_queries[ref_asm].append(q_asm)
+        ref_rows = gff_to_gene_annotations(gff_pairs)
+        all_rows: list[dict[str, Any]] = []
+        seen: set[tuple[str, str, str]] = set()
+        for gene_row in ref_rows:
+            owners = set(asm_aliases.get(gene_row["query_asm"], {gene_row["query_asm"]}))
+            for q_asm in ref_to_queries.get(gene_row["query_asm"], []):
+                owners.update(asm_aliases.get(q_asm, {q_asm}))
+            for owner in owners:
+                key = (owner, gene_row["query_contig"], gene_row["gene_id"])
+                if key in seen:
+                    continue
+                seen.add(key)
+                duped = dict(gene_row)
+                duped["query_asm"] = owner
+                all_rows.append(duped)
+        if all_rows:
+            write_tsv(
+                gene_annotations_path,
+                all_rows,
+                ["query_asm", "query_contig", "gene_id", "gene_name", "start", "end", "strand", "biotype", "product"],
+            )
+            print(
+                f"      gene_annotations: wrote {len(all_rows)} gene records "
+                f"(from {len(gff_pairs)} GFF/GBFF sources) -> {gene_annotations_path}",
+                flush=True,
+            )
+            gene_annotations_count = len(all_rows)
+        else:
+            sys.stderr.write(
+                f"[gene-annot] no gene records parsed from {len(gff_pairs)} annotation source(s); "
+                f"skipping gene_annotations.tsv\n"
+            )
 
     # Step 4: build the real routing index by invoking the MycoSV binary, then
     # pad with synthetic decoys up to --target-centroids if requested.
@@ -6619,6 +7262,12 @@ def prepare_million_real(args: argparse.Namespace) -> int:
         print(f"      padding routing store: real={len(ref_manifest_rows)} -> target={args.target_centroids}")
         info = augment_routing_store(index_dir, args.target_centroids, args.seed)
 
+    # `queries_held_out` historically counted every row in the query manifest
+    # (assembly + per-mode reads children), which conflated "species held
+    # out" with "query rows produced". Split them so the summary is honest:
+    # query_assemblies_held_out = unique assemblies, query_rows_total = the
+    # rows the benchmark step iterates over.
+    held_out_assembly_rows = sum(1 for q in query_manifest_rows if q.get("query_mode") == "assembly")
     summary = {
         "out_dir": str(out_dir),
         "data_cache_dir": str(cache_dir),
@@ -6627,6 +7276,13 @@ def prepare_million_real(args: argparse.Namespace) -> int:
         "source": args.source,
         "max_assemblies_requested": args.max_assemblies,
         "assemblies_downloaded": download_count,
+        "gff_sources_downloaded": len(gff_pairs),
+        "gene_annotations_rows_written": gene_annotations_count,
+        "phenotypic_records_cached": len(phenotype_meta),
+        "ecological_rows_written": ecological_rows_written,
+        "query_assemblies_held_out": held_out_assembly_rows,
+        "query_rows_total": len(query_manifest_rows),
+        # Back-compat alias for older log scrapers that key on this field.
         "queries_held_out": len(query_manifest_rows),
         "refs_in_index": len(ref_manifest_rows),
         "target_centroids": args.target_centroids,
@@ -6638,6 +7294,12 @@ def prepare_million_real(args: argparse.Namespace) -> int:
     }
     summary_path = out_dir / "prepare_million_real_summary.json"
     summary_path.write_text(json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")
+    # Mirror under prepare_summary.json so tooling that expects the
+    # per-panel filename also finds the run summary in the million-real
+    # output dir.
+    (out_dir / "prepare_summary.json").write_text(
+        json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8"
+    )
 
     print(
         f"million_real_ready\tassemblies={download_count}"
@@ -6750,6 +7412,39 @@ def build_parser() -> argparse.ArgumentParser:
         "--ena-max-rows-per-species", type=int, default=200,
         help="Maximum read_run rows to pull from ENA per species before "
              "filtering by platform.",
+    )
+    # GFF/GBFF -> gene_annotations.tsv next to the manifest, mirroring the
+    # per-panel `prepare` default. NCBI hosts genomic.gff.gz alongside the
+    # FASTA so the marginal per-assembly cost is small; for ~2k assemblies
+    # this is on the order of minutes once warmed. Pass --no-million-real-
+    # download-gff if bandwidth- or wall-time-constrained.
+    smr.add_argument(
+        "--million-real-download-gff", dest="million_real_download_gff",
+        action="store_true", default=True,
+        help="Download GFF (or GBFF fallback) annotations alongside reference "
+             "FASTA so the prepared dir gets a gene_annotations.tsv (default: on).",
+    )
+    smr.add_argument(
+        "--no-million-real-download-gff", dest="million_real_download_gff",
+        action="store_false",
+        help="Skip GFF/GBFF download (disables auto gene_annotations.tsv).",
+    )
+    # FungalTraits + BioSample phenotypes are species-level lookups used by
+    # the biology analyzer and the visualization report. The CSVs are cached
+    # under data_cache/ so the first run pays the network cost and later
+    # runs are no-ops; default ON keeps million-real on par with the per-
+    # panel prepare path.
+    smr.add_argument(
+        "--million-real-phenotypes", dest="million_real_phenotypes",
+        action="store_true", default=True,
+        help="Fetch BioSample phenotype attributes + FungalTraits and emit "
+             "phenotypic_metadata.json / ecological_traits.tsv (default: on).",
+    )
+    smr.add_argument(
+        "--no-million-real-phenotypes", dest="million_real_phenotypes",
+        action="store_false",
+        help="Skip BioSample/FungalTraits enrichment (disables phenotypic_"
+             "metadata.json + ecological_traits.tsv).",
     )
 
     spp = sub.add_parser("prepare", help="Download a real fungal panel and write MycoSV-ready manifests.")

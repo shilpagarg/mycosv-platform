@@ -62,6 +62,14 @@ def _info_val(info_str: str, key: str) -> str:
     return ""
 
 
+def _first_info_val(info_str: str, *keys: str) -> str:
+    for key in keys:
+        val = _info_val(info_str, key)
+        if val:
+            return val
+    return ""
+
+
 def parse_vcf(path: Path) -> list[dict[str, str]]:
     rows: list[dict[str, str]] = []
     try:
@@ -81,8 +89,8 @@ def parse_vcf(path: Path) -> list[dict[str, str]]:
                     "pos": parts[1],
                     "svtype": svtype,
                     "svlen": _info_val(info, "SVLEN"),
-                    "query_asm": _info_val(info, "QUERY_ASM") or _info_val(info, "SAMPLE"),
-                    "element_class": _info_val(info, "ELEMENT_CLASS"),
+                    "query_asm": _first_info_val(info, "QUERY_ASM", "QUERY", "SAMPLE"),
+                    "element_class": _first_info_val(info, "ELEMENT_CLASS", "EC", "TE_CLASS"),
                     "chr2": _info_val(info, "CHR2"),
                     "end2": _info_val(info, "END2"),
                     "hgt_flag": _info_val(info, "HGT"),
@@ -182,9 +190,9 @@ def analyze_mge_architecture(
     counts: dict[tuple[str, str, str, str], int] = defaultdict(int)
 
     for row in bio_rows:
-        asm = row.get("query_asm", "")
-        ec = row.get("element_class", "OTHER") or "OTHER"
-        svtype = row.get("svtype", ".") or "."
+        asm = row.get("query_asm", "") or row.get("sample", "")
+        ec = row.get("element_class", "") or row.get("te_class", "") or row.get("effect", "") or "OTHER"
+        svtype = row.get("svtype", "") or row.get("sv_type", "") or row.get("type", ".") or "."
         meta = asm_meta.get(asm, {})
         species = meta.get("species", "") or row.get("phylum", "")
         lineage = species_to_lineage.get(species, {})
@@ -196,6 +204,8 @@ def analyze_mge_architecture(
             else "repeat" if ec in MGE_REPEAT_BASED
             else "none"
         )
+        if mge_cat == "none":
+            continue
         counts[(phylum, mge_cat, ec, svtype)] += 1
 
     # Also fold in raw SV rows that have element_class set
@@ -252,9 +262,12 @@ def analyze_hgt_propagation(
             species_to_lineage[sp] = lineage
 
     # Use bio_rows for HGT candidates first (already scored and classified)
-    hgt_rows = [r for r in bio_rows if r.get("hgt_flag") == "1" or
-                r.get("candidate_type") == "hgt_candidate" or
-                r.get("element_class") in MGE_INTEGRATIVE]
+    hgt_rows = [
+        r for r in bio_rows
+        if r.get("hgt_flag") == "1"
+        or r.get("candidate_type") == "hgt_candidate"
+        or (r.get("element_class") or r.get("te_class") or r.get("effect")) in MGE_INTEGRATIVE
+    ]
     # Supplement with raw TRA/OFF_REF from VCF
     vcf_hgt = [sv for sv in sv_rows if sv.get("svtype") in HGT_SV_TYPES]
 
@@ -272,10 +285,10 @@ def analyze_hgt_propagation(
         })
 
     for row in hgt_rows:
-        asm = row.get("query_asm", "")
+        asm = row.get("query_asm", "") or row.get("sample", "")
         lin = get_lineage_for_asm(asm)
-        svtype = row.get("svtype", "TRA")
-        ec = row.get("element_class", "HGT") or "HGT"
+        svtype = row.get("svtype", "") or row.get("sv_type", "") or row.get("type", "TRA")
+        ec = row.get("element_class", "") or row.get("te_class", "") or row.get("effect", "") or "HGT"
         phylum = lin.get("phylum", ".")
         order = lin.get("order", ".")
         counts[(phylum, order, svtype)] += 1

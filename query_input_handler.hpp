@@ -400,17 +400,17 @@ inline QueryMode sanity_check_mode_override(const std::string& path,
     const size_t med = median_read_length(sample);
     if (requested == QueryMode::LONG_READS && is_fastq(path) && med > 0 && med < 400) {
         if (!quiet) {
-            std::cerr << "[query-input] mode sanity override: requested long-reads but median read length="
-                      << med << "bp; using short-reads preprocessing instead\n";
+            std::cerr << "[query-input] mode sanity warning: requested long-reads but median read length="
+                      << med << "bp; keeping explicit long-reads preprocessing\n";
         }
-        return QueryMode::SHORT_READS;
+        return requested;
     }
     if (requested == QueryMode::SHORT_READS && med >= 1500) {
         if (!quiet) {
-            std::cerr << "[query-input] mode sanity override: requested short-reads but median read length="
-                      << med << "bp; using long-reads preprocessing instead\n";
+            std::cerr << "[query-input] mode sanity warning: requested short-reads but median read length="
+                      << med << "bp; keeping explicit short-reads preprocessing\n";
         }
-        return QueryMode::LONG_READS;
+        return requested;
     }
     return requested;
 }

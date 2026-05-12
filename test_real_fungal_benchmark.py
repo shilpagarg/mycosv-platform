@@ -4,6 +4,7 @@
 import run_real_fungal_benchmark as rrfb
 from pathlib import Path
 import gzip
+import math
 
 from run_real_fungal_benchmark import (
     NormalizedCall,
@@ -184,6 +185,7 @@ def test_load_mycosv_reference_calls_parses_ref_space(tmp_path: Path):
     assert call.pos == 101
     assert call.end == 150
     assert call.svtype == "DEL"
+    assert call.read_support is None
 
 
 def test_load_mycosv_calls_match_full_fasta_qasm_alias(tmp_path: Path):
@@ -200,6 +202,112 @@ def test_load_mycosv_calls_match_full_fasta_qasm_alias(tmp_path: Path):
     assert len(ref_calls) == 1
     assert query_calls[0].query_asm == "GCA_000149225_2"
     assert ref_calls[0].pos == 101
+
+
+def test_load_mycosv_calls_parse_intrinsic_read_support(tmp_path: Path):
+    vcf = tmp_path / "calls.vcf"
+    vcf.write_text(
+        "##fileformat=VCFv4.3\n"
+        "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tSAMPLE\n"
+        "sr_unitig7_len155_mf12\t1\tsv1\tN\t<OFF_REF>\t20\tPASS\t"
+        "SVTYPE=OFF_REF;SVLEN=155;END=155;QASM=q1;SUPPORT=12\tGT\t0/1\n"
+        "lr_pc4_n8\t20\tsv2\tN\t<DEL>\t40\tPASS\t"
+        "SVTYPE=DEL;SVLEN=-50;END=20;REFCONTIG=chr1;REFPOS=101;REFEND=150;QASM=q1\tGT\t0/1\n",
+        encoding="utf-8",
+    )
+    query_calls = load_mycosv_query_calls(vcf, "q1")
+    ref_calls = load_mycosv_reference_calls(vcf, "q1")
+    assert query_calls[0].read_support == 12
+    assert query_calls[1].read_support == 8
+    assert ref_calls[0].read_support == 8
+
+
+def test_load_mycosv_assembly_support_from_vcf(tmp_path: Path):
+    vcf = tmp_path / "calls.vcf"
+    vcf.write_text(
+        "##fileformat=VCFv4.3\n"
+        "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tSAMPLE\n"
+        "asm_ctg\t11\tsv1\tN\t<DEL>\t40\tPASS\t"
+        "SVTYPE=DEL;SVLEN=-50;END=11;REFCONTIG=chr1;REFPOS=101;REFEND=150;QASM=q1;QMODE=assembly;SUPPORT=17\tGT:GQ\t0/1:40\n",
+        encoding="utf-8",
+    )
+    query_calls = load_mycosv_query_calls(vcf, "q1")
+    ref_calls = load_mycosv_reference_calls(vcf, "q1")
+    assert query_calls[0].read_support == 17
+    assert ref_calls[0].read_support == 17
+
+
+def test_validate_mycosv_calls_uses_intrinsic_read_support(tmp_path: Path, monkeypatch):
+    ref = tmp_path / "ref.fa"
+    ref.write_text(">chr1\nACGT\n", encoding="utf-8")
+    query_row = {
+        "query_asm": "q1",
+        "query_mode": "short-reads",
+        "path": str(ref),
+        "benchmark_ref_fasta": str(ref),
+    }
+    call = NormalizedCall(
+        "q1", "sr_unitig7_len155_mf12", 1, 155, "OFF_REF", 155, "mycosv",
+        coord_space="query", read_support=12,
+    )
+    monkeypatch.setattr(rrfb, "_build_validation_bam", lambda *a, **k: (tmp_path / "x.bam", ref))
+    monkeypatch.setattr(rrfb, "_samtools_count_breakpoint_support", lambda *a, **k: 0)
+    kept, rows = rrfb.validate_calls_with_reads(
+        [call], query_row, tmp_path / "validation",
+        threads=1, min_support=3, flank_bp=250,
+    )
+    assert kept == [call]
+    assert rows[0]["read_support"] == 12
+    assert rows[0]["validation_support"] == 0
+    assert rows[0]["support_source"] == "mycosv_short_read_kmer"
+    assert rows[0]["read_validated"] == "yes"
+
+
+def test_validate_assembly_query_space_mycosv_keeps_internal_support(tmp_path: Path, monkeypatch):
+    ref = tmp_path / "ref.fa"
+    ref.write_text(">chr1\nACGT\n", encoding="utf-8")
+    query_row = {
+        "query_asm": "q1",
+        "query_mode": "assembly",
+        "path": str(ref),
+        "benchmark_ref_fasta": str(ref),
+    }
+    call = NormalizedCall(
+        "q1", "query_ctg", 10, 100, "INV", 90, "mycosv",
+        coord_space="query", read_support=5,
+    )
+    monkeypatch.setattr(rrfb, "_build_validation_bam", lambda *a, **k: (tmp_path / "x.bam", ref))
+    monkeypatch.setattr(rrfb, "_samtools_count_breakpoint_support", lambda *a, **k: 0)
+    kept, rows = rrfb.validate_calls_with_reads(
+        [call], query_row, tmp_path / "validation",
+        threads=1, min_support=3, flank_bp=250,
+    )
+    assert kept == [call]
+    assert rows[0]["read_support"] == 5
+    assert rows[0]["validation_support"] == -1
+    assert rows[0]["support_source"] == "mycosv_assembly_anchors"
+    assert rows[0]["status"] == "query_space_not_reference_validated"
+    assert rows[0]["read_validated"] == "yes"
+
+
+def test_score_callsets_no_truth_is_nan_status():
+    metrics = score_callsets([], [
+        NormalizedCall("q1", "ctg", 1, 10, "DEL", -10, "mycosv")
+    ])
+    assert math.isnan(metrics["f1"])
+    assert metrics["status"] == "no_truth"
+
+
+def test_write_mycosv_failure_outputs_are_parseable(tmp_path: Path):
+    paths = rrfb.write_mycosv_failure_outputs(tmp_path / "mycosv" / "calls", "rc=9")
+    for path in paths.values():
+        p = Path(path)
+        assert p.exists()
+        assert p.stat().st_size > 0
+    assert "#CHROM" in Path(paths["vcf"]).read_text(encoding="utf-8")
+    hits_text = Path(paths["hits"]).read_text(encoding="utf-8")
+    assert "query_asm\tquery_contig" in hits_text
+    assert "MYCOSV_FAILED" in hits_text
 
 
 def test_calls_compatible_accepts_inv_whole_block_prediction():
@@ -470,6 +578,56 @@ def test_run_mycosv_reuses_prebuilt_index(tmp_path: Path, monkeypatch):
     assert str(prebuilt_idx.resolve()) in cmd
     assert str(prebuilt_reg.resolve()) in cmd
     assert "--no-flat-ref-fallback" in cmd
+
+
+def test_run_mycosv_ref_override_reenables_flat_fallback_for_fresh_index(tmp_path: Path, monkeypatch):
+    prepared = tmp_path / "prepared"
+    prepared.mkdir()
+    full_ref = prepared / "full_ref.fa"
+    full_ref.write_text(">chr1\nACGTACGTACGT\n", encoding="utf-8")
+    bench_ref = prepared / "bench_ref.fa"
+    bench_ref.write_text(">chr1\nACGTACGTACGT\n", encoding="utf-8")
+    query = prepared / "query.fa"
+    query.write_text(">chr1\nACGTACGTACGT\n", encoding="utf-8")
+    (prepared / "ref_list.txt").write_text(str(full_ref) + "\n", encoding="utf-8")
+    (prepared / "query_list.txt").write_text(str(query) + "\n", encoding="utf-8")
+    (prepared / "query_manifest.tsv").write_text(
+        "query_asm\tbenchmark_ref_fasta\nq1\t" + str(bench_ref) + "\n",
+        encoding="utf-8",
+    )
+    (prepared / "hierarchy_manifest.tsv").write_text(
+        "asm_name\tphylum\tclass\torder\tfamily\tgenus\tclade_name\tclade_rank\tfasta_path\n"
+        f"ref1\t.\t.\t.\t.\t.\t.\tspecies\t{full_ref}\n",
+        encoding="utf-8",
+    )
+    bench_ref_list = tmp_path / "bench_ref_list.txt"
+    bench_ref_list.write_text(str(bench_ref) + "\n", encoding="utf-8")
+
+    invocations: list[list[str]] = []
+
+    def fake_run(cmd, cwd=None):
+        invocations.append(list(cmd))
+        class Dummy:
+            stdout = ""
+            stderr = ""
+        return Dummy()
+
+    monkeypatch.setattr(rrfb, "run_mycosv_command", fake_run)
+    run_mycosv(
+        prepared,
+        tmp_path / "bench",
+        tmp_path / "fake.exe",
+        "assembly",
+        ["--no-flat-ref-fallback", "--no-gfa"],
+        ref_list_override=bench_ref_list,
+    )
+
+    assert len(invocations) == 2, invocations
+    call_cmd = invocations[-1]
+    assert "--tol-build-index" not in call_cmd
+    assert str(bench_ref_list.resolve()) in call_cmd
+    assert "--no-flat-ref-fallback" not in call_cmd
+    assert "--no-gfa" in call_cmd
 
 
 def test_run_mycosv_rejects_invalid_reuse_index(tmp_path: Path, monkeypatch):
@@ -792,4 +950,4 @@ def test_benchmark_mycosv_only_validates_mycosv_reference_calls(tmp_path: Path, 
     assert readval.exists()
     assert "mycosv" in readval.read_text(encoding="utf-8")
     summary = json.loads((args.out_dir / "benchmark_summary.json").read_text(encoding="utf-8"))
-    assert summary["queries"]["q1"]["read_validation"]["read_validated"] == 1
+    assert summary["queries"]["q1"]["read_validation"]["mycosv_reference"]["read_validated"] == 1

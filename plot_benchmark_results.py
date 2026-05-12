@@ -73,9 +73,29 @@ def read_tsv(path: Path) -> list[dict[str, str]]:
 
 def float_or(val: str | None, default: float = 0.0) -> float:
     try:
-        return float(val)
+        out = float(val)
+        if np.isnan(out):
+            return default
+        return out
     except (TypeError, ValueError):
         return default
+
+
+def metric_or_nan(val: str | None) -> float:
+    return float_or(val, np.nan)
+
+
+def int_or(val: str | None, default: int = 0) -> int:
+    try:
+        return int(float(val))
+    except (TypeError, ValueError):
+        return default
+
+
+def nonnegative_err(center: float, lo: float, hi: float) -> tuple[float, float]:
+    if any(np.isnan(v) for v in (center, lo, hi)):
+        return 0.0, 0.0
+    return max(0.0, center - lo), max(0.0, hi - center)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -154,16 +174,15 @@ def fig_f1_by_svtype(mode_metrics: dict[str, list[dict]], out: Path) -> None:
     fig, ax = plt.subplots(figsize=(max(8, 2 * len(svtypes)), 5))
     for i, mode in enumerate(modes):
         by_type = {r["svtype"]: r for r in mode_metrics[mode]}
-        f1s = [float_or(by_type.get(t, {}).get("f1")) for t in svtypes]
-        recs = [float_or(by_type.get(t, {}).get("recall")) for t in svtypes]
-        precs = [float_or(by_type.get(t, {}).get("precision")) for t in svtypes]
-        tps = [int(by_type.get(t, {}).get("tp", 0)) for t in svtypes]
+        f1s = [metric_or_nan(by_type.get(t, {}).get("f1")) for t in svtypes]
+        tps = [int_or(by_type.get(t, {}).get("tp")) for t in svtypes]
         offset = (i - len(modes) / 2 + 0.5) * width
-        bars = ax.bar(x + offset, f1s, width * 0.9,
+        heights = [0.0 if np.isnan(v) else v for v in f1s]
+        bars = ax.bar(x + offset, heights, width * 0.9,
                       label=_label(mode), color=MODE_COLORS[i % len(MODE_COLORS)],
                       alpha=0.85)
         for bar, f1, tp in zip(bars, f1s, tps):
-            if f1 > 0.02:
+            if not np.isnan(f1) and f1 > 0.02:
                 ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.01,
                         f"{f1:.2f}", ha="center", va="bottom", fontsize=6.5)
 
@@ -197,16 +216,18 @@ def fig_pr_scatter(mode_metrics: dict[str, list[dict]], out: Path) -> None:
         color = MODE_COLORS[i % len(MODE_COLORS)]
         for j, t in enumerate(svtypes):
             row = by_type.get(t, {})
-            prec = float_or(row.get("precision"))
-            rec = float_or(row.get("recall"))
-            if prec == 0 and rec == 0:
+            prec = metric_or_nan(row.get("precision"))
+            rec = metric_or_nan(row.get("recall"))
+            if np.isnan(prec) or np.isnan(rec) or (prec == 0 and rec == 0):
                 continue
-            p_lo = float_or(row.get("prec_lo95"))
-            p_hi = float_or(row.get("prec_hi95"))
-            r_lo = float_or(row.get("rec_lo95"))
-            r_hi = float_or(row.get("rec_hi95"))
-            xerr = [[rec - r_lo], [r_hi - rec]]
-            yerr = [[prec - p_lo], [p_hi - prec]]
+            p_lo = metric_or_nan(row.get("prec_lo95"))
+            p_hi = metric_or_nan(row.get("prec_hi95"))
+            r_lo = metric_or_nan(row.get("rec_lo95"))
+            r_hi = metric_or_nan(row.get("rec_hi95"))
+            r_err_lo, r_err_hi = nonnegative_err(rec, r_lo, r_hi)
+            p_err_lo, p_err_hi = nonnegative_err(prec, p_lo, p_hi)
+            xerr = [[r_err_lo], [r_err_hi]]
+            yerr = [[p_err_lo], [p_err_hi]]
             marker = ["o", "s", "^", "D", "v", "P"][j % 6]
             ax.errorbar(rec, prec, xerr=xerr, yerr=yerr,
                         fmt=marker, color=color, markersize=8,
@@ -256,12 +277,12 @@ def fig_scenario_heatmap(scenario_metrics: dict[str, list[dict]],
                 continue
             si = scenarios.index(r["scenario"])
             ti = svtypes.index(r["svtype"])
-            matrix[si, ti] = float_or(r.get("f1"), np.nan)
+            matrix[si, ti] = metric_or_nan(r.get("f1"))
 
         fig, ax = plt.subplots(figsize=(max(5, len(svtypes) * 1.2),
                                          max(3, len(scenarios) * 1.0)))
         masked = np.ma.masked_invalid(matrix)
-        cmap = cm.RdYlGn
+        cmap = cm.RdYlGn.copy()
         cmap.set_bad("lightgrey")
         im = ax.imshow(masked, cmap=cmap, vmin=0, vmax=1, aspect="auto")
         ax.set_xticks(range(len(svtypes)))
@@ -302,10 +323,13 @@ def fig_mode_comparison(mode_metrics: dict[str, list[dict]], out: Path) -> None:
         vals = []
         for mode in modes:
             overall = next((r for r in mode_metrics[mode] if r["svtype"] == "OVERALL"), {})
-            vals.append(float_or(overall.get(metric)))
-        bars = ax.bar(x + (i - 1) * width, vals, width * 0.9,
+            vals.append(metric_or_nan(overall.get(metric)))
+        heights = [0.0 if np.isnan(v) else v for v in vals]
+        bars = ax.bar(x + (i - 1) * width, heights, width * 0.9,
                       label=mlabel, color=color, alpha=0.85)
         for bar, val in zip(bars, vals):
+            if np.isnan(val):
+                continue
             ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.005,
                     f"{val:.3f}", ha="center", va="bottom", fontsize=8)
 

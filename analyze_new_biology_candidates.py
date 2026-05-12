@@ -7,6 +7,7 @@ import argparse
 import csv
 import json
 import math
+import re
 from collections import Counter, defaultdict
 from pathlib import Path
 
@@ -31,6 +32,11 @@ MGE_INTEGRATIVE = {"STARSHIP", "HGT"}    # integrative island-type MGEs
 MGE_TRANSPOSABLE = {"TE", "LTR_GYPSY", "LTR_COPIA", "DNA_TIR", "HELITRON", "MITE",
                     "TE_LTR", "TE_TIR", "LINE", "SINE"}
 MGE_REPEAT_BASED = {"REPEAT", "RIP"}     # repeat/RIP elements (not strictly MGE)
+
+ASM_EXT_STRIP = (
+    ".fasta.gz", ".fastq.gz", ".fna.gz", ".fa.gz", ".fq.gz",
+    ".fasta", ".fastq", ".fna", ".fa", ".fq",
+)
 
 # Curated functional exemplars used to make the report more actionable.
 # These are short, concrete analogies that tie a structural signal to a real-data
@@ -170,6 +176,149 @@ def load_hits(path: Path | None) -> dict[tuple[str, str, str, str], dict[str, st
 
 
 
+def query_asm_aliases(asm: str) -> list[str]:
+    out = [asm]
+    seen = {asm}
+    lower = asm.lower()
+    for ext in ASM_EXT_STRIP:
+        if lower.endswith(ext):
+            stripped = asm[: -len(ext)]
+            if stripped and stripped not in seen:
+                out.append(stripped)
+                seen.add(stripped)
+    downsample_stripped = re.sub(r"\.\d+$", "", asm)
+    if downsample_stripped and downsample_stripped not in seen:
+        out.append(downsample_stripped)
+        seen.add(downsample_stripped)
+    acc_match = re.search(r"(GC[AF]_\d+)\.(\d+)", asm)
+    if acc_match:
+        accession_alias = f"{acc_match.group(1)}_{acc_match.group(2)}"
+        if accession_alias not in seen:
+            out.append(accession_alias)
+            seen.add(accession_alias)
+    base = Path(asm).name
+    if base and base != asm:
+        for alias in query_asm_aliases(base):
+            if alias not in seen:
+                out.append(alias)
+                seen.add(alias)
+    return out
+
+
+def load_ecological_traits(path: Path | None) -> dict[str, dict[str, str]]:
+    traits: dict[str, dict[str, str]] = {}
+    if path is None or not path.exists():
+        return traits
+    with path.open() as fh:
+        for row in csv.DictReader(fh, delimiter='\t'):
+            qasm = row.get('query_asm') or row.get('asm') or ''
+            if not qasm:
+                continue
+            for alias in query_asm_aliases(qasm):
+                traits.setdefault(alias, row)
+    return traits
+
+
+def load_fungaltraits_csv(path: Path | None) -> tuple[dict[str, dict[str, str]], dict[str, dict[str, str]]]:
+    by_species: dict[str, dict[str, str]] = {}
+    by_genus: dict[str, dict[str, str]] = {}
+    if path is None or not path.exists():
+        return by_species, by_genus
+    with path.open(encoding='utf-8', errors='replace') as fh:
+        reader = csv.DictReader(fh)
+        for row in reader:
+            species = (row.get('speciesMatched') or row.get('species') or row.get('SPECIES') or '').replace('_', ' ').strip().lower()
+            genus = (row.get('GENUS') or row.get('Genus') or '').strip().lower()
+            if not genus and species:
+                genus = species.split()[0]
+            trait_name = (row.get('trait_name') or '').strip().lower()
+            value = (row.get('value') or '').strip()
+            if trait_name and value:
+                slim = {'species': species}
+                if trait_name == 'trophic_mode_fg':
+                    slim['primary_lifestyle'] = value
+                    slim['trophic_mode'] = value
+                elif trait_name == 'substrate':
+                    slim['substrate_or_host'] = value
+                elif trait_name in {'growth_form', 'fruitbody_type', 'guild'}:
+                    slim[trait_name] = value
+                else:
+                    continue
+                row = slim
+            if species:
+                by_species.setdefault(species, {}).update({k: v for k, v in row.items() if v})
+            if genus:
+                by_genus.setdefault(genus, {}).update({k: v for k, v in row.items() if v})
+    return by_species, by_genus
+
+
+def ecological_context(
+    qasm: str,
+    meta_row: dict[str, str],
+    traits_by_qasm: dict[str, dict[str, str]],
+    fungal_by_species: dict[str, dict[str, str]],
+    fungal_by_genus: dict[str, dict[str, str]],
+) -> dict[str, str]:
+    def pick(*values: str | None) -> str:
+        for value in values:
+            if value not in (None, '', '.'):
+                return str(value)
+        return '.'
+
+    def inferred_trait() -> str:
+        species_text = (meta_row.get('species') or '').lower()
+        genus = (meta_row.get('genus') or '').lower()
+        order = (meta_row.get('order') or '').lower()
+        scenario = (meta_row.get('scenario') or '').lower()
+        if 'arbuscular' in scenario or genus in {'rhizophagus', 'gigaspora'}:
+            return 'Symbiotroph_arbuscular_mycorrhizal'
+        if any(x in species_text or x == genus for x in (
+            'puccinia', 'ustilago', 'mycosarcoma', 'pyricularia', 'fusarium',
+            'leptosphaeria', 'zymoseptoria'
+        )):
+            return 'Pathotroph_plant_pathogen'
+        if genus in {'candida', 'cryptococcus', 'nakaseomyces'}:
+            return 'Yeast_opportunistic_pathogen'
+        if genus in {'saccharomyces', 'lachancea', 'kluyveromyces'}:
+            return 'Saprotroph_yeast'
+        if order in {'polyporales', 'agaricales', 'russulales'}:
+            return 'Saprotroph_wood_decay'
+        if 'pathogen' in scenario:
+            return 'Pathotroph'
+        return '.'
+
+    trait_row: dict[str, str] = {}
+    for alias in query_asm_aliases(qasm):
+        if alias in traits_by_qasm:
+            trait_row = traits_by_qasm[alias]
+            break
+    species = pick(trait_row.get('species'), meta_row.get('species'))
+    species_low = species.replace('_', ' ').strip().lower()
+    fungal_row = (
+        fungal_by_species.get(species_low)
+        or fungal_by_genus.get(species_low.split()[0] if species_low else '')
+        or {}
+    )
+    primary = pick(
+        trait_row.get('primary_lifestyle'),
+        trait_row.get('trophic_mode'),
+        fungal_row.get('primary_lifestyle'),
+        fungal_row.get('trophic_mode'),
+        meta_row.get('lifestyle'),
+        inferred_trait(),
+    )
+    secondary = pick(trait_row.get('secondary_lifestyle'), fungal_row.get('secondary_lifestyle'))
+    trophic = pick(trait_row.get('trophic_mode'), fungal_row.get('trophic_mode'), primary)
+    substrate = pick(trait_row.get('substrate_or_host'), fungal_row.get('substrate_or_host'), fungal_row.get('Substrate'))
+    return {
+        'species': species,
+        'ecological_trait': primary,
+        'secondary_lifestyle': secondary,
+        'trophic_mode': trophic,
+        'substrate_or_host': substrate,
+    }
+
+
 def load_query_meta(path: Path | None) -> dict[str, dict[str, str]]:
     out: dict[str, dict[str, str]] = {}
     if path is None or not path.exists():
@@ -178,7 +327,13 @@ def load_query_meta(path: Path | None) -> dict[str, dict[str, str]]:
         for row in csv.DictReader(fh, delimiter='\t'):
             asm = row.get('query_asm')
             if asm:
-                out[asm] = row
+                for alias in query_asm_aliases(asm):
+                    out.setdefault(alias, row)
+            for path_field in ('path', 'benchmark_ref_fasta'):
+                path_val = row.get(path_field) or ''
+                if path_val:
+                    for alias in query_asm_aliases(Path(path_val).name):
+                        out.setdefault(alias, row)
     return out
 
 
@@ -288,6 +443,9 @@ def load_gene_annotations(path: Path | None) -> dict[tuple[str, str], list[dict[
                 'gene_name': row.get('gene_name') or row.get('name') or gene_id,
                 'start': start,
                 'end': end,
+                'strand': row.get('strand') or '.',
+                'biotype': row.get('biotype') or '.',
+                'product': row.get('product') or '.',
             })
     for rows in genes.values():
         rows.sort(key=lambda r: (int(r['start']), int(r['end'])))
@@ -624,10 +782,29 @@ def nearest_gene_for_candidate(
                 'gene_id': str(gene['gene_id']),
                 'gene_name': str(gene.get('gene_name') or gene['gene_id']),
                 'distance_bp': dist,
+                'product': str(gene.get('product') or '.'),
+                'biotype': str(gene.get('biotype') or '.'),
             }
             if dist == 0:
                 break
     return best
+
+
+def nearest_gene_for_locus(
+    gene_annotations: dict[tuple[str, str], list[dict[str, object]]],
+    qasm_candidates: list[str],
+    contig: str,
+    pos: str,
+    end: str,
+) -> dict[str, object] | None:
+    for qasm in qasm_candidates:
+        if not qasm or qasm == '.':
+            continue
+        for alias in query_asm_aliases(qasm):
+            hit = nearest_gene_for_candidate(gene_annotations, alias, contig, pos, end)
+            if hit is not None:
+                return hit
+    return nearest_gene_for_candidate(gene_annotations, '.', contig, pos, end)
 
 
 
@@ -687,7 +864,52 @@ def classify_candidate(
         return 'te_architecture_rewiring', 3, 'TE-like structural event may rewire genome architecture.'
     if novelty:
         return 'sequence_novelty', 2, 'Sequence appears novel or strongly diverged relative to indexed references.'
+    if svtype in {'INS', 'DEL', 'DUP', 'INV', 'TRA'}:
+        return 'structural_sv_signal', 1, 'Breakpoint-resolved structural variant with potential genome architecture impact.'
     return 'other', 1, 'Interesting structural event, but without clear novelty or TE evidence.'
+
+
+def select_diverse_rows(rows: list[dict[str, object]], top_n: int) -> list[dict[str, object]]:
+    """Return a ranked top-N while preserving representation across SV classes.
+
+    Fungal panels with many novel/off-reference unitigs can otherwise fill the
+    entire top-N with OFF_REF candidates and hide biologically relevant DEL,
+    INS, DUP, INV, or TRA rows.  Keep the global priority order, but reserve a
+    small quota for each observed SV type before filling the remaining slots.
+    """
+    if top_n <= 0 or len(rows) <= top_n:
+        return rows
+
+    svtypes = sorted({str(r.get('svtype', '.')) for r in rows if r.get('svtype') not in {None, '', '.'}})
+    if len(svtypes) <= 1:
+        return rows[:top_n]
+
+    quota = max(3, min(25, top_n // (2 * len(svtypes))))
+    selected: list[dict[str, object]] = []
+    selected_ids: set[int] = set()
+
+    for svtype in svtypes:
+        taken = 0
+        for row in rows:
+            if id(row) in selected_ids or str(row.get('svtype', '.')) != svtype:
+                continue
+            selected.append(row)
+            selected_ids.add(id(row))
+            taken += 1
+            if taken >= quota or len(selected) >= top_n:
+                break
+        if len(selected) >= top_n:
+            break
+
+    for row in rows:
+        if len(selected) >= top_n:
+            break
+        if id(row) not in selected_ids:
+            selected.append(row)
+            selected_ids.add(id(row))
+
+    selected.sort(key=lambda r: (-int(r['priority']), str(r['candidate_type']), str(r['query_asm']), str(r['query_contig']), int(r['pos'])))
+    return selected
 
 
 
@@ -766,6 +988,10 @@ def main() -> int:
                     help='Sample-level long-form expression table with query_asm, gene_id, expression, and condition/group columns.')
     ap.add_argument('--gene-annotations', type=Path,
                     help='Gene coordinate TSV with query_asm, query_contig, gene_id, gene_name, start, end.')
+    ap.add_argument('--ecological-traits', type=Path,
+                    help='Ecological trait TSV keyed by query_asm, typically prepared/ecological_traits.tsv.')
+    ap.add_argument('--fungaltraits-csv', type=Path,
+                    help='Cached FungalTraits CSV used as a species/genus fallback for ecological_trait columns.')
     ap.add_argument('--derived-expression-out', type=Path,
                     help='Optional TSV path to write candidate-level expression quantification derived from --expression-long-tsv.')
     ap.add_argument('--expression-window-bp', type=int, default=5000)
@@ -791,6 +1017,8 @@ def main() -> int:
     meta = load_query_meta(args.query_metadata)
     ancestral = load_ancestral(args.ancestral)
     records = load_vcf_records(args.vcf)
+    ecological_traits = load_ecological_traits(args.ecological_traits)
+    fungal_by_species, fungal_by_genus = load_fungaltraits_csv(args.fungaltraits_csv)
 
     expression = load_expression(args.expression_tsv)
     # Always load gene_annotations even when no expression_long is supplied —
@@ -825,10 +1053,16 @@ def main() -> int:
         ec = normalize_element_class(raw_ec)
         annot = info.get('ANNOT', '.')
         hit = hits.get((chrom, pos, end, svtype), {})
-        qasm = hit.get('query_asm') or info.get('QUERY_ASM', '.')
-        scenario = meta.get(qasm, {}).get('scenario', '.') if qasm in meta else '.'
-        architecture = meta.get(qasm, {}).get('architecture', '.') if qasm in meta else '.'
-        lifestyle = meta.get(qasm, {}).get('lifestyle', '.') if qasm in meta else '.'
+        qasm = hit.get('query_asm') or info.get('QASM') or info.get('QUERY_ASM', '.')
+        meta_row = {}
+        for alias in query_asm_aliases(qasm):
+            if alias in meta:
+                meta_row = meta[alias]
+                break
+        scenario = meta_row.get('scenario', '.') if meta_row else '.'
+        architecture = meta_row.get('architecture', '.') if meta_row else '.'
+        lifestyle = meta_row.get('lifestyle', '.') if meta_row else '.'
+        eco = ecological_context(qasm, meta_row, ecological_traits, fungal_by_species, fungal_by_genus)
         anc = ancestral.get((qasm, chrom)) or ancestral.get(('.', chrom))
         expr = expression_for_candidate(expression, qasm, chrom, pos, end, svtype)
         # Even when no expression matrix was supplied, the gene_annotations.tsv
@@ -836,8 +1070,27 @@ def main() -> int:
         # Surface that as expression_gene + expression_distance_bp; leave
         # expression_log2_fc / expression_padj as '.' since we have no measurement.
         nearest = None
+        affected_locus = chrom
+        gene_contig = chrom
+        gene_pos = pos
+        gene_end = end
+        ref_contig = hit.get('ref_contig') or info.get('REFCONTIG') or '.'
+        ref_pos = hit.get('ref_pos') or info.get('REFPOS') or ''
+        ref_end = hit.get('ref_end') or info.get('REFEND') or ref_pos
+        ref_asm = hit.get('ref_asm') or info.get('CLADE') or info.get('CL') or '.'
+        if ref_contig not in {'', '.'} and ref_pos not in {'', '.', '0'}:
+            gene_contig = ref_contig
+            gene_pos = ref_pos
+            gene_end = ref_end or ref_pos
+            affected_locus = f"{ref_contig}:{gene_pos}-{gene_end}"
         if expr is None or not expr.get('best_gene'):
-            nearest = nearest_gene_for_candidate(gene_annotations_lookup, qasm, chrom, pos, end)
+            nearest = nearest_gene_for_locus(
+                gene_annotations_lookup,
+                [qasm, meta_row.get('benchmark_ref_asm', ''), ref_asm, meta_row.get('benchmark_ref_fasta', '')],
+                gene_contig,
+                gene_pos,
+                gene_end,
+            )
         candidate_type, priority, rationale = classify_candidate(svtype, ec, annot, anc, expr)
         if candidate_type == 'other':
             continue
@@ -852,6 +1105,11 @@ def main() -> int:
         expr_log2_fc = expr.get('log2_fc', '.') if expr else '.'
         expr_padj = expr.get('padj', '.') if expr else '.'
         expr_condition = expr.get('condition', '.') if expr else '.'
+        affected_gene_id = nearest.get('gene_id') if nearest else '.'
+        affected_gene = nearest.get('gene_name') if nearest else expr_gene
+        affected_distance = nearest.get('distance_bp') if nearest else expr_distance
+        affected_product = nearest.get('product') if nearest else '.'
+        affected_biotype = nearest.get('biotype') if nearest else '.'
         rows.append({
             'priority': priority,
             'candidate_type': candidate_type,
@@ -859,8 +1117,13 @@ def main() -> int:
             'query_asm': qasm,
             'query_contig': chrom,
             'scenario': scenario,
+            'species': eco['species'],
             'lifestyle': lifestyle,
             'architecture': architecture,
+            'ecological_trait': eco['ecological_trait'],
+            'secondary_lifestyle': eco['secondary_lifestyle'],
+            'trophic_mode': eco['trophic_mode'],
+            'substrate_or_host': eco['substrate_or_host'],
             'svtype': svtype,
             'element_class': raw_ec,
             'mge_subtype': mge_subtype(ec),
@@ -869,6 +1132,12 @@ def main() -> int:
             'pos': int(pos),
             'end': int(end),
             'ref_target': hit.get('ref_asm', info.get('CL', '.')),
+            'affected_locus': affected_locus,
+            'affected_gene_id': affected_gene_id,
+            'affected_gene': affected_gene,
+            'affected_gene_distance_bp': affected_distance,
+            'affected_gene_biotype': affected_biotype,
+            'affected_gene_product': affected_product,
             'alignment_mode': hit.get('alignment_mode', info.get('ALIGNMENT_MODE', '.')),
             'ancestral_clades': clades,
             'ancestral_ranks': clade_ranks,
@@ -891,14 +1160,17 @@ def main() -> int:
         })
 
     rows.sort(key=lambda r: (-int(r['priority']), str(r['candidate_type']), str(r['query_asm']), str(r['query_contig']), int(r['pos'])))
-    rows = rows[: max(1, args.top_n)]
+    rows = select_diverse_rows(rows, max(1, args.top_n))
 
     args.out_tsv.parent.mkdir(parents=True, exist_ok=True)
     with args.out_tsv.open('w', newline='') as fh:
         fieldnames = [
-            'priority', 'candidate_type', 'phylum', 'query_asm', 'query_contig', 'scenario', 'lifestyle',
-            'architecture', 'svtype', 'element_class', 'mge_subtype', 'hgt_flag', 'novelty', 'pos', 'end',
-            'ref_target', 'alignment_mode', 'ancestral_clades', 'ancestral_ranks', 'ancestral_breakpoints',
+            'priority', 'candidate_type', 'phylum', 'query_asm', 'query_contig', 'scenario', 'species',
+            'lifestyle', 'architecture', 'ecological_trait', 'secondary_lifestyle', 'trophic_mode',
+            'substrate_or_host', 'svtype', 'element_class', 'mge_subtype', 'hgt_flag', 'novelty', 'pos', 'end',
+            'ref_target', 'affected_locus', 'affected_gene_id', 'affected_gene', 'affected_gene_distance_bp',
+            'affected_gene_biotype', 'affected_gene_product', 'alignment_mode', 'ancestral_clades',
+            'ancestral_ranks', 'ancestral_breakpoints',
             'ancestral_segment_bp', 'expression_supported', 'expression_gene', 'expression_distance_bp',
             'expression_log2_fc', 'expression_padj', 'expression_condition', 'rationale',
             'functional_example', 'evidence_axis', 'example_system',

@@ -109,8 +109,11 @@ def read_table(path: Optional[str]) -> Optional[pd.DataFrame]:
     # C parser bails on the first row whose field count differs from the
     # header. Falling back to the python engine with on_bad_lines='skip'
     # drops only the offending rows instead of aborting the whole report.
+    # low_memory=False reads each column in a single pass so pandas can pick a
+    # consistent dtype; the previous chunked read emitted a DtypeWarning on the
+    # 30+ mixed-type columns produced by the comparator merge.
     try:
-        return pd.read_csv(p, sep=sep)
+        return pd.read_csv(p, sep=sep, low_memory=False)
     except pd.errors.ParserError:
         sys.stderr.write(
             f"[read_table] Falling back to lenient parse for {p} "
@@ -158,14 +161,15 @@ COLUMN_ALIASES: Dict[str, Sequence[str]] = {
 def harmonize_columns(df: pd.DataFrame) -> pd.DataFrame:
     if df is None:
         return df
-    renamed = {}
+    out = df.copy()
     lower_map = {c.lower(): c for c in df.columns}
     for canonical, aliases in COLUMN_ALIASES.items():
+        if canonical in out.columns:
+            continue
         for alias in aliases:
             if alias.lower() in lower_map:
-                renamed[lower_map[alias.lower()]] = canonical
+                out[canonical] = out[lower_map[alias.lower()]]
                 break
-    out = df.rename(columns=renamed).copy()
 
     if "sv_len" not in out.columns and {"start", "end"}.issubset(out.columns):
         out["sv_len"] = (pd.to_numeric(out["end"], errors="coerce") - pd.to_numeric(out["start"], errors="coerce")).abs()
@@ -245,6 +249,48 @@ def add_size_bin(df: pd.DataFrame, source_col: str = "sv_len") -> pd.DataFrame:
     return out
 
 
+SVTYPE_ORDER: tuple[str, ...] = ("INS", "DEL", "INV", "DUP", "TRA", "OFF_REF")
+
+
+def short_sample_label(value: object, max_len: int = 30) -> str:
+    s = str(value)
+    if len(s) <= max_len:
+        return s
+    return s[: max_len - 1] + "…"
+
+
+def is_benchmark_summary_table(df: pd.DataFrame) -> bool:
+    return {"query_asm", "method", "svtype", "pred_calls", "truth_label"}.issubset(df.columns)
+
+
+def benchmark_pred_call_counts(df: pd.DataFrame, *, include_all: bool = False) -> pd.DataFrame:
+    """Deduplicate exact_benchmark_summary-style rows into prediction counts.
+
+    exact_benchmark_summary.tsv repeats the same prediction counts once per
+    truth label. For landscape plots we want one count per sample/caller/SV
+    type, so max(pred_calls) is the stable de-duplicated value.
+    """
+    if not is_benchmark_summary_table(df):
+        return pd.DataFrame()
+    tmp = df.copy()
+    tmp["pred_calls"] = pd.to_numeric(tmp["pred_calls"], errors="coerce").fillna(0)
+    tmp["svtype"] = tmp["svtype"].astype(str)
+    if not include_all:
+        tmp = tmp[tmp["svtype"] != "ALL"]
+    keep_methods = tmp["method"].astype(str).ne("")
+    tmp = tmp[keep_methods]
+    if tmp.empty:
+        return pd.DataFrame()
+    out = (
+        tmp.groupby(["query_asm", "method", "svtype"], dropna=False)["pred_calls"]
+        .max()
+        .reset_index(name="count")
+        .rename(columns={"query_asm": "sample", "method": "caller", "svtype": "sv_type"})
+    )
+    out["count"] = pd.to_numeric(out["count"], errors="coerce").fillna(0)
+    return out
+
+
 @dataclass
 class FigureRecord:
     title: str
@@ -259,13 +305,16 @@ class FigureRecord:
 
 
 def plot_bar(df: pd.DataFrame, x: str, y: str, title: str, xlabel: str, ylabel: str, rotate_xticks: bool = False) -> plt.Figure:
-    fig, ax = plt.subplots(figsize=(9, 5))
-    ax.bar(df[x].astype(str), df[y])
+    fig, ax = plt.subplots(figsize=(max(9, 0.34 * len(df) + 3), 5.5))
+    labels = [short_sample_label(v) for v in df[x]]
+    ax.bar(labels, df[y])
     ax.set_title(title)
     ax.set_xlabel(xlabel)
     ax.set_ylabel(ylabel)
     if rotate_xticks:
-        ax.tick_params(axis="x", rotation=45)
+        ax.tick_params(axis="x", rotation=35, labelsize=8)
+        for label in ax.get_xticklabels():
+            label.set_ha("right")
     fig.tight_layout()
     return fig
 
@@ -273,12 +322,42 @@ def plot_bar(df: pd.DataFrame, x: str, y: str, title: str, xlabel: str, ylabel: 
 
 def plot_grouped_metric(df: pd.DataFrame, category: str, metric: str, series: str, title: str) -> plt.Figure:
     pivot = df.pivot_table(index=category, columns=series, values=metric, aggfunc="mean")
-    fig, ax = plt.subplots(figsize=(10, 5))
+    pivot.index = [short_sample_label(v) for v in pivot.index]
+    fig, ax = plt.subplots(figsize=(max(10, 0.34 * len(pivot.index) + 3), 5.5))
     pivot.plot(kind="bar", ax=ax)
     ax.set_title(title)
     ax.set_xlabel(category)
     ax.set_ylabel(metric)
     ax.legend(title=series, bbox_to_anchor=(1.02, 1), loc="upper left")
+    ax.tick_params(axis="x", rotation=35, labelsize=8)
+    for label in ax.get_xticklabels():
+        label.set_ha("right")
+    fig.tight_layout()
+    return fig
+
+
+def plot_caller_count_proxy(df: pd.DataFrame, title: str, *, top_n: int = 25) -> plt.Figure:
+    totals = df.groupby("sample", dropna=False)["count"].sum().sort_values(ascending=False)
+    top_samples = list(totals.head(top_n).index)
+    plot_df = df[df["sample"].isin(top_samples)].copy()
+    plot_df["sample"] = pd.Categorical(plot_df["sample"], categories=top_samples, ordered=True)
+    pivot = (
+        plot_df.pivot_table(index="sample", columns="caller", values="count", aggfunc="sum", observed=False)
+        .fillna(0)
+        .reindex(top_samples)
+    )
+    pivot.index = [short_sample_label(v) for v in pivot.index]
+    fig, ax = plt.subplots(figsize=(max(11, 0.42 * len(pivot.index) + 4), 5.8))
+    pivot.plot(kind="bar", ax=ax, width=0.84)
+    ax.set_yscale("symlog", linthresh=5)
+    ax.set_title(title)
+    ax.set_xlabel("Sample")
+    ax.set_ylabel("SV count (symlog scale)")
+    ax.legend(title="caller", bbox_to_anchor=(1.02, 1), loc="upper left")
+    ax.tick_params(axis="x", rotation=35, labelsize=8)
+    for label in ax.get_xticklabels():
+        label.set_ha("right")
+    ax.grid(axis="y", alpha=0.25)
     fig.tight_layout()
     return fig
 
@@ -303,12 +382,19 @@ def plot_hist(values: pd.Series, title: str, xlabel: str, bins: int = 30, log_x:
     return fig
 
 
+def boxplot_with_labels(ax: plt.Axes, data: list, labels: list, **kwargs) -> None:
+    try:
+        ax.boxplot(data, tick_labels=labels, **kwargs)
+    except TypeError:
+        ax.boxplot(data, labels=labels, **kwargs)
+
+
 
 def plot_box(df: pd.DataFrame, x: str, y: str, title: str, rotate_xticks: bool = False) -> plt.Figure:
     categories = [g[y].dropna().values for _, g in df.groupby(x)]
     labels = [str(k) for k, _ in df.groupby(x)]
     fig, ax = plt.subplots(figsize=(10, 5))
-    ax.boxplot(categories, labels=labels, showfliers=False)
+    boxplot_with_labels(ax, categories, labels, showfliers=False)
     ax.set_title(title)
     ax.set_xlabel(x)
     ax.set_ylabel(y)
@@ -321,12 +407,17 @@ def plot_box(df: pd.DataFrame, x: str, y: str, title: str, rotate_xticks: bool =
 
 def plot_stacked_counts(df: pd.DataFrame, index_col: str, stack_col: str, title: str, normalize: bool = False) -> plt.Figure:
     counts = pd.crosstab(df[index_col].fillna("NA"), df[stack_col].fillna("NA"), normalize="index" if normalize else False)
-    fig, ax = plt.subplots(figsize=(10, 5))
+    counts = counts[[c for c in SVTYPE_ORDER if c in counts.columns] + [c for c in counts.columns if c not in SVTYPE_ORDER]]
+    counts.index = [short_sample_label(v) for v in counts.index]
+    fig, ax = plt.subplots(figsize=(max(10, 0.34 * len(counts.index) + 3), 5.5))
     counts.plot(kind="bar", stacked=True, ax=ax)
     ax.set_title(title)
     ax.set_xlabel(index_col)
     ax.set_ylabel("Fraction" if normalize else "Count")
     ax.legend(title=stack_col, bbox_to_anchor=(1.02, 1), loc="upper left")
+    ax.tick_params(axis="x", rotation=35, labelsize=8)
+    for label in ax.get_xticklabels():
+        label.set_ha("right")
     fig.tight_layout()
     return fig
 
@@ -423,8 +514,10 @@ def build_real_section(real_df: Optional[pd.DataFrame], metadata_df: Optional[pd
     if real_df is None or real_df.empty:
         return "<p>No real-data SV table provided.</p>", [], []
 
+    raw_real_df = real_df.copy()
     real_df = harmonize_columns(real_df)
     real_df = add_size_bin(real_df)
+    benchmark_counts = benchmark_pred_call_counts(raw_real_df)
     figs: List[FigureRecord] = []
     tables: List[pd.DataFrame] = []
     blocks: List[str] = []
@@ -447,7 +540,26 @@ def build_real_section(real_df: Optional[pd.DataFrame], metadata_df: Optional[pd
         blocks.append("<p>This section summarizes real-data structural variant landscapes, sample burden, class composition, size distributions, and cohort-level heterogeneity.</p>")
         return "\n".join(blocks), figs, tables
 
-    if "sample" in real_df.columns:
+    if not benchmark_counts.empty:
+        mycosv_counts = benchmark_counts[benchmark_counts["caller"].eq("mycosv")]
+        burden_source = mycosv_counts if not mycosv_counts.empty else benchmark_counts
+        burden = (
+            burden_source.groupby("sample", dropna=False)["count"]
+            .sum()
+            .reset_index(name="sv_count")
+            .sort_values("sv_count", ascending=False)
+        )
+        tables.append(burden)
+        save_df(burden, outdir / "real_sv_burden_by_sample.tsv")
+        fig = plot_bar(burden.head(30), "sample", "sv_count", "MycoSV SV burden by sample (top 30)", "Sample", "SV count", rotate_xticks=True)
+        encoded = write_figure(fig, outdir / "real_sv_burden_by_sample.png")
+        figs.append(FigureRecord(
+            title="SV burden by sample",
+            filename="real_sv_burden_by_sample.png",
+            encoded_png=encoded,
+            caption="De-duplicated MycoSV prediction burden across real samples, using pred_calls from benchmark summaries."
+        ))
+    elif "sample" in real_df.columns:
         burden = real_df.groupby("sample", dropna=False).size().reset_index(name="sv_count").sort_values("sv_count", ascending=False)
         tables.append(burden)
         save_df(burden, outdir / "real_sv_burden_by_sample.tsv")
@@ -460,8 +572,25 @@ def build_real_section(real_df: Optional[pd.DataFrame], metadata_df: Optional[pd
             caption="SV burden across real samples, showing the most variant-rich samples."
         ))
 
-    if {"sample", "sv_type"}.issubset(real_df.columns):
-        fig = plot_stacked_counts(real_df, "sample", "sv_type", "SV composition by sample", normalize=True)
+    if not benchmark_counts.empty:
+        mycosv_counts = benchmark_counts[benchmark_counts["caller"].eq("mycosv")]
+        comp_source = mycosv_counts if not mycosv_counts.empty else benchmark_counts
+        comp_source = comp_source[comp_source["count"] > 0]
+        if not comp_source.empty:
+            fig = plot_stacked_counts(
+                comp_source.loc[comp_source.index.repeat(comp_source["count"].astype(int).clip(lower=0))],
+                "sample", "sv_type", "MycoSV SV composition by sample", normalize=True,
+            )
+            encoded = write_figure(fig, outdir / "real_sv_composition_by_sample.png")
+            figs.append(FigureRecord(
+                title="SV composition by sample",
+                filename="real_sv_composition_by_sample.png",
+                encoded_png=encoded,
+                caption="Relative MycoSV SV class composition per sample; ALL rows and repeated truth-label rows are excluded."
+            ))
+    elif {"sample", "sv_type"}.issubset(real_df.columns):
+        real_sv_only = real_df[real_df["sv_type"].astype(str).ne("ALL")]
+        fig = plot_stacked_counts(real_sv_only, "sample", "sv_type", "SV composition by sample", normalize=True)
         encoded = write_figure(fig, outdir / "real_sv_composition_by_sample.png")
         figs.append(FigureRecord(
             title="SV composition by sample",
@@ -493,7 +622,21 @@ def build_real_section(real_df: Optional[pd.DataFrame], metadata_df: Optional[pd
             caption="Chromosome-level distribution of SV classes in real data."
         ))
 
-    if {"caller", "sample"}.issubset(real_df.columns):
+    if not benchmark_counts.empty:
+        caller_summary = (
+            benchmark_counts.groupby(["sample", "caller"], dropna=False)["count"]
+            .sum()
+            .reset_index(name="count")
+        )
+        fig = plot_caller_count_proxy(caller_summary, "Caller-specific SV counts in real data (top 25 samples)")
+        encoded = write_figure(fig, outdir / "real_caller_overlap_proxy.png")
+        figs.append(FigureRecord(
+            title="Caller-specific counts",
+            filename="real_caller_overlap_proxy.png",
+            encoded_png=encoded,
+            caption="De-duplicated caller-specific prediction counts from pred_calls; y-axis uses symlog scaling so large comparator callsets do not hide smaller callsets."
+        ))
+    elif {"caller", "sample"}.issubset(real_df.columns):
         caller_summary = real_df.groupby(["sample", "caller"], dropna=False).size().reset_index(name="count")
         fig = plot_grouped_metric(caller_summary, "sample", "count", "caller", "Caller-specific SV counts in real data")
         encoded = write_figure(fig, outdir / "real_caller_overlap_proxy.png")
@@ -660,7 +803,7 @@ def plot_te_architecture(df: pd.DataFrame, outdir: Path) -> Optional[FigureRecor
     if "sv_len" in te_df.columns:
         order = counts[te_col].tolist()
         data = [te_df.loc[te_df[te_col] == cls, "sv_len"].dropna().values for cls in order]
-        axes[1].boxplot(data, labels=order, showfliers=False, vert=False)
+        boxplot_with_labels(axes[1], data, order, showfliers=False, vert=False)
         axes[1].set_title("TE size distribution (bp)")
         axes[1].set_xlabel("SV length (bp)")
     else:
@@ -742,10 +885,17 @@ def _select_wins_subset(real_df: pd.DataFrame) -> pd.DataFrame:
     needed = {"truth_label", "method", "svtype", "f1"}
     if not needed.issubset(real_df.columns):
         return pd.DataFrame()
-    label = real_df["truth_label"].astype(str)
-    keep = label.str.startswith(("consensus_",)) & ~label.eq("no_comparator")
-    keep |= label.str.endswith("_read_supported")
-    return real_df[keep].copy()
+    out = real_df.copy()
+    label = out["truth_label"].astype(str)
+    keep = label.str.startswith("consensus_") & label.str.endswith("_read_supported")
+    if "truth_calls" in out.columns:
+        keep &= pd.to_numeric(out["truth_calls"], errors="coerce").fillna(0) > 0
+    if "status" in out.columns:
+        keep &= ~out["status"].astype(str).eq("no_truth")
+    out = out[keep].copy()
+    out["f1"] = pd.to_numeric(out["f1"], errors="coerce")
+    out = out.dropna(subset=["f1"])
+    return out
 
 
 def plot_wins_matrix(real_df: pd.DataFrame, outdir: Path) -> List[FigureRecord]:
@@ -766,17 +916,16 @@ def plot_wins_matrix(real_df: pd.DataFrame, outdir: Path) -> List[FigureRecord]:
     subset = _select_wins_subset(real_df)
     if subset.empty:
         return figs
-    rs = subset[subset["truth_label"].astype(str).str.endswith("_read_supported")].copy()
+    rs = subset.copy()
     if rs.empty:
         return figs
-    rs["f1"] = pd.to_numeric(rs["f1"], errors="coerce")
     rs["svtype"] = rs["svtype"].astype(str)
     rs["method"] = rs["method"].astype(str)
 
     # ── (A) F1 heatmap, mean across queries ─────────────────────────────
     pivot = rs.pivot_table(
         index="method", columns="svtype", values="f1", aggfunc="mean",
-    ).fillna(0.0)
+    )
     if not pivot.empty:
         # Put mycosv at the top so the eye reads it as "the method we are
         # testing"; sort the rest alphabetically so panels are stable across
@@ -787,7 +936,10 @@ def plot_wins_matrix(real_df: pd.DataFrame, outdir: Path) -> List[FigureRecord]:
         if sv_order:
             pivot = pivot[sv_order]
         fig, ax = plt.subplots(figsize=(max(6, 0.9 * len(pivot.columns) + 4), max(3, 0.5 * len(pivot.index) + 2)))
-        im = ax.imshow(pivot.values, aspect="auto", cmap="viridis", vmin=0.0, vmax=1.0)
+        masked = np.ma.masked_invalid(pivot.values.astype(float))
+        cmap = plt.get_cmap("viridis").copy()
+        cmap.set_bad(color="#f2f2f2")
+        im = ax.imshow(masked, aspect="auto", cmap=cmap, vmin=0.0, vmax=1.0)
         ax.set_xticks(range(len(pivot.columns)))
         ax.set_xticklabels(pivot.columns, rotation=0)
         ax.set_yticks(range(len(pivot.index)))
@@ -795,8 +947,9 @@ def plot_wins_matrix(real_df: pd.DataFrame, outdir: Path) -> List[FigureRecord]:
         for i in range(pivot.shape[0]):
             for j in range(pivot.shape[1]):
                 v = float(pivot.values[i, j])
-                ax.text(j, i, f"{v:.2f}", ha="center", va="center",
-                        color=("white" if v < 0.55 else "black"), fontsize=9)
+                label = "NA" if np.isnan(v) else f"{v:.2f}"
+                ax.text(j, i, label, ha="center", va="center",
+                        color=("white" if not np.isnan(v) and v < 0.55 else "black"), fontsize=9)
         ax.set_title("Mean F1 vs read-validated truth (by method × SV type)")
         fig.colorbar(im, ax=ax, label="F1")
         fig.tight_layout()
@@ -824,6 +977,7 @@ def plot_wins_matrix(real_df: pd.DataFrame, outdir: Path) -> List[FigureRecord]:
             wins_rows = []
             for cmp in [c for c in wide.columns if c != "mycosv"]:
                 pair = wide[["mycosv", cmp]].dropna()
+                pair = pair[(pair["mycosv"] > 0) | (pair[cmp] > 0)]
                 if pair.empty:
                     continue
                 for sv in sorted({sv for (_, sv) in pair.index}):
@@ -843,18 +997,29 @@ def plot_wins_matrix(real_df: pd.DataFrame, outdir: Path) -> List[FigureRecord]:
                 wins_df = pd.DataFrame(wins_rows)
                 pivot_wins = wins_df.pivot_table(
                     index="svtype", columns="comparator", values="win_rate",
-                ).fillna(0.0)
+                )
                 sv_order = [s for s in ("ALL", "INS", "DEL", "INV", "DUP", "TRA", "OFF_REF") if s in pivot_wins.index]
                 if sv_order:
                     pivot_wins = pivot_wins.reindex(sv_order)
-                fig, ax = plt.subplots(figsize=(10, 5))
-                pivot_wins.plot(kind="bar", ax=ax)
-                ax.axhline(0.5, color="grey", linestyle="--", linewidth=0.8)
-                ax.set_ylim(0.0, 1.05)
-                ax.set_ylabel("MycoSV win rate (F1 ≥ comparator)")
-                ax.set_xlabel("SV type")
+                fig, ax = plt.subplots(figsize=(max(7, 0.85 * len(pivot_wins.columns) + 3), max(3.5, 0.55 * len(pivot_wins.index) + 2.2)))
+                masked = np.ma.masked_invalid(pivot_wins.values.astype(float))
+                cmap = plt.get_cmap("magma").copy()
+                cmap.set_bad(color="#f2f2f2")
+                im = ax.imshow(masked, aspect="auto", cmap=cmap, vmin=0.0, vmax=1.0)
+                ax.set_xticks(range(len(pivot_wins.columns)))
+                ax.set_xticklabels(pivot_wins.columns, rotation=35, ha="right")
+                ax.set_yticks(range(len(pivot_wins.index)))
+                ax.set_yticklabels(pivot_wins.index)
+                for i in range(pivot_wins.shape[0]):
+                    for j in range(pivot_wins.shape[1]):
+                        v = float(pivot_wins.values[i, j])
+                        label = "NA" if np.isnan(v) else f"{v:.2f}"
+                        ax.text(j, i, label, ha="center", va="center",
+                                color=("white" if not np.isnan(v) and v < 0.65 else "black"), fontsize=9)
+                ax.set_xlabel("Comparator")
+                ax.set_ylabel("SV type")
                 ax.set_title("Per-(SV type, comparator) win rate of MycoSV (read-validated truth)")
-                ax.legend(title="comparator", bbox_to_anchor=(1.02, 1), loc="upper left")
+                fig.colorbar(im, ax=ax, label="MycoSV win rate (F1 >= comparator)")
                 fig.tight_layout()
                 encoded = write_figure(fig, outdir / "wins_rate.png")
                 save_df(wins_df, outdir / "wins_rate.tsv")
@@ -865,9 +1030,9 @@ def plot_wins_matrix(real_df: pd.DataFrame, outdir: Path) -> List[FigureRecord]:
                     caption=(
                         "Per (SV type, comparator), the fraction of queries "
                         "where MycoSV F1 ≥ that comparator's F1 on the "
-                        "read-validated consensus truth. Dashed line at 0.5 "
-                        "is parity. wins_rate.tsv lists every (query, "
-                        "svtype, comparator) cell."
+                        "read-validated consensus truth. Grey cells are "
+                        "unavailable comparisons. wins_rate.tsv lists every "
+                        "(query, svtype, comparator) cell."
                     ),
                 ))
 
@@ -879,7 +1044,8 @@ def plot_wins_matrix(real_df: pd.DataFrame, outdir: Path) -> List[FigureRecord]:
                 fig, axes = plt.subplots(nrows, ncols, figsize=(5 * ncols, 4 * nrows), squeeze=False)
                 for idx, cmp in enumerate(cmps):
                     ax = axes[idx // ncols][idx % ncols]
-                    pair = wide[["mycosv", cmp]].dropna().reset_index()
+                    pair = wide[["mycosv", cmp]].dropna()
+                    pair = pair[(pair["mycosv"] > 0) | (pair[cmp] > 0)].reset_index()
                     if pair.empty:
                         ax.axis("off")
                         continue

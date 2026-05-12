@@ -136,10 +136,10 @@ struct VariantCallBridge {
     double      fusedLogOddsAlt     = 0.0;
     double      fusedEffectiveDepth = 0.0;
     int         fusedLayersUsed     = 0;
-    // Read support backing this call's pseudo-contig:
+    // Evidence support backing this call:
+    //   assembly    → anchor count / fused evidence layers, filled before output
     //   long-reads  → cluster size (_n<N> in contig name), exact read count
     //   short-reads → min k-mer frequency along unitig path (_mf<N>), coverage proxy
-    //   assembly    → -1 (not applicable)
     int         readSupport         = -1;
 };
 
@@ -2100,7 +2100,7 @@ hierarchical_call_assembly(const std::string& qAsm,
     std::vector<const TolGlobal::RefSeq*> allRefPtrs;
     allRefPtrs.reserve(allRefs.size());
     for (const auto& r : allRefs) allRefPtrs.push_back(&r);
-    const int minHierChainAnchors = static_cast<int>(std::max<size_t>(fo.tolMinChainAnchors, 2));
+    const int minHierChainAnchors = static_cast<int>(std::max<size_t>(fo.tolMinChainAnchors, 1));
     auto append_window_calls = [&](const std::string& contigName,
                                    const std::string& seq) {
         if (!fo.graphNativeMode) return;
@@ -2234,6 +2234,15 @@ hierarchical_call_assembly(const std::string& qAsm,
                 append_window_calls(name, seq);
                 continue;
             }
+            // Best ref matched but the contig-wide length delta is too small
+            // to call as one SV. Emit per-window OFF_REF/INDEL calls so sub-
+            // contig variants are not silently absorbed by Path C's whole-
+            // contig fallback.
+            if (best) {
+                size_t windowsBefore = out.size();
+                append_window_calls(name, seq);
+                if (out.size() != windowsBefore) continue;
+            }
         }
 
         // ── Path C: OFF_REF novelty scoring with cross-clade HGT detection ─
@@ -2293,10 +2302,21 @@ hierarchical_call_assembly(const std::string& qAsm,
             : score_off_ref_novelty(std::max(sameCladeOverlap, otherCladeOverlap));
         const std::string tier = novelty_tier_name(noveltyTier);
         if (tier == "NOVEL" || tier == "NOVEL_WEAK" || tier == "DIVERGED") {
-            auto ofcall = make_offref_call(qAsm, name, seq, tier,
-                                           bestCladeGc, bestAsmName, bestCladeRank, bestPhylum);
-            if (isHgt) ofcall.elementClass = "HGT";
-            out.push_back(std::move(ofcall));
+            // Prefer per-window OFF_REF calls so a divergent contig produces
+            // many small events that can match a per-position truth set.
+            // The contig-wide call is kept only as a safety net when graph-
+            // native windowing is disabled or yields no windows.
+            size_t windowsBefore = out.size();
+            append_window_calls(name, seq);
+            if (out.size() == windowsBefore) {
+                auto ofcall = make_offref_call(qAsm, name, seq, tier,
+                                               bestCladeGc, bestAsmName, bestCladeRank, bestPhylum);
+                if (isHgt) ofcall.elementClass = "HGT";
+                out.push_back(std::move(ofcall));
+            } else if (isHgt) {
+                for (size_t i = windowsBefore; i < out.size(); ++i)
+                    out[i].elementClass = "HGT";
+            }
         }
     }
 
@@ -2322,7 +2342,7 @@ hierarchical_call_assembly_multirank(
 
     const auto& global   = TolGlobal::instance();
     const auto& allRefs  = global.all_refs();
-    const int minHierChainAnchors = static_cast<int>(std::max<size_t>(fo.tolMinChainAnchors, 2));
+    const int minHierChainAnchors = static_cast<int>(std::max<size_t>(fo.tolMinChainAnchors, 1));
 
     // Collect all unique rank strings present in the index.
     // kLinnaeanRanks defines the canonical traversal order.
@@ -2483,6 +2503,11 @@ hierarchical_call_assembly_multirank(
                     append_rank_window_calls(name, seq);
                     continue;
                 }
+                if (best) {
+                    size_t windowsBefore = rankCalls.size();
+                    append_rank_window_calls(name, seq);
+                    if (rankCalls.size() != windowsBefore) continue;
+                }
             }
 
             // Path C: OFF_REF novelty scoring with cross-clade HGT detection
@@ -2541,10 +2566,17 @@ hierarchical_call_assembly_multirank(
                     : score_off_ref_novelty(std::max(sameCladeOverlap, otherCladeOverlap));
                 const std::string tier = novelty_tier_name(noveltyTier);
                 if (tier == "NOVEL" || tier == "NOVEL_WEAK" || tier == "DIVERGED") {
-                    auto ofcall = make_offref_call(qAsm, name, seq, tier,
-                                                   bestCladeGc, bestAsmName, bestCladeRank, bestPhylum);
-                    if (isHgt) ofcall.elementClass = "HGT";
-                    rankCalls.push_back(std::move(ofcall));
+                    size_t windowsBefore = rankCalls.size();
+                    append_rank_window_calls(name, seq);
+                    if (rankCalls.size() == windowsBefore) {
+                        auto ofcall = make_offref_call(qAsm, name, seq, tier,
+                                                       bestCladeGc, bestAsmName, bestCladeRank, bestPhylum);
+                        if (isHgt) ofcall.elementClass = "HGT";
+                        rankCalls.push_back(std::move(ofcall));
+                    } else if (isHgt) {
+                        for (size_t i = windowsBefore; i < rankCalls.size(); ++i)
+                            rankCalls[i].elementClass = "HGT";
+                    }
                 }
             }
         }

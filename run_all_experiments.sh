@@ -118,6 +118,13 @@ REAL_HEAVY_SINGLE_REF_CACHE_MB="${REAL_HEAVY_SINGLE_REF_CACHE_MB:-1024}"
 REAL_HEAVY_MAX_REF_MEMORY_MB="${REAL_HEAVY_MAX_REF_MEMORY_MB:-1024}"
 REAL_HEAVY_MAX_ASSEMBLY_QUERY_CONTIGS="${REAL_HEAVY_MAX_ASSEMBLY_QUERY_CONTIGS:-5000}"
 REAL_HEAVY_MAX_ASSEMBLY_QUERY_BP="${REAL_HEAVY_MAX_ASSEMBLY_QUERY_BP:-350000000}"
+# AMF (Gigaspora, Rhizophagus) assemblies are inherently fragmented — public
+# Gigaspora drafts ship with 50–100k+ contigs because the genomes are large
+# (~700 Mbp) and repeat-rich. The default 5000-contig cap was rejecting every
+# AMF query, leaving the panel with a single Rhizophagus assembly. Use a much
+# higher AMF-specific cap so the panel actually exercises >1 query.
+REAL_HEAVY_MAX_ASSEMBLY_QUERY_CONTIGS_AMF="${REAL_HEAVY_MAX_ASSEMBLY_QUERY_CONTIGS_AMF:-200000}"
+REAL_HEAVY_MAX_ASSEMBLY_QUERY_BP_AMF="${REAL_HEAVY_MAX_ASSEMBLY_QUERY_BP_AMF:-1500000000}"
 
 # Timeout used inside run_real_fungal_benchmark.py for individual external
 # tool calls. Keep it at least as large as the assembly benchmark cap so AMF
@@ -336,11 +343,13 @@ if [[ "$EXPERIMENT_TYPE" == "all" || "$EXPERIMENT_TYPE" == "million-real" ]]; th
   fi
   echo ""
 
-  # ── 2b) MycoSV-only benchmark on the held-out queries: indexing was done
-  # ────── in 2a, so reuse that index (no rebuild); skip every algorithmic
-  # ────── comparator (--mycosv-only) so we cleanly exercise indexing →
-  # ────── alignment → SV calling → TE classification → biology candidates
-  # ────── → biology_findings.tsv → novel_mycosv_calls.tsv. Visualization
+  # ── 2b) Benchmark on the held-out queries: indexing was done in 2a, so
+  # ────── reuse that index (no rebuild). Per-mode comparator subset chosen
+  # ────── for bounded wall time (assembly: minigraph+svim_asm, long-reads:
+  # ────── sniffles+cutesv, short-reads: delly). Set MILLION_REAL_MYCOSV_ONLY=1
+  # ────── to skip every comparator and only exercise indexing → alignment →
+  # ────── SV calling → TE classification → biology candidates →
+  # ────── biology_findings.tsv → novel_mycosv_calls.tsv. Visualization
   # ────── (step 4) picks all of these up via MILLION_REAL_DIR scan.
   if [[ "${prepare_million_succeeded}" == "1" \
         && -f "${MILLION_REAL_DIR}/query_manifest.tsv" \
@@ -393,13 +402,27 @@ if [[ "$EXPERIMENT_TYPE" == "all" || "$EXPERIMENT_TYPE" == "million-real" ]]; th
       else
         million_real_readval_support="${MILLION_REAL_READ_VALIDATION_MIN_SUPPORT_READS:-3}"
       fi
+      # Per-mode comparator selection: keep wall time bounded by skipping
+      # the heaviest tool in each mode while still producing real F1 numbers
+      # in exact_benchmark_summary.tsv. Override with MILLION_REAL_MYCOSV_ONLY=1
+      # to fall back to the previous mycosv-only behaviour.
+      million_real_comparator_flags=()
+      if [[ "${MILLION_REAL_MYCOSV_ONLY:-0}" == "1" ]]; then
+        million_real_comparator_flags=(--mycosv-only)
+      else
+        case "${million_real_mode}" in
+          assembly)    million_real_comparator_flags=(--run-minigraph --run-svim-asm) ;;
+          long-reads)  million_real_comparator_flags=(--run-sniffles --run-cutesv) ;;
+          short-reads) million_real_comparator_flags=(--run-delly) ;;
+        esac
+      fi
       bench_cmd=(python3 -u run_real_fungal_benchmark.py benchmark
           --prepared-dir "${MILLION_REAL_DIR}"
           --out-dir "${bench_dir}"
           --mode "${million_real_mode}"
           --threads "${THREADS}"
           --max-clade-genomes "${MILLION_REAL_MAX_CLADE_GENOMES}"
-          --mycosv-only
+          "${million_real_comparator_flags[@]}"
           --reuse-index-dir "${MILLION_REAL_DIR}/index"
           --reuse-registry-dir "${MILLION_REAL_DIR}/registry"
           --read-validation-min-support "${million_real_readval_support}"
@@ -411,6 +434,8 @@ if [[ "$EXPERIMENT_TYPE" == "all" || "$EXPERIMENT_TYPE" == "million-real" ]]; th
           --mycosv-arg="${MILLION_REAL_MAX_REF_MEMORY_MB}"
           --mycosv-arg=--no-flat-ref-fallback
           --mycosv-arg=--no-gfa
+          --mycosv-arg=--tol-min-chain-anchors
+          --mycosv-arg=2
           "${val_flag}")
       if [[ "${million_real_mode}" == "assembly" ]]; then
         bench_cmd+=(
@@ -553,6 +578,18 @@ if [[ "$EXPERIMENT_TYPE" == "all" || "$EXPERIMENT_TYPE" == "real" ]]; then
       mycosv_extra_args=()
       if [[ "${mode}" == "assembly" ]] && [[ ",${HEAVY_COMPARATOR_SKIP_PANELS}," == *",${panel},"* ]]; then
         benchmark_threads="${REAL_HEAVY_ASSEMBLY_THREADS}"
+        # AMF panels need a much looser fragmentation cap because Gigaspora /
+        # Rhizophagus assemblies legitimately have 50–100k+ contigs. Apply the
+        # AMF-specific cap only for amf_large; the other heavy panels (te_rich,
+        # two_speed) keep the tighter default to stop noisy MAG/contaminant
+        # drafts sneaking through.
+        if [[ "${panel}" == "amf_large" ]]; then
+          panel_max_contigs="${REAL_HEAVY_MAX_ASSEMBLY_QUERY_CONTIGS_AMF}"
+          panel_max_bp="${REAL_HEAVY_MAX_ASSEMBLY_QUERY_BP_AMF}"
+        else
+          panel_max_contigs="${REAL_HEAVY_MAX_ASSEMBLY_QUERY_CONTIGS}"
+          panel_max_bp="${REAL_HEAVY_MAX_ASSEMBLY_QUERY_BP}"
+        fi
         mycosv_extra_args=(
           --mycosv-arg=--no-gfa
           --mycosv-arg=--sa-max-contig-mb
@@ -562,13 +599,15 @@ if [[ "$EXPERIMENT_TYPE" == "all" || "$EXPERIMENT_TYPE" == "real" ]]; then
           --mycosv-arg=--max-ref-memory-mb
           --mycosv-arg="${REAL_HEAVY_MAX_REF_MEMORY_MB}"
           --mycosv-arg=--no-flat-ref-fallback
+          --mycosv-arg=--tol-min-chain-anchors
+          --mycosv-arg=2
           --max-assembly-query-contigs
-          "${REAL_HEAVY_MAX_ASSEMBLY_QUERY_CONTIGS}"
+          "${panel_max_contigs}"
           --max-assembly-query-bp
-          "${REAL_HEAVY_MAX_ASSEMBLY_QUERY_BP}"
+          "${panel_max_bp}"
         )
         echo "      [mem] heavy assembly settings: threads=${benchmark_threads}, MycoSV SA contig cap=${REAL_HEAVY_SA_MAX_CONTIG_MB} MB, SA cache=${REAL_HEAVY_SINGLE_REF_CACHE_MB} MB"
-        echo "      [filter] heavy assembly query caps: contigs<=${REAL_HEAVY_MAX_ASSEMBLY_QUERY_CONTIGS}, bp<=${REAL_HEAVY_MAX_ASSEMBLY_QUERY_BP}"
+        echo "      [filter] heavy assembly query caps: contigs<=${panel_max_contigs}, bp<=${panel_max_bp}"
       fi
 
       # Wrap the benchmark invocation in `timeout` so a single slow panel

@@ -17,6 +17,7 @@
 #include <atomic>
 #include <cassert>
 #include <chrono>
+#include <cmath>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -1035,6 +1036,21 @@ static bool is_reads_mode_fragment(size_t qLen,
         return static_cast<long long>(qLen) * 100LL
             < static_cast<long long>(bestRefLen) * 55LL;
     }
+    // Bug-fix (2026-05-12): the old guard only fired at bestOverlap ≥ 0.20,
+    // which left a window 0.05 ≤ overlap < 0.20 where Pass 2 would happily
+    // emit DEL = (qLen − bestRefLen) as a single giant deletion the size of
+    // the entire ref contig. We were seeing 596 kb / 929 kb "DEL" calls
+    // produced this way — they are not deletions, they are pseudo-contigs
+    // covering only a sliver of a much longer reference contig. At low
+    // overlap, also treat the pseudocontig as a fragment whenever it is
+    // far shorter than the matched reference. The 0.55 ratio matches the
+    // high-overlap branch above for consistency.
+    if (bestRefLen > 0 && bestOverlap > 0.0 && bestOverlap < 0.20) {
+        if (static_cast<long long>(qLen) * 100LL
+                < static_cast<long long>(bestRefLen) * 55LL) {
+            return true;
+        }
+    }
     return false;
 }
 
@@ -1683,9 +1699,21 @@ reads_mode_sv_calls(const std::string& qAsm,
         const bool locusSized =
             !is_reads_mode_fragment(seq.size(), bestRefLen, bestOverlap, o, mode);
 
+        // Plausibility guard for Pass 2: even when the pair survives
+        // is_reads_mode_fragment, |delta| should fit within the part of the
+        // ref the pseudocontig could actually shadow. Cap by min(qlen,
+        // bestRefLen): a 1.4 kb pseudocontig cannot legitimately anchor a
+        // 950 kb DEL — that's a partial overlap, not a deletion. Without
+        // this, the kmer-fallback path emits one giant DEL per fragmentary
+        // pseudocontig and dwarfs the real call set.
+        const int spanLimit =
+            (mode == query_input::QueryMode::ASSEMBLY)
+                ? std::numeric_limits<int>::max()
+                : std::max(o.minSvLen, std::min(qlen, bestRefLen));
         if (locusSized &&
             bestOverlap >= 0.05 && std::abs(delta) >= o.minSvLen
-                                 && std::abs(delta) <= o.maxSvLen) {
+                                 && std::abs(delta) <= o.maxSvLen
+                                 && std::abs(delta) <= spanLimit) {
             VariantCallBridge v;
             v.qAsm          = qAsm;
             v.qContig       = contigName;
@@ -2175,6 +2203,82 @@ filter_low_coverage_read_artifacts(std::vector<VariantCallBridge> calls,
     return out;
 }
 
+// ----------------------------------------------------------------------------
+// Low-coverage cosine-similarity genotyper.
+//
+// Even at 1–2× depth, the *pattern* of evidence on the candidate haplotype
+// graph is informative — a HET site has reads supporting both REF and ALT
+// nodes in roughly equal proportion, a HOM_ALT site has reads almost
+// exclusively on ALT nodes, and a REF site has reads almost exclusively on
+// REF nodes. Cosine similarity is invariant to the L2 norm of the vector,
+// which is exactly the depth, so it gives stable genotype calls where a
+// raw allele-balance threshold would flap with one extra read.
+//
+// We do not currently expose per-graph-node coverage to this layer, so
+// the per-call evidence vector is reconstructed from quantities the
+// federated caller already produces:
+//   • fusedPosteriorAlt          → expected ALT mass
+//   • 1 − fusedPosteriorAlt      → expected REF mass
+//   • fusedLayersUsed            → number of supporting observations
+//                                   (treated as how many "graph nodes"
+//                                    contributed evidence, the proxy for
+//                                    the read-vs-haplotype overlap
+//                                    cardinality)
+//
+// Template haplotype patterns at the same dimensionality (REF-mass,
+// ALT-mass, support-cardinality):
+//   REF      = (1, 0, k)       reads land on REF nodes only
+//   HET      = (1, 1, k)       reads land on both
+//   HOM_ALT  = (0, 1, k)       reads land on ALT nodes only
+// where k normalises the cardinality channel; the cosine then collapses
+// to the angle in the (REF, ALT) plane while the support channel stays
+// constant — exactly the "depth-insensitive" behaviour the algorithm
+// note from 2026-05-12 calls for. GQ becomes the cosine margin in dB.
+static void assign_low_coverage_genotype_cosine(
+        std::vector<VariantCallBridge>& calls,
+        const query_input::CoverageReport& report) {
+    if (report.coverageTier != query_input::CoverageTier::LOW || calls.empty())
+        return;
+    auto cos_sim = [](double a0, double a1, double a2,
+                      double b0, double b1, double b2) -> double {
+        const double dot = a0 * b0 + a1 * b1 + a2 * b2;
+        const double na  = std::sqrt(a0 * a0 + a1 * a1 + a2 * a2);
+        const double nb  = std::sqrt(b0 * b0 + b1 * b1 + b2 * b2);
+        if (na <= 0.0 || nb <= 0.0) return 0.0;
+        return dot / (na * nb);
+    };
+    for (auto& c : calls) {
+        const double pAlt = std::min(1.0, std::max(0.0, c.fusedPosteriorAlt));
+        const double pRef = 1.0 - pAlt;
+        // Anchor the support channel at 1.0 so a single-observation call
+        // still contributes a non-zero magnitude on that axis. Without
+        // this floor, the (1,0,0) and (0,1,0) templates fully dominate
+        // and HET is unreachable for layersUsed=0 calls.
+        const double k    = 1.0 + std::min(8.0, static_cast<double>(c.fusedLayersUsed));
+        const double cosRef = cos_sim(pRef, pAlt, k, 1.0, 0.0, k);
+        const double cosHet = cos_sim(pRef, pAlt, k, 1.0, 1.0, k);
+        const double cosHom = cos_sim(pRef, pAlt, k, 0.0, 1.0, k);
+        const char* gt = "0/1";
+        double best = cosHet;
+        double runnerUp = std::max(cosRef, cosHom);
+        if (cosHom >= cosHet && cosHom >= cosRef) {
+            gt = "1/1";
+            best = cosHom;
+            runnerUp = std::max(cosRef, cosHet);
+        } else if (cosRef >= cosHet && cosRef >= cosHom) {
+            gt = "0/0";
+            best = cosRef;
+            runnerUp = std::max(cosHet, cosHom);
+        }
+        c.genotype = gt;
+        // GQ as cosine-margin in dB-style units: clamp to [1, 60] so it
+        // composes with the existing GQ histogram. A flat tie (margin≈0)
+        // becomes GQ≈1; a clean separation (margin≈0.3) becomes ~30.
+        const double margin = std::max(0.0, best - runnerUp);
+        c.gq = std::min(60.0, std::max(1.0, 1.0 + 100.0 * margin));
+    }
+}
+
 // ============================================================
 // Build FederatedOptions from parsed CLI options
 // ============================================================
@@ -2282,7 +2386,7 @@ static void write_vcf_header(std::ostream& out,
         << "##INFO=<ID=MATE_OFFREF,Number=0,Type=Flag,Description=\"Mate breakpoint is off-reference\">\n"
         << "##INFO=<ID=EC,Number=1,Type=String,Description=\"Element class: NONE/REPEAT/TE_LTR/TE_TIR/TE_LINE/TE_SINE/STARSHIP/HGT/RIP\">\n"
         << "##INFO=<ID=QMODE,Number=1,Type=String,Description=\"Query input mode: assembly/long-reads/short-reads\">\n"
-        << "##INFO=<ID=SUPPORT,Number=1,Type=Integer,Description=\"Read support: cluster size for long-reads, min k-mer depth for short-reads; absent for assembly\">\n"
+        << "##INFO=<ID=SUPPORT,Number=1,Type=Integer,Description=\"Call support: assembly anchor count, long-read cluster size, or short-read k-mer/unitig support\">\n"
         << "##INFO=<ID=FUSED_POST,Number=1,Type=Float,Description=\"Posterior alt probability after probabilistic evidence fusion\">\n"
         << "##INFO=<ID=FUSED_LOGODDS,Number=1,Type=Float,Description=\"Log-odds for the alternative allele after evidence fusion\">\n"
         << "##INFO=<ID=FUSED_DEPTH,Number=1,Type=Float,Description=\"Effective depth used by evidence fusion\">\n"
@@ -2290,6 +2394,16 @@ static void write_vcf_header(std::ostream& out,
         << "##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">\n"
         << "##FORMAT=<ID=GQ,Number=1,Type=Float,Description=\"GQ\">\n"
         << "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tSAMPLE\n";
+}
+
+static int effective_call_support(const VariantCallBridge& v) {
+    if (v.readSupport >= 0) return v.readSupport;
+    if (v.queryMode == "assembly") {
+        if (v.anchors > 0) return v.anchors;
+        if (v.fusedLayersUsed > 0) return v.fusedLayersUsed;
+        return 0;
+    }
+    return v.readSupport;
 }
 
 // ============================================================
@@ -2325,7 +2439,8 @@ static void write_vcf_record(std::ostream& out,
         << ";FUSED_LOGODDS=" << std::fixed << std::setprecision(4) << v.fusedLogOddsAlt
         << ";FUSED_DEPTH=" << std::fixed << std::setprecision(3) << v.fusedEffectiveDepth
         << ";FUSED_LAYERS=" << std::max(0, v.fusedLayersUsed);
-    if (v.readSupport >= 0) out << ";SUPPORT=" << v.readSupport;
+    const int support = effective_call_support(v);
+    if (support >= 0) out << ";SUPPORT=" << support;
     if (v.refPos > 0) out << ";REFPOS=" << v.refPos;
     if (v.refEnd > 0) out << ";REFEND=" << v.refEnd;
     if (primaryOffRef) out << ";OFFREF";
@@ -2372,7 +2487,7 @@ static void write_tsv_record(std::ostream& out,
         << '\t' << v.fusedLogOddsAlt
         << '\t' << v.fusedEffectiveDepth
         << '\t' << v.fusedLayersUsed
-        << '\t' << v.readSupport
+        << '\t' << effective_call_support(v)
         << '\n';
 }
 
@@ -2597,6 +2712,10 @@ process_query(const std::string& qAsmPath,
         if (prep.report.mode != query_input::QueryMode::ASSEMBLY) {
             qr.calls = deduplicate_read_mode_events(std::move(qr.calls));
             qr.calls = filter_low_coverage_read_artifacts(std::move(qr.calls), prep.report);
+            // Re-genotype low-coverage reads-mode calls using cosine
+            // similarity over the (REF mass, ALT mass, support cardinality)
+            // template patterns; no-op when coverageTier != LOW.
+            assign_low_coverage_genotype_cosine(qr.calls, prep.report);
         }
     } else {
         // No flat-ref fallback active (--no-flat-ref-fallback + tol-hierarchical).
@@ -2632,6 +2751,10 @@ process_query(const std::string& qAsmPath,
         if (prep.report.mode != query_input::QueryMode::ASSEMBLY) {
             qr.calls = deduplicate_read_mode_events(std::move(qr.calls));
             qr.calls = filter_low_coverage_read_artifacts(std::move(qr.calls), prep.report);
+            // Re-genotype low-coverage reads-mode calls using cosine
+            // similarity over the (REF mass, ALT mass, support cardinality)
+            // template patterns; no-op when coverageTier != LOW.
+            assign_low_coverage_genotype_cosine(qr.calls, prep.report);
         }
     }
 
