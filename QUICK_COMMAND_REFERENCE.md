@@ -191,12 +191,12 @@ python3 --version
 
 ### Verify required packages
 ```bash
-python3 -c "import pytest; import numpy; import scipy; print('✓ All dependencies installed')"
+python3 -c "import pytest; import numpy; import scipy; import pandas; print('✓ All dependencies installed')"
 ```
 
 ### Install missing packages
 ```bash
-pip install pytest numpy scipy
+pip install pytest numpy scipy pandas
 ```
 
 ---

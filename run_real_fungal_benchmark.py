@@ -4,18 +4,23 @@
 from __future__ import annotations
 
 import argparse
+import bisect
 import csv
 import ctypes
 import gzip
 import io
 import json
+import math
 import os
 import random
 import re
 import shutil
+import statistics
 import subprocess
 import sys
+import threading
 import time
+import uuid
 import hashlib
 import urllib.error
 import urllib.parse
@@ -211,7 +216,9 @@ TYPE_CANON = {
 BIOLOGY_FINDINGS_EXTRA_FIELDS = [
     "comparator_support_count",
     "comparator_support_labels",
+    "single_reference_equivalent",
     "mycosv_unique",
+    "evidence_tier",
 ]
 
 READ_VALIDATION_FIELDS = [
@@ -273,6 +280,19 @@ class NormalizedCall:
 
 
 _TOOL_TIMEOUT = int(os.environ.get("MYCOSV_TOOL_TIMEOUT", "14400"))
+# Soft cap applied to subprocess calls inside the per-query comparator runners
+# (minigraph / svim_asm / svim / sniffles / cuteSV / delly / manta / anchorwave
+# / cactus and their shared _minimap2_align_reads helper). Smaller than
+# _TOOL_TIMEOUT so a single hung tool can't eat the whole mode budget when
+# comparators are scheduled in parallel across queries; 45 min was empirically
+# the wall time above which the bench almost always missed its 4 h cap.
+# Override with MYCOSV_COMPARATOR_TIMEOUT (seconds) for long-walltime runs.
+_COMPARATOR_TIMEOUT = int(os.environ.get("MYCOSV_COMPARATOR_TIMEOUT", "2700"))
+_BIOLOGY_TIMEOUT = int(os.environ.get("MYCOSV_BIOLOGY_TIMEOUT", "120"))
+_GENE_ANNOTATION_MAX_BYTES = int(os.environ.get(
+    "MYCOSV_GENE_ANNOTATION_MAX_BYTES",
+    str(512 * 1024 * 1024),
+))
 
 
 def _stderr_tail(exc: BaseException, max_lines: int = 8) -> str:
@@ -521,9 +541,139 @@ def _mycosv_child_memory_limit_bytes() -> int | None:
     return child_limit
 
 
-def run_mycosv_command(cmd: list[str], cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
+def _stream_subprocess_to_files(
+    cmd: list[str],
+    *,
+    cwd: Path | None,
+    timeout: int,
+    stdout_path: Path,
+    stderr_path: Path,
+    memory_limit_bytes: int | None,
+) -> subprocess.CompletedProcess[str]:
+    """Run `cmd` with stdout/stderr piped DIRECTLY to disk files (not
+    buffered in Python memory), so `tail -f stderr_path` shows live
+    progress and a slurm time-out leaves a real log instead of an empty
+    one.  Returns a CompletedProcess whose stdout/stderr fields contain the
+    final on-disk tail (so existing callers that scan `result.stderr` for
+    error patterns continue to work). On timeout, kills the process group
+    and re-raises subprocess.TimeoutExpired with the same tail attached.
+    """
+    stdout_path.parent.mkdir(parents=True, exist_ok=True)
+    stderr_path.parent.mkdir(parents=True, exist_ok=True)
+    preexec_fn = None
+    if memory_limit_bytes and memory_limit_bytes > 0 and os.name != "nt":
+        def _limit_child() -> None:
+            try:
+                import resource
+                resource.setrlimit(
+                    resource.RLIMIT_AS,
+                    (memory_limit_bytes, memory_limit_bytes),
+                )
+            except Exception:
+                pass
+            try:
+                os.setsid()
+            except Exception:
+                pass
+        preexec_fn = _limit_child
+    elif os.name != "nt":
+        def _new_session() -> None:
+            try:
+                os.setsid()
+            except Exception:
+                pass
+        preexec_fn = _new_session
+
+    def _tail(path: Path, n: int = 400) -> str:
+        try:
+            with path.open("rb") as fh:
+                fh.seek(0, os.SEEK_END)
+                size = fh.tell()
+                read = min(size, 64 * 1024)
+                fh.seek(size - read)
+                data = fh.read(read).decode("utf-8", errors="replace")
+        except OSError:
+            return ""
+        lines = data.splitlines()
+        return "\n".join(lines[-n:])
+
+    with stdout_path.open("wb") as out_fh, stderr_path.open("wb") as err_fh:
+        proc = subprocess.Popen(
+            cmd,
+            cwd=str(cwd) if cwd else None,
+            stdout=out_fh,
+            stderr=err_fh,
+            preexec_fn=preexec_fn,
+        )
+        try:
+            rc = proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            # Try graceful SIGTERM to the process group, then SIGKILL.
+            try:
+                if os.name != "nt":
+                    os.killpg(os.getpgid(proc.pid), 15)
+                else:
+                    proc.terminate()
+            except Exception:
+                pass
+            try:
+                proc.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                try:
+                    if os.name != "nt":
+                        os.killpg(os.getpgid(proc.pid), 9)
+                    else:
+                        proc.kill()
+                except Exception:
+                    pass
+                proc.wait()
+            tail_err = _tail(stderr_path)
+            tail_out = _tail(stdout_path)
+            sys.stderr.write(
+                f"[mycosv] streamed subprocess timed out after {timeout}s — "
+                f"killed via SIGKILL. Stderr tail at {stderr_path}:\n"
+            )
+            for line in tail_err.splitlines()[-40:]:
+                sys.stderr.write(f"  {line}\n")
+            raise subprocess.TimeoutExpired(
+                cmd=cmd, timeout=timeout, output=tail_out, stderr=tail_err,
+            )
+
+    stdout_text = _tail(stdout_path, n=2000)
+    stderr_text = _tail(stderr_path, n=2000)
+    if rc != 0:
+        raise subprocess.CalledProcessError(rc, cmd, stdout_text, stderr_text)
+    return subprocess.CompletedProcess(cmd, rc, stdout_text, stderr_text)
+
+
+def run_mycosv_command(
+    cmd: list[str],
+    cwd: Path | None = None,
+    *,
+    stream_stdout_path: Path | None = None,
+    stream_stderr_path: Path | None = None,
+) -> subprocess.CompletedProcess[str]:
     _preflight_memory_check(cmd)
     try:
+        if stream_stdout_path is not None and stream_stderr_path is not None:
+            # Stream mode: stdout/stderr go straight to disk so the operator
+            # can `tail -f` the log and see whether MycoSV is alive or stuck
+            # on a specific query. This is the fix for "the benchmark looks
+            # hung but is actually working" — subprocess.run with capture_output
+            # buffers all bytes until exit, which made any long per-query
+            # routing/loading silently invisible.
+            sys.stderr.write(
+                f"[mycosv] streaming stderr -> {stream_stderr_path}\n"
+                f"[mycosv]   `tail -f {stream_stderr_path}` to watch live\n"
+            )
+            return _stream_subprocess_to_files(
+                cmd,
+                cwd=cwd,
+                timeout=_TOOL_TIMEOUT,
+                stdout_path=stream_stdout_path,
+                stderr_path=stream_stderr_path,
+                memory_limit_bytes=_mycosv_child_memory_limit_bytes(),
+            )
         return run(cmd, cwd=cwd, memory_limit_bytes=_mycosv_child_memory_limit_bytes())
     except subprocess.CalledProcessError as exc:
         # Surface SIGKILL as an OOM signal rather than a generic exit code.
@@ -655,10 +805,59 @@ _HTTP_RETRY_STATUS = {429, 500, 502, 503, 504}
 _HTTP_MAX_ATTEMPTS = 8
 _HTTP_BACKOFF_BASE = 2.0
 _HTTP_BACKOFF_CAP  = 90.0
-# Max workers for ftp.ncbi.nlm.nih.gov — they tolerate ~8 concurrent streams
-# from a single client comfortably, but 16 (the previous default) was the
-# proximate cause of the 503 storm seen in 2026-05-06's run.
-_HTTP_MAX_PARALLEL_FTP_NCBI = 8
+# Max workers for ftp.ncbi.nlm.nih.gov. 8 was the prior default but the
+# 2026-05-15 prep run (slurm-14936460) still saw a sustained 503 storm —
+# hundreds of [retry] lines, multiple URLs climbing to attempt 4/8. Dropping
+# to 6 + the per-host semaphore/cooldown below keeps GFF throughput close to
+# the 8-worker run while staying inside NCBI's well-behaved client window.
+_HTTP_MAX_PARALLEL_FTP_NCBI = 6
+
+# Hosts we treat as a single overloadable resource. When a 503/429 fires on
+# any of these, every other in-flight request to the same host pauses for a
+# short cooldown so workers stop hammering the same throttled pool in
+# lockstep. ftp.ncbi.nlm.nih.gov is the only one that bursts in practice; the
+# tuple shape keeps it cheap to add ENA/Ensembl if they ever start throttling.
+_THROTTLED_HOSTS: tuple[str, ...] = ("ftp.ncbi.nlm.nih.gov",)
+_NCBI_HOST_SEM = threading.BoundedSemaphore(_HTTP_MAX_PARALLEL_FTP_NCBI)
+_NCBI_COOLDOWN_LOCK = threading.Lock()
+_NCBI_COOLDOWN_UNTIL = 0.0  # monotonic deadline; 0 means no cooldown active
+# How long a 503/429 blocks every NCBI request. Floor at 3 s (NCBI's
+# throttle window is short) and let server-supplied Retry-After lengthen it
+# up to the backoff cap.
+_NCBI_COOLDOWN_MIN_SECONDS = 3.0
+
+
+def _request_throttle_host(req: urllib.request.Request) -> str | None:
+    """Return the throttled host for ``req``, or None if no throttle applies."""
+    try:
+        host = (req.host or "").lower()
+    except AttributeError:
+        host = ""
+    if not host:
+        return None
+    for throttled in _THROTTLED_HOSTS:
+        if host == throttled or host.endswith("." + throttled):
+            return throttled
+    return None
+
+
+def _wait_for_ncbi_cooldown() -> None:
+    deadline = _NCBI_COOLDOWN_UNTIL
+    if deadline <= 0.0:
+        return
+    remaining = deadline - time.monotonic()
+    if remaining > 0:
+        time.sleep(remaining)
+
+
+def _trigger_ncbi_cooldown(seconds: float) -> None:
+    if seconds <= 0:
+        return
+    global _NCBI_COOLDOWN_UNTIL
+    with _NCBI_COOLDOWN_LOCK:
+        new_deadline = time.monotonic() + seconds
+        if new_deadline > _NCBI_COOLDOWN_UNTIL:
+            _NCBI_COOLDOWN_UNTIL = new_deadline
 
 
 def _http_retry_sleep(attempt: int, retry_after: str | None) -> float:
@@ -681,33 +880,55 @@ def _http_retry_sleep(attempt: int, retry_after: str | None) -> float:
 def _http_open_with_retry(req: urllib.request.Request):
     """Open `req` with retry-on-transient-error.  Returns the urlopen response;
     caller is responsible for closing it (use as a context manager)."""
+    throttled_host = _request_throttle_host(req)
     last_exc: Exception | None = None
     for attempt in range(_HTTP_MAX_ATTEMPTS):
+        # Honor the shared cooldown before every attempt, including the first:
+        # a worker that arrives after another worker already tripped 503 should
+        # not immediately retry into the same overload window.
+        if throttled_host is not None:
+            _wait_for_ncbi_cooldown()
+            _NCBI_HOST_SEM.acquire()
+        # pending_sleep is the backoff we should sleep AFTER releasing the
+        # semaphore — keeping the sleep outside the host-limited region means
+        # the semaphore caps in-flight requests, not idle-waiting workers.
+        pending_sleep: float = 0.0
         try:
-            return urllib.request.urlopen(req, timeout=_HTTP_TIMEOUT)
-        except urllib.error.HTTPError as exc:
-            if exc.code not in _HTTP_RETRY_STATUS or attempt == _HTTP_MAX_ATTEMPTS - 1:
-                raise
-            retry_after = exc.headers.get("Retry-After") if exc.headers else None
-            wait = _http_retry_sleep(attempt, retry_after)
-            sys.stderr.write(
-                f"[retry] HTTP {exc.code} for {req.full_url}; sleeping {wait:.1f}s "
-                f"(attempt {attempt + 1}/{_HTTP_MAX_ATTEMPTS})\n"
-            )
-            sys.stderr.flush()
-            time.sleep(wait)
-            last_exc = exc
-        except (urllib.error.URLError, TimeoutError) as exc:
-            if attempt == _HTTP_MAX_ATTEMPTS - 1:
-                raise
-            wait = _http_retry_sleep(attempt, None)
-            sys.stderr.write(
-                f"[retry] network error for {req.full_url}: {exc}; "
-                f"sleeping {wait:.1f}s (attempt {attempt + 1}/{_HTTP_MAX_ATTEMPTS})\n"
-            )
-            sys.stderr.flush()
-            time.sleep(wait)
-            last_exc = exc
+            try:
+                return urllib.request.urlopen(req, timeout=_HTTP_TIMEOUT)
+            except urllib.error.HTTPError as exc:
+                if exc.code not in _HTTP_RETRY_STATUS or attempt == _HTTP_MAX_ATTEMPTS - 1:
+                    raise
+                retry_after = exc.headers.get("Retry-After") if exc.headers else None
+                wait = _http_retry_sleep(attempt, retry_after)
+                # 503/429 means NCBI is throttling our IP — pause every other
+                # worker for the longer of the per-request backoff and a 3 s
+                # floor so the server-side window can clear.
+                if throttled_host is not None and exc.code in {429, 503}:
+                    _trigger_ncbi_cooldown(max(wait, _NCBI_COOLDOWN_MIN_SECONDS))
+                sys.stderr.write(
+                    f"[retry] HTTP {exc.code} for {req.full_url}; sleeping {wait:.1f}s "
+                    f"(attempt {attempt + 1}/{_HTTP_MAX_ATTEMPTS})\n"
+                )
+                sys.stderr.flush()
+                pending_sleep = wait
+                last_exc = exc
+            except (urllib.error.URLError, TimeoutError) as exc:
+                if attempt == _HTTP_MAX_ATTEMPTS - 1:
+                    raise
+                wait = _http_retry_sleep(attempt, None)
+                sys.stderr.write(
+                    f"[retry] network error for {req.full_url}: {exc}; "
+                    f"sleeping {wait:.1f}s (attempt {attempt + 1}/{_HTTP_MAX_ATTEMPTS})\n"
+                )
+                sys.stderr.flush()
+                pending_sleep = wait
+                last_exc = exc
+        finally:
+            if throttled_host is not None:
+                _NCBI_HOST_SEM.release()
+        if pending_sleep > 0:
+            time.sleep(pending_sleep)
     # Unreachable: the final attempt either returns or raises above.
     assert last_exc is not None
     raise last_exc
@@ -724,10 +945,13 @@ def http_get_text_cached(url: str, cache_path: Path) -> str:
     if cache_path.exists() and cache_path.stat().st_size > 0:
         return cache_path.read_text(encoding="utf-8")
     text = http_get_text(url)
-    tmp = cache_path.with_suffix(cache_path.suffix + ".part")
+    # See http_download for the rationale on the per-process tmp suffix.
+    tmp = cache_path.with_suffix(
+        cache_path.suffix + f".part.{os.getpid()}.{uuid.uuid4().hex[:8]}"
+    )
     try:
         tmp.write_text(text, encoding="utf-8")
-        tmp.rename(cache_path)
+        os.replace(tmp, cache_path)
     except Exception:
         if tmp.exists():
             tmp.unlink()
@@ -740,7 +964,15 @@ def http_download(url: str, dest: Path) -> Path:
     if dest.exists() and dest.stat().st_size > 0:
         return dest
     req = urllib.request.Request(url, headers={"User-Agent": "MycoSV-real-benchmark/1.0"})
-    tmp = dest.with_suffix(dest.suffix + ".part")
+    # Per-process tmp suffix: when two concurrent runs share a data_cache and
+    # both download the same Ensembl GFF (one Ensembl record can back many NCBI
+    # accessions), a static `.part` collides. The first rename wins, the second
+    # then sees its `.part` gone and crashes with FileNotFoundError mid-rename,
+    # killing the whole prepare step. Salting with PID+rand makes each writer's
+    # tmp file private; the cache-hit guard above keeps races from re-downloading.
+    tmp = dest.with_suffix(
+        dest.suffix + f".part.{os.getpid()}.{uuid.uuid4().hex[:8]}"
+    )
     try:
         with _http_open_with_retry(req) as resp, tmp.open("wb") as out:
             content_length = resp.getheader("Content-Length")
@@ -762,7 +994,10 @@ def http_download(url: str, dest: Path) -> Path:
                     raise IOError(
                         f"Truncated download for {url}: got {got} bytes, expected {expected}"
                     )
-        tmp.rename(dest)
+        # os.replace is atomic and overwrites if a concurrent writer already
+        # finished and published the same dest — both writers end up with a
+        # valid file at dest, and neither raises.
+        os.replace(tmp, dest)
     except Exception:
         if tmp.exists():
             tmp.unlink()
@@ -867,21 +1102,33 @@ def cap_read_query_inputs(
     mode: str,
     max_short_reads: int,
     max_long_reads: int,
+    *,
+    mycosv_use_full_reads: bool = False,
 ) -> list[dict[str, str]]:
-    if mode not in {"short-reads", "long-reads"}:
-        return query_manifest
-    max_records = max_long_reads if mode == "long-reads" else max_short_reads
-    if max_records <= 0:
+    if mode not in {"auto", "short-reads", "long-reads"}:
         return query_manifest
 
     capped_rows: list[dict[str, str]] = []
     subset_dir = out_dir / "read_subsets"
     for row in query_manifest:
+        row_mode = mode if mode in {"short-reads", "long-reads"} else (row.get("query_mode") or "assembly")
+        if row_mode not in {"short-reads", "long-reads"}:
+            capped_rows.append(row)
+            continue
+        max_records = max_long_reads if row_mode == "long-reads" else max_short_reads
+        if max_records <= 0:
+            capped_rows.append(row)
+            continue
         original = locate_query_path(row)
         if sequence_kind_from_name(original.name) != "fastq":
             capped_rows.append(row)
             continue
-        dest = subset_dir / f"{normalize_name(row.get('query_asm', original.stem))}.{max_records}.fastq"
+        # Keep the bounded copy name stable and sample-like. Both MycoSV and
+        # the external comparators use this bounded FASTQ by default; otherwise
+        # million-real short-read runs can hand MycoSV multi-GB public FASTQs
+        # while comparators see tiny subsets, causing hour-scale stalls,
+        # cgroup kills, and empty calls.vcf files.
+        dest = subset_dir / f"{normalize_name(row.get('query_asm', original.stem))}.fastq"
         try:
             capped_path, kept, capped = subset_fastq_records(original, dest, max_records)
         except Exception as exc:
@@ -893,10 +1140,12 @@ def cap_read_query_inputs(
             continue
         new_row = dict(row)
         new_row["path"] = str(capped_path)
+        if mycosv_use_full_reads:
+            new_row["mycosv_path"] = str(original)
         capped_rows.append(new_row)
         if capped:
             sys.stderr.write(
-                f"[reads-mode] comparator input capped for "
+                f"[reads-mode] benchmark input capped for "
                 f"{row.get('query_asm', original.name)}: {kept} reads -> {capped_path}\n"
             )
     return capped_rows
@@ -985,6 +1234,147 @@ def fasta_contig_names(fasta_path: Path) -> frozenset[str]:
     frozen = frozenset(contigs)
     _FASTA_CONTIG_CACHE[key] = frozen
     return frozen
+
+
+INPUT_PREFLIGHT_FIELDS = [
+    "role", "query_asm", "path", "expected_format", "status", "reason",
+]
+
+
+def _preflight_sequence_file(path: Path, expected_format: str) -> tuple[bool, str]:
+    """Cheaply verify that a FASTA/FASTQ path exists, is readable, and starts
+    like the format the benchmark will hand to MycoSV/comparators.
+
+    This intentionally reads only the first record. It catches corrupt cached
+    gzip payloads and manifest/path mixups before the expensive MycoSV and
+    comparator launches allocate large reference/query indexes.
+    """
+    if not path.exists():
+        return False, "missing"
+    try:
+        if path.stat().st_size == 0:
+            return False, "empty"
+    except OSError as exc:
+        return False, f"stat_failed:{type(exc).__name__}"
+
+    try:
+        with open_text_auto(path) as fh:
+            if expected_format in {"fastq", "fastq_or_fasta"}:
+                header = fh.readline()
+                if expected_format == "fastq_or_fasta" and header.startswith(">"):
+                    saw_sequence = False
+                    for i, line in enumerate(fh):
+                        if i > 10000:
+                            break
+                        if line.startswith(">"):
+                            if saw_sequence:
+                                break
+                            continue
+                        if line.strip():
+                            saw_sequence = True
+                            break
+                    return (True, "ok") if saw_sequence else (False, "fasta_sequence_missing")
+                seq = fh.readline()
+                plus = fh.readline()
+                qual = fh.readline()
+                if not header:
+                    return False, "no_fastq_record"
+                if not header.startswith("@"):
+                    return False, "fastq_header_not_at"
+                if not seq.strip():
+                    return False, "fastq_empty_sequence"
+                if not plus.startswith("+"):
+                    return False, "fastq_plus_line_missing"
+                if not qual:
+                    return False, "fastq_quality_missing"
+                return True, "ok"
+
+            # FASTA: allow comments/blank preamble, but require one header and
+            # at least one sequence line so gzip errors surface immediately.
+            saw_header = False
+            saw_sequence = False
+            for i, line in enumerate(fh):
+                if i > 10000:
+                    break
+                stripped = line.strip()
+                if not stripped or stripped.startswith(";"):
+                    continue
+                if stripped.startswith(">"):
+                    saw_header = True
+                    continue
+                if saw_header:
+                    saw_sequence = True
+                    break
+            if not saw_header:
+                return False, "fasta_header_missing"
+            if not saw_sequence:
+                return False, "fasta_sequence_missing"
+            return True, "ok"
+    except (OSError, EOFError, gzip.BadGzipFile, UnicodeError) as exc:
+        return False, f"read_failed:{type(exc).__name__}"
+
+
+def preflight_benchmark_inputs(
+    query_manifest: list[dict[str, str]],
+    out_dir: Path,
+    mode: str,
+) -> list[dict[str, str]]:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    rows: list[dict[str, str]] = []
+    seen_refs: set[str] = set()
+    query_expected = "fastq_or_fasta" if mode in {"auto", "short-reads", "long-reads"} else "fasta"
+
+    def add(role: str, query_asm: str, raw_path: str, expected_format: str) -> None:
+        path = Path(raw_path)
+        ok, reason = _preflight_sequence_file(path, expected_format)
+        rows.append({
+            "role": role,
+            "query_asm": query_asm,
+            "path": str(path),
+            "expected_format": expected_format,
+            "status": "ok" if ok else "fail",
+            "reason": reason,
+        })
+
+    for row in query_manifest:
+        query_asm = row.get("query_asm", ".")
+        query_path = (row.get("mycosv_path") or row.get("path") or "").strip()
+        if query_path:
+            add("query", query_asm, query_path, query_expected)
+        else:
+            rows.append({
+                "role": "query",
+                "query_asm": query_asm,
+                "path": "",
+                "expected_format": query_expected,
+                "status": "fail",
+                "reason": "missing_manifest_path",
+            })
+        bench_ref = (row.get("benchmark_ref_fasta") or "").strip()
+        if bench_ref and bench_ref != "." and bench_ref not in seen_refs:
+            seen_refs.add(bench_ref)
+            add("benchmark_ref", query_asm, bench_ref, "fasta")
+
+    write_tsv(out_dir / "INPUT_PREFLIGHT.tsv", rows, INPUT_PREFLIGHT_FIELDS)
+    failed = [r for r in rows if r["status"] != "ok"]
+    if failed:
+        marker = out_dir / "INPUT_PREFLIGHT_FAILED.txt"
+        marker.write_text(
+            "Benchmark input preflight failed before launching expensive "
+            "MycoSV/comparator work. See INPUT_PREFLIGHT.tsv for paths and "
+            "reasons. Remove corrupt cached files or fix query_manifest.tsv, "
+            "then rerun using --reuse-index-dir when applicable.\n",
+            encoding="utf-8",
+        )
+        examples = "; ".join(
+            f"{r['role']}:{r['query_asm']}:{r['reason']}"
+            for r in failed[:5]
+        )
+        raise ValueError(
+            f"Benchmark input preflight failed for {len(failed)} file(s): {examples}. "
+            f"Details: {out_dir / 'INPUT_PREFLIGHT.tsv'}"
+        )
+    return rows
 
 
 def write_public_resource_links(path: Path) -> None:
@@ -1517,6 +1907,19 @@ def _ensembl_fungi_gff_url(
     assembly = (rec.get("assembly") or "").strip()
     if not species_dir or not assembly:
         return None
+    # The species TSV occasionally records `assembly` values with embedded
+    # whitespace ("version 1", "CBS 141442 assembly", "Neocallimastix sp. G1
+    # v1.0"). Those map to filenames Ensembl publishes with spaces collapsed to
+    # underscores; passing the raw string would also produce a urllib request
+    # that fails with "URL can't contain control characters" *before* the HTTP
+    # call is even attempted. Sanitise both URL path components defensively.
+    def _safe(part: str) -> str:
+        # Collapse any run of whitespace to a single underscore — matches the
+        # actual filenames Ensembl serves and dodges the urllib pre-flight check.
+        return re.sub(r"\s+", "_", part)
+
+    species_dir = _safe(species_dir)
+    assembly = _safe(assembly)
     # The whole-genome GFF filename is "<Species_Cap>.<assembly>.<release>.gff3.gz".
     # Capitalize only the first character (Ensembl convention: do NOT title-case
     # each word — strain suffixes like "_cen_pk113_7d_gca_000269885" must stay
@@ -2086,6 +2489,73 @@ def write_mycosv_failure_outputs(out_prefix: Path, reason: str) -> dict[str, str
     }], MYCOSV_HITS_FIELDS)
     gfa_path.write_text(f"H\tVN:Z:1.0\tST:Z:MYCOSV_FAILED\tRS:Z:{safe_reason}\n", encoding="utf-8")
     return {"vcf": str(vcf_path), "hits": str(hits_path), "gfa": str(gfa_path)}
+
+
+def snapshot_mycosv_outputs(out_prefix: Path) -> dict[Path, bytes]:
+    """Keep prior MycoSV artifacts in memory before a rerun truncates them.
+
+    The C++ binary streams directly to calls.vcf/calls.hits.tsv/calls.gfa. If a
+    rerun is killed mid-write, the old successful callset used to be lost and
+    replaced by a partial or failure-header file. These artifacts are small
+    enough for the real-data benchmark panels, and preserving them makes failed
+    reruns diagnosable instead of destructive.
+    """
+    snapshots: dict[Path, bytes] = {}
+    for path in (
+        out_prefix.with_suffix(".vcf"),
+        out_prefix.with_suffix(".hits.tsv"),
+        out_prefix.with_suffix(".gfa"),
+        out_prefix.parent / (out_prefix.name + ".multisample.vcf"),
+    ):
+        if path.exists() and path.is_file() and path.stat().st_size > 0:
+            snapshots[path] = path.read_bytes()
+    return snapshots
+
+
+def restore_mycosv_outputs(snapshots: dict[Path, bytes]) -> None:
+    for path, payload in snapshots.items():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(payload)
+
+
+def vcf_data_record_count(path: Path) -> int:
+    if not path.exists() or not path.is_file() or path.stat().st_size == 0:
+        return 0
+    n = 0
+    try:
+        with open_text_auto(path) as fh:
+            for line in fh:
+                if line.strip() and not line.startswith("#"):
+                    n += 1
+    except OSError:
+        return 0
+    return n
+
+
+def promote_hierarchical_checkpoint(out_prefix: Path) -> dict[str, str] | None:
+    """Use completed per-contig checkpoint output as the canonical callset.
+
+    A long panel can be killed after hierarchical_call_assembly has flushed
+    thousands of per-contig calls but before the final calls.vcf is complete.
+    In that case the checkpoint is the best available pangenome caller output
+    and should feed the benchmark/reporting layers instead of a stale or empty
+    canonical VCF.
+    """
+    hier_vcf = out_prefix.parent / (out_prefix.name + ".hierarchical.vcf")
+    hier_hits = out_prefix.parent / (out_prefix.name + ".hierarchical.hits.tsv")
+    if vcf_data_record_count(hier_vcf) == 0:
+        return None
+    canonical_vcf = out_prefix.with_suffix(".vcf")
+    canonical_hits = out_prefix.with_suffix(".hits.tsv")
+    canonical_vcf.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(hier_vcf, canonical_vcf)
+    if hier_hits.exists() and hier_hits.stat().st_size > 0:
+        shutil.copy2(hier_hits, canonical_hits)
+    return {
+        "vcf": str(canonical_vcf),
+        "hits": str(canonical_hits),
+        "gfa": str(out_prefix.with_suffix(".gfa")),
+    }
 
 
 _GFF_GENE_TYPES: frozenset[str] = frozenset({
@@ -3630,11 +4100,188 @@ def prepare_from_ncbi(args: argparse.Namespace) -> int:
 
 
 def load_query_manifest(path: Path) -> list[dict[str, str]]:
+    # Surface a clear, actionable error when the manifest is missing — the raw
+    # FileNotFoundError used to bubble up from `path.open()` deep in benchmark()
+    # with no hint that the upstream `prepare` step never finished (e.g. another
+    # job partially cleaned the prepared dir, or the user pointed --prepared-dir
+    # at the wrong place).
+    if not path.exists():
+        raise FileNotFoundError(
+            f"query_manifest.tsv not found at {path}. The prepared directory is "
+            f"incomplete or was never populated by the `prepare` sub-command. "
+            f"Re-run prepare against {path.parent} before benchmarking."
+        )
     rows: list[dict[str, str]] = []
     with path.open() as fh:
         for row in csv.DictReader(fh, delimiter="\t"):
             rows.append({k: (v or "").strip() for k, v in row.items()})
     return rows
+
+
+def _normalise_query_group_token(token: str) -> str:
+    t = re.sub(r"[^a-z0-9]+", "", (token or "").lower())
+    aliases = {
+        "penciliium": "penicillium",
+        "penicilium": "penicillium",
+        "mychrrzia": "mycorrhiza",
+        "mychrrhiza": "mycorrhiza",
+        "mycorrhzia": "mycorrhiza",
+        "trichderma": "trichoderma",
+        "trichdermia": "trichoderma",
+    }
+    return aliases.get(t, t)
+
+
+def _query_row_taxon_blob(row: dict[str, str]) -> str:
+    fields = (
+        "phylum", "class", "order", "family", "genus", "species",
+        "query_asm", "path", "benchmark_ref_asm", "benchmark_ref_fasta",
+        "lifestyle", "architecture",
+    )
+    return " ".join((row.get(f) or "") for f in fields).lower()
+
+
+def select_one_query_per_group(
+    query_manifest: list[dict[str, str]],
+    group_spec: str,
+    out_dir: Path,
+    hierarchy_manifest: Path | None = None,
+) -> list[dict[str, str]]:
+    requested = [
+        _normalise_query_group_token(tok)
+        for tok in re.split(r"[,;\s]+", group_spec or "")
+        if tok.strip()
+    ]
+    if not requested:
+        return query_manifest
+
+    def matches(row: dict[str, str], target: str) -> bool:
+        blob = _query_row_taxon_blob(row)
+        compact = re.sub(r"[^a-z0-9]+", "", blob)
+        if target == "mycorrhiza":
+            return any(term in compact for term in (
+                "mycorrhiza", "mycorrhizal", "rhizophagus", "glomus",
+                "glomeromycotina", "glomeromycetes", "arbuscular"
+            ))
+        return target in compact
+
+    def hierarchy_rows() -> list[dict[str, str]]:
+        if hierarchy_manifest is None or not hierarchy_manifest.exists():
+            return []
+        rows: list[dict[str, str]] = []
+        with hierarchy_manifest.open() as fh:
+            for line in fh:
+                line = line.rstrip("\n")
+                if not line or line.startswith("#"):
+                    continue
+                cols = line.split("\t")
+                if len(cols) < 9:
+                    continue
+                rows.append({
+                    "asm": cols[0], "phylum": cols[1], "class": cols[2],
+                    "order": cols[3], "family": cols[4], "genus": cols[5],
+                    "species": cols[6], "rank": cols[7], "path": cols[8],
+                })
+        return rows
+
+    hrows = hierarchy_rows()
+
+    def synthesize_from_hierarchy(target: str) -> dict[str, str] | None:
+        candidates = [r for r in hrows if r.get("rank") == "species" and matches(r, target)]
+        if not candidates:
+            return None
+        q = candidates[0]
+        ref = next(
+            (r for r in candidates[1:] if r.get("asm") != q.get("asm")),
+            None,
+        )
+        if ref is None:
+            ref = next(
+                (r for r in hrows
+                 if r.get("rank") == "species"
+                 and r.get("asm") != q.get("asm")
+                 and r.get("genus") == q.get("genus")),
+                None,
+            )
+        if ref is None:
+            ref = next(
+                (r for r in hrows
+                 if r.get("rank") == "species"
+                 and r.get("asm") != q.get("asm")
+                 and r.get("family") == q.get("family")),
+                None,
+            )
+        ref = ref or q
+        return {
+            "query_asm": q.get("asm", ""),
+            "query_mode": "assembly",
+            "path": q.get("path", ""),
+            "scenario": "million_real_group_target",
+            "lifestyle": ".",
+            "architecture": ".",
+            "benchmark_ref_asm": ref.get("asm", "."),
+            "benchmark_ref_fasta": ref.get("path", "."),
+            "phylum": q.get("phylum", "."),
+            "class": q.get("class", "."),
+            "order": q.get("order", "."),
+            "family": q.get("family", "."),
+            "genus": q.get("genus", "."),
+            "species": q.get("species", "."),
+            "source": "hierarchy_manifest_group_target",
+            "instrument_platform": ".",
+            "library_layout": ".",
+            "run_accession": ".",
+        }
+
+    selected: list[dict[str, str]] = []
+    selected_ids: set[str] = set()
+    report_rows: list[dict[str, str]] = []
+    for target in requested:
+        row = next((r for r in query_manifest if matches(r, target)), None)
+        status = "found_query_manifest"
+        if row is None:
+            row = synthesize_from_hierarchy(target)
+            status = "synthesized_from_hierarchy"
+        if row is None:
+            report_rows.append({
+                "requested_group": target, "status": "missing",
+                "query_asm": ".", "genus": ".", "species": ".", "path": ".",
+            })
+            continue
+        qid = row.get("query_asm") or row.get("path") or repr(row)
+        if qid not in selected_ids:
+            selected_ids.add(qid)
+            selected.append(row)
+        report_rows.append({
+            "requested_group": target, "status": status,
+            "query_asm": row.get("query_asm", "."),
+            "genus": row.get("genus", "."),
+            "species": row.get("species", "."),
+            "path": row.get("path", "."),
+        })
+
+    report = out_dir / "REQUESTED_QUERY_GROUPS.tsv"
+    write_tsv(report, report_rows, [
+        "requested_group", "status", "query_asm", "genus", "species", "path",
+    ])
+    missing = [r["requested_group"] for r in report_rows if r["status"] == "missing"]
+    if missing:
+        sys.stderr.write(
+            "[benchmark] requested query group(s) absent from query_manifest.tsv "
+            f"and hierarchy_manifest.tsv: {', '.join(missing)}\n"
+        )
+    if selected:
+        sys.stderr.write(
+            "[benchmark] selected one query per requested group where available "
+            "(query_manifest first, hierarchy_manifest fallback): "
+            f"{len(selected)} of {len(requested)} group(s); report={report}\n"
+        )
+        return selected
+    sys.stderr.write(
+        "[benchmark] none of the requested query groups were present; keeping "
+        "the mode-matched query manifest unchanged.\n"
+    )
+    return query_manifest
 
 
 def parse_info_field(field: str) -> dict[str, str]:
@@ -3729,6 +4376,8 @@ def load_mycosv_query_calls(vcf_path: Path, query_asm: str) -> list[NormalizedCa
             if not line.strip() or line.startswith("#"):
                 continue
             fields = line.rstrip("\n").split("\t")
+            if len(fields) < 8:
+                continue
             info = parse_info_field(fields[7])
             if not qasm_matches_observed(query_asm, info.get("QASM", "")):
                 continue
@@ -3758,6 +4407,259 @@ def load_mycosv_query_calls(vcf_path: Path, query_asm: str) -> list[NormalizedCa
                 mate_end=mate_end,
             ))
     return rows
+
+
+def fasta_bp_and_contigs(path: Path | None) -> tuple[int, int]:
+    if path is None or not path.exists():
+        return 0, 0
+    total_bp = 0
+    contigs = 0
+    with open_text_auto(path) as fh:
+        for line in fh:
+            if line.startswith(">"):
+                contigs += 1
+            else:
+                total_bp += len(line.strip())
+    return total_bp, contigs
+
+
+def sequence_bp_and_records(path: Path | None) -> tuple[int, int]:
+    if path is None or not path.exists():
+        return 0, 0
+    if sequence_kind_from_name(path.name) == "fastq":
+        total_bp = 0
+        records = 0
+        with open_text_auto(path) as fh:
+            while True:
+                header = fh.readline()
+                if not header:
+                    break
+                seq = fh.readline()
+                plus = fh.readline()
+                qual = fh.readline()
+                if not qual:
+                    break
+                total_bp += len(seq.strip())
+                records += 1
+        return total_bp, records
+    return fasta_bp_and_contigs(path)
+
+
+def mycosv_qasm_counts(vcf_path: Path) -> tuple[dict[str, int], int, int]:
+    counts: dict[str, int] = defaultdict(int)
+    missing_qasm = 0
+    malformed = 0
+    if not vcf_path.exists():
+        return counts, missing_qasm, malformed
+    with open_text_auto(vcf_path) as fh:
+        for line in fh:
+            if not line.strip() or line.startswith("#"):
+                continue
+            fields = line.rstrip("\n").split("\t")
+            if len(fields) < 8:
+                malformed += 1
+                continue
+            info = parse_info_field(fields[7])
+            qasm = info.get("QASM", "")
+            if not qasm:
+                missing_qasm += 1
+                qasm = "."
+            counts[qasm] += 1
+    return counts, missing_qasm, malformed
+
+
+def write_sv_volume_audit(
+    out_path: Path,
+    query_manifest: list[dict[str, str]],
+    mycosv_calls_by_query: dict[str, dict[str, Any]],
+    truth_sets: dict[str, dict[tuple[str, str], list[NormalizedCall]]],
+    mycosv_vcf: Path,
+    *,
+    mode: str,
+    mycosv_failed: bool,
+) -> list[dict[str, object]]:
+    qasm_counts, missing_qasm, malformed = mycosv_qasm_counts(mycosv_vcf)
+    rows: list[dict[str, object]] = []
+    for row in query_manifest:
+        query_asm = row["query_asm"]
+        query_path = Path(row.get("mycosv_path") or row["path"])
+        query_bp, query_contigs = sequence_bp_and_records(query_path)
+        bench_ref = (row.get("benchmark_ref_fasta") or "").strip()
+        ref_bp, ref_contigs = fasta_bp_and_contigs(
+            Path(bench_ref) if bench_ref and bench_ref != "." else None
+        )
+        estimated_cov = (float(query_bp) / float(ref_bp)) if ref_bp > 0 else 0.0
+        mycosv_count = len(mycosv_calls_by_query.get(query_asm, {}).get("query", []))
+        truth_counts = {
+            f"{coord}:{label}": len(calls)
+            for (coord, label), calls in truth_sets.get(query_asm, {}).items()
+        }
+        max_truth = max(truth_counts.values(), default=0)
+        mycosv_query_calls = list(mycosv_calls_by_query.get(query_asm, {}).get("query", []))
+        n_off_ref = sum(1 for c in mycosv_query_calls if getattr(c, "svtype", "") == "OFF_REF")
+        n_anchored = len(mycosv_query_calls) - n_off_ref
+        qmode = (row.get("query_mode") or mode or "").lower()
+        scenario = (row.get("scenario") or "").lower()
+        species = (row.get("species") or "").lower()
+        is_read_capped = (
+            qmode in {"short-reads", "long-reads"}
+            and "read_subsets" in Path(row.get("path", "")).parts
+        )
+        if mycosv_failed:
+            status = "fail"
+            diagnosis = "mycosv_failed"
+        elif malformed or missing_qasm:
+            status = "fail"
+            diagnosis = "malformed_or_missing_qasm_records"
+        elif mycosv_count == 0:
+            status = "fail"
+            diagnosis = "no_calls_for_query"
+        elif max_truth > 0 and n_anchored == 0 and n_off_ref > 0:
+            status = "fail"
+            diagnosis = "off_ref_only_against_anchored_truth"
+        elif qmode == "long-reads" and 0.0 < estimated_cov < 5.0:
+            status = "fail"
+            diagnosis = "long_read_input_too_low_coverage_for_sv_volume"
+        elif qmode == "short-reads" and 0.0 < estimated_cov < 10.0:
+            status = "fail"
+            diagnosis = "short_read_input_too_low_coverage_for_sv_volume"
+        elif qmode in {"short-reads", "long-reads"} and is_read_capped:
+            status = "ok"
+            diagnosis = "bounded_benchmark_read_input"
+        elif max_truth > 0 and mycosv_count < max_truth:
+            status = "low"
+            diagnosis = "below_comparator_burden"
+        elif max_truth == 0:
+            status = "needs_model"
+            diagnosis = "no_truth_or_comparator_volume_model"
+        else:
+            status = "ok"
+            diagnosis = "consistent_with_available_comparator_burden"
+        rows.append({
+            "query_asm": query_asm,
+            "query_mode": qmode or ".",
+            "scenario": row.get("scenario", "."),
+            "species": row.get("species", "."),
+            "query_bp": query_bp,
+            "query_contigs": query_contigs,
+            "benchmark_ref_bp": ref_bp,
+            "benchmark_ref_contigs": ref_contigs,
+            "estimated_query_coverage": f"{estimated_cov:.2f}" if estimated_cov > 0 else "0",
+            "mycosv_query_calls": mycosv_count,
+            "max_comparator_or_truth_calls": max_truth,
+            "observed_qasm_count_in_vcf": sum(
+                count for qasm, count in qasm_counts.items()
+                if qasm_matches_observed(query_asm, qasm)
+            ),
+            "missing_qasm_records_in_vcf": missing_qasm,
+            "malformed_records_in_vcf": malformed,
+            "status": status,
+            "diagnosis": diagnosis,
+            "truth_counts": json.dumps(truth_counts, sort_keys=True),
+        })
+    write_tsv(
+        out_path,
+        rows,
+        [
+            "query_asm", "query_mode", "scenario", "species",
+            "query_bp", "query_contigs", "benchmark_ref_bp", "benchmark_ref_contigs",
+            "estimated_query_coverage",
+            "mycosv_query_calls", "max_comparator_or_truth_calls",
+            "observed_qasm_count_in_vcf", "missing_qasm_records_in_vcf",
+            "malformed_records_in_vcf", "status", "diagnosis", "truth_counts",
+        ],
+    )
+    return rows
+
+
+def load_mycosv_paired_calls(
+    vcf_path: Path, query_asm: str,
+) -> tuple[list[NormalizedCall], list[NormalizedCall], list[tuple[str, str, int, int, str]]]:
+    """Single-pass loader that returns (query_calls, ref_calls, ref_to_query_keys).
+
+    `ref_to_query_keys[i]` is the call_key tuple of the QUERY-coord
+    NormalizedCall produced from the same VCF row that yielded `ref_calls[i]`.
+    Lets the benchmark loop, after matching reference-coord truth vs
+    reference-coord mycosv predictions, attribute the comparator-support label
+    back to the QUERY-coord call_key that `support_by_key` is indexed by — the
+    bridge across coord spaces that was previously missing and caused every
+    mycosv call in biology_findings.tsv to be flagged `mycosv_unique=yes`.
+    """
+    query_calls: list[NormalizedCall] = []
+    ref_calls: list[NormalizedCall] = []
+    ref_to_query_keys: list[tuple[str, str, int, int, str]] = []
+    if not vcf_path.exists():
+        return query_calls, ref_calls, ref_to_query_keys
+    with open_text_auto(vcf_path) as fh:
+        for line in fh:
+            if not line.strip() or line.startswith("#"):
+                continue
+            fields = line.rstrip("\n").split("\t")
+            if len(fields) < 8:
+                continue
+            info = parse_info_field(fields[7])
+            if not qasm_matches_observed(query_asm, info.get("QASM", "")):
+                continue
+            svtype = TYPE_CANON.get(info.get("SVTYPE", fields[4].strip("<>")))
+            if not svtype:
+                continue
+            try:
+                query_pos = int(fields[1])
+            except ValueError:
+                continue
+            query_end = int(info.get("END", query_pos))
+            svlen = int(info.get("SVLEN", query_end - query_pos + 1))
+            mate_contig, mate_pos, mate_end = _mate_fields(info, fields[4])
+            query_contig = fields[0]
+            ref_contig = info.get("REFCONTIG", ".")
+            ref_pos_raw = info.get("REFPOS", "")
+            q_call = NormalizedCall(
+                query_asm=query_asm,
+                query_contig=query_contig,
+                pos=query_pos,
+                end=query_end,
+                svtype=svtype,
+                svlen=svlen,
+                source="mycosv",
+                coord_space="query",
+                annotation=info.get("ANNOT", "."),
+                element_class=info.get("EC", "NONE"),
+                ref_asm=info.get("CLADE", "."),
+                ref_contig=ref_contig,
+                read_support=_mycosv_intrinsic_read_support(info, fields[0]),
+                mate_contig=mate_contig,
+                mate_pos=mate_pos,
+                mate_end=mate_end,
+            )
+            query_calls.append(q_call)
+            if ref_contig not in {"", "."} and ref_pos_raw:
+                try:
+                    ref_pos = int(ref_pos_raw)
+                except ValueError:
+                    continue
+                ref_end = int(info.get("REFEND", ref_pos))
+                ref_calls.append(NormalizedCall(
+                    query_asm=query_asm,
+                    query_contig=query_contig,
+                    pos=ref_pos,
+                    end=ref_end,
+                    svtype=svtype,
+                    svlen=svlen,
+                    source="mycosv",
+                    coord_space="reference",
+                    annotation=info.get("ANNOT", "."),
+                    element_class=info.get("EC", "NONE"),
+                    ref_asm=info.get("CLADE", "."),
+                    ref_contig=ref_contig,
+                    read_support=_mycosv_intrinsic_read_support(info, fields[0]),
+                    mate_contig=mate_contig,
+                    mate_pos=mate_pos,
+                    mate_end=mate_end,
+                ))
+                ref_to_query_keys.append(
+                    (query_asm, query_contig, query_pos, query_end, svtype)
+                )
+    return query_calls, ref_calls, ref_to_query_keys
 
 
 def load_mycosv_reference_calls(vcf_path: Path, query_asm: str) -> list[NormalizedCall]:
@@ -3928,7 +4830,7 @@ def load_reference_vcf_calls(path: Path, label: str, query_asm: str) -> list[Nor
             if not svtype:
                 # paftools.js / svim-asm non-symbolic VCFs do not set SVTYPE
                 # and use explicit allele sequences. Derive from REF/ALT so
-                # those callers contribute to the comparator truth set.
+                # those callers contribute to the comparator baseline set.
                 svtype, inferred_svlen = _infer_svtype_from_alleles(ref_allele, alt_allele)
                 if not svtype:
                     continue
@@ -3994,6 +4896,26 @@ def parse_minigraph_call_tail(field: str) -> dict[str, str] | None:
 
 
 def load_minigraph_bubble_calls(bubble_bed: Path, sample_bed: Path, query_asm: str) -> list[NormalizedCall]:
+    """Load minigraph bubble calls as a normalized comparator callset.
+
+    minigraph emits one bubble per local divergence, including microsatellite
+    expansions and 30 bp indels — typical yeast assemblies produce ~1 000 bubbles
+    per sample, of which 60–80 % are sub-50 bp events that mycosv's chain caller
+    intentionally collapses. Comparing 1 000 minigraph bubbles against
+    ~20 mycosv chain-level events caps recall at ~2 % independent of correctness.
+
+    To bring the truth-set granularity in line with mycosv (and with how human
+    SV benchmarks usually score):
+      1. optionally drop bubbles below MINIGRAPH_MIN_SV_BP (default 0 keeps
+         minigraph's raw calls; set 50 to match the usual SV-size convention);
+      2. coalesce adjacent same-type bubbles within MINIGRAPH_MERGE_GAP_BP
+         (default 1 000 bp) on the same contig into a single representative event
+         whose pos = first bubble start, end = last bubble end, svlen = sum.
+
+    Both thresholds are overridable via env vars so a panel that wants the raw
+    fine-grained bubbles back can opt out (set MINIGRAPH_MIN_SV_BP=0 and
+    MINIGRAPH_MERGE_GAP_BP=0).
+    """
     rows: list[NormalizedCall] = []
     if not bubble_bed.exists() or not sample_bed.exists():
         return rows
@@ -4001,6 +4923,16 @@ def load_minigraph_bubble_calls(bubble_bed: Path, sample_bed: Path, query_asm: s
     sample_lines = [line.rstrip("\n") for line in sample_bed.read_text(encoding="utf-8").splitlines() if line.strip()]
     if len(bubble_lines) != len(sample_lines):
         return rows
+    try:
+        min_sv_bp = int(os.environ.get("MINIGRAPH_MIN_SV_BP", "0"))
+    except ValueError:
+        min_sv_bp = 0
+    try:
+        merge_gap_bp = int(os.environ.get("MINIGRAPH_MERGE_GAP_BP", "1000"))
+    except ValueError:
+        merge_gap_bp = 1000
+
+    raw: list[NormalizedCall] = []
     for bubble_line, sample_line in zip(bubble_lines, sample_lines):
         b = bubble_line.split("\t")
         s = sample_line.split("\t")
@@ -4028,7 +4960,9 @@ def load_minigraph_bubble_calls(bubble_bed: Path, sample_bed: Path, query_asm: s
             svlen = max(1, ref_len - sample_len)
         else:
             continue
-        rows.append(NormalizedCall(
+        if min_sv_bp > 0 and svlen < min_sv_bp:
+            continue
+        raw.append(NormalizedCall(
             query_asm=query_asm,
             query_contig=tail["query_contig"],
             pos=ref_start0 + 1,
@@ -4040,6 +4974,28 @@ def load_minigraph_bubble_calls(bubble_bed: Path, sample_bed: Path, query_asm: s
             annotation="MINIGRAPH_BUBBLE",
             ref_contig=chrom,
         ))
+    if merge_gap_bp <= 0 or not raw:
+        return raw
+    # Coalesce adjacent same-type bubbles on the same contig within merge_gap_bp.
+    raw.sort(key=lambda c: (c.ref_contig, c.svtype, c.pos))
+    for call in raw:
+        if not rows:
+            rows.append(call)
+            continue
+        last = rows[-1]
+        same_block = (
+            last.ref_contig == call.ref_contig
+            and last.svtype == call.svtype
+            and (call.pos - last.end) <= merge_gap_bp
+        )
+        if not same_block:
+            rows.append(call)
+            continue
+        rows[-1] = replace(
+            last,
+            end=max(last.end, call.end),
+            svlen=last.svlen + call.svlen,
+        )
     return rows
 
 
@@ -4067,6 +5023,38 @@ def _has_mate(call: NormalizedCall) -> bool:
     return call.mate_contig not in {"", "."} and call.mate_pos > 0
 
 
+_SPAN_CONTAIN_TYPES = {"INV", "TRA", "DEL", "DUP"}
+
+
+def _span_contain_applies(truth: NormalizedCall, pred: NormalizedCall) -> bool:
+    """Return True when the predicted call's span legitimately covers the truth
+    breakpoint AND the type group supports span-based matching.
+
+    MycoSV emits chain-level DEL/DUP blocks that span the genomic interval
+    between consecutive MEM anchors; read-level callers (svim, sniffles,
+    cutesv, delly, manta) emit per-event fine-grained breakpoints. Allowing
+    span-containment lets one chain-level pred match a single fine-grained
+    truth event nested inside it. The truth-loop in match_calls() still
+    consumes the pred greedily, so a single coarse pred is credited for at
+    most one TP — it cannot inflate TP by claiming many fine-grained truths
+    at once.
+    """
+    group = canonical_group(truth.svtype)
+    if group not in _SPAN_CONTAIN_TYPES and canonical_group(pred.svtype) not in _SPAN_CONTAIN_TYPES:
+        return False
+    if truth.svtype != "INV" and pred.svtype != "INV" \
+            and canonical_group(truth.svtype) != "TRA" \
+            and canonical_group(pred.svtype) != "TRA":
+        # DEL/DUP: only allow span-contain when pred is at least 2x the truth
+        # length. Otherwise the regular pos+length tolerance is the right gate
+        # and span-contain would silently relax length agreement on co-located
+        # but length-disagreeing same-scale calls.
+        if abs(pred.svlen) < 2 * max(1, abs(truth.svlen)):
+            return False
+    tol_bp = DEFAULT_TOL_BP.get(group, 500)
+    return _call_span_contains(pred, truth.pos, pad=tol_bp)
+
+
 def calls_compatible(truth: NormalizedCall, pred: NormalizedCall) -> bool:
     if truth.coord_space != pred.coord_space:
         return False
@@ -4078,14 +5066,15 @@ def calls_compatible(truth: NormalizedCall, pred: NormalizedCall) -> bool:
         return False
     tol_bp = DEFAULT_TOL_BP.get(canonical_group(truth.svtype), 500)
     tol_frac = DEFAULT_TOL_LEN_FRAC.get(canonical_group(truth.svtype), 0.30)
-    inv_or_tra = canonical_group(truth.svtype) == "TRA" or canonical_group(pred.svtype) == "TRA" or truth.svtype == "INV" or pred.svtype == "INV"
+    span_match = _span_contain_applies(truth, pred)
     pos_within_tol = abs(truth.pos - pred.pos) <= tol_bp
-    # MycoSV can emit whole-chain INV/TRA blocks: the comparator breakpoint may
-    # be embedded inside the predicted block rather than near pred.pos.
-    pos_within_span = inv_or_tra and _call_span_contains(pred, truth.pos, pad=tol_bp)
-    if not (pos_within_tol or pos_within_span):
+    if not (pos_within_tol or span_match):
         return False
-    if truth.svtype not in {"INV", "TRA", "OFF_REF", "INS"}:
+    if truth.svtype not in {"INV", "TRA", "OFF_REF", "INS"} and not span_match:
+        # Skip strict length agreement when the pred is a coarse chain-level
+        # block that span-contains the truth: by construction |pred.svlen| is
+        # much larger than |truth.svlen| in that case, and length disagreement
+        # is the expected signal rather than a mismatch.
         denom = max(abs(truth.svlen), 1)
         if abs(abs(truth.svlen) - abs(pred.svlen)) / denom > tol_frac:
             return False
@@ -4103,13 +5092,14 @@ def calls_compatible(truth: NormalizedCall, pred: NormalizedCall) -> bool:
 
 
 def call_distance(truth: NormalizedCall, pred: NormalizedCall) -> int:
-    inv_or_tra = canonical_group(truth.svtype) == "TRA" or canonical_group(pred.svtype) == "TRA" or truth.svtype == "INV" or pred.svtype == "INV"
-    if inv_or_tra and _call_span_contains(pred, truth.pos, pad=DEFAULT_TOL_BP.get(canonical_group(truth.svtype), 500)):
+    if _span_contain_applies(truth, pred):
         pos_d = 0
-    elif inv_or_tra:
-        pos_d = abs(truth.pos - (pred.pos + abs(pred.svlen) // 2))
     else:
-        pos_d = abs(truth.pos - pred.pos)
+        inv_or_tra = canonical_group(truth.svtype) == "TRA" or canonical_group(pred.svtype) == "TRA" or truth.svtype == "INV" or pred.svtype == "INV"
+        if inv_or_tra:
+            pos_d = abs(truth.pos - (pred.pos + abs(pred.svlen) // 2))
+        else:
+            pos_d = abs(truth.pos - pred.pos)
     len_d = 0 if canonical_group(truth.svtype) == "TRA" else abs(abs(truth.svlen) - abs(pred.svlen))
     mate_d = 0
     if (
@@ -4157,6 +5147,12 @@ def build_consensus_truth(
 
     for i in range(n):
         for j in range(i + 1, n):
+            # Consensus means support from independent callsets. Do not let
+            # duplicate/nearby calls from one comparator bridge two otherwise
+            # separate clusters: A1~B and A2~B should not make A1~A2 support
+            # each other as if they were independent evidence.
+            if flat[i][0] == flat[j][0]:
+                continue
             if calls_compatible(flat[i][1], flat[j][1]):
                 union(i, j)
 
@@ -4173,22 +5169,22 @@ def build_consensus_truth(
 
 
 def match_calls(truth_calls: list[NormalizedCall], pred_calls: list[NormalizedCall]) -> tuple[set[int], list[int]]:
-    used: set[int] = set()
-    missed_truth: list[int] = []
+    pairs: list[tuple[int, int, int]] = []
     for truth_idx, truth in enumerate(truth_calls):
-        best_idx: int | None = None
-        best_dist = 10**18
         for pred_idx, pred in enumerate(pred_calls):
-            if pred_idx in used or not calls_compatible(truth, pred):
-                continue
-            dist = call_distance(truth, pred)
-            if dist < best_dist:
-                best_idx = pred_idx
-                best_dist = dist
-        if best_idx is None:
-            missed_truth.append(truth_idx)
-        else:
-            used.add(best_idx)
+            if calls_compatible(truth, pred):
+                pairs.append((call_distance(truth, pred), truth_idx, pred_idx))
+    pairs.sort()
+
+    used: set[int] = set()
+    used_truth: set[int] = set()
+    for _dist, truth_idx, pred_idx in pairs:
+        if truth_idx in used_truth or pred_idx in used:
+            continue
+        used_truth.add(truth_idx)
+        used.add(pred_idx)
+
+    missed_truth = [idx for idx in range(len(truth_calls)) if idx not in used_truth]
     return used, missed_truth
 
 
@@ -4251,6 +5247,419 @@ def score_callsets_by_svtype(
     return out
 
 
+# ── Fungal-specific leave-one-out comparator-variance benchmark ──────────
+#
+# Single-number F1 against comparator consensus hides how much of the metric is
+# driven by *which* comparators happened to be in the pool. LOO replays the
+# score K times, each time excluding one comparator; the F1 dispersion is
+# the "comparator-induced" component. Folds are also stratified by fungal-
+# specific axes — length bin (sub-TE / TE element / TE cluster / arm) and
+# element class (TE_LTR / TE_TIR / STARSHIP / HGT / RIP / ...) — so the
+# reader can tell whether the variance is in boring small INDELs or in the
+# biologically interesting HGT / STARSHIP / >50 kb arm rearrangements.
+#
+# Length-bin boundaries reflect fungal SV biology:
+#   <500 bp        : sub-TE fragments / small accessory
+#   500 bp–5 kb    : full TE element (LTR retrotransposon, helitron, TIR)
+#   5–50 kb        : TE cluster, Starship cargo, accessory chromosome chunk
+#   >50 kb         : whole-arm rearrangement / accessory chromosome
+_FUNGAL_LEN_BINS: tuple[tuple[int, int, str], ...] = (
+    (50,        500,         "lt_500bp_subTE"),
+    (500,       5_000,       "500bp_5kb_TE_element"),
+    (5_000,     50_000,      "5kb_50kb_TE_cluster_starship"),
+    (50_000,    10**12,      "gt_50kb_arm_or_accessory"),
+)
+
+
+def _fungal_length_bin(svlen: int) -> str:
+    a = abs(int(svlen or 0))
+    for lo, hi, label in _FUNGAL_LEN_BINS:
+        if lo <= a < hi:
+            return label
+    return "lt_50bp_below_threshold"
+
+
+_FUNGAL_ELEMENT_CLASSES: tuple[str, ...] = (
+    "TE_LTR", "TE_TIR", "TE_LINE", "TE_SINE",
+    "STARSHIP", "HGT", "RIP", "REPEAT", "NONE",
+)
+
+
+def _stratify_calls_fungal(
+    calls: list[NormalizedCall],
+    query_phylum: str,
+) -> dict[str, dict[str, list[NormalizedCall]]]:
+    out: dict[str, dict[str, list[NormalizedCall]]] = {
+        "LENGTH_BIN":    defaultdict(list),
+        "ELEMENT_CLASS": defaultdict(list),
+        "PHYLUM":        defaultdict(list),
+    }
+    phylum = (query_phylum or ".").strip() or "."
+    for c in calls:
+        # TRA calls have svlen=1 (breakpoint) per the VCF parser at
+        # line ~4503, so the numeric bin would mis-route every TRA into
+        # the "<50 bp sub-TE" bucket. TRAs get their own stratum so they
+        # are scored as the structural events they are, independent of
+        # the breakpoint coordinate distance.
+        if (c.svtype or "").upper() == "TRA":
+            out["LENGTH_BIN"]["TRA_breakpoint"].append(c)
+        else:
+            out["LENGTH_BIN"][_fungal_length_bin(c.svlen)].append(c)
+        ec = (c.element_class or "NONE").upper()
+        if ec not in _FUNGAL_ELEMENT_CLASSES:
+            ec = "NONE"
+        out["ELEMENT_CLASS"][ec].append(c)
+        out["PHYLUM"][phylum].append(c)
+    return out
+
+
+def _score_strata_fungal(
+    truth_calls: list[NormalizedCall],
+    pred_calls: list[NormalizedCall],
+    query_phylum: str,
+) -> dict[str, dict[str, dict[str, Any]]]:
+    """Per-fungal-stratum scoring: each stratum filters BOTH truth and
+    predictions to the same key before scoring, so e.g. STARSHIP precision
+    is computed against STARSHIP predictions only.
+    """
+    t = _stratify_calls_fungal(truth_calls, query_phylum)
+    p = _stratify_calls_fungal(pred_calls,  query_phylum)
+    out: dict[str, dict[str, dict[str, Any]]] = {}
+    for sk in ("LENGTH_BIN", "ELEMENT_CLASS", "PHYLUM"):
+        out[sk] = {}
+        for k in sorted(set(t[sk].keys()) | set(p[sk].keys())):
+            out[sk][k] = score_callsets(t[sk].get(k, []), p[sk].get(k, []))
+    return out
+
+
+def score_loo_consensus(
+    pred_calls: list[NormalizedCall],
+    comparator_callsets: dict[str, list[NormalizedCall]],
+    *,
+    min_support: int = 2,
+    query_phylum: str = ".",
+) -> dict[str, Any]:
+    """Leave-one-out comparator-variance benchmark.
+
+    For K comparator callsets:
+      • Baseline: K-comparator consensus_(min_support) of K.
+      • For each comparator i, exclude i and compute consensus on the
+        remaining K-1 → leave-one-out fold; score pred against it.
+    Returns per-fold metrics + F1 mean/stdev/range + the most influential
+    comparator (the one whose exclusion shifts F1 most). All folds are
+    additionally broken down by fungal length bin / element class / phylum.
+
+    Skipped when K < min_support + 1 — without a margin, LOO folds would
+    drop below the support threshold and emit empty truth.
+    """
+    K = len(comparator_callsets)
+    if K < min_support + 1:
+        return {
+            "status":      "skipped",
+            "reason":      f"need >= {min_support + 1} comparators for LOO at min_support={min_support}, got {K}",
+            "comparators": sorted(comparator_callsets.keys()),
+        }
+
+    labels = sorted(comparator_callsets.keys())
+
+    full_truth  = build_consensus_truth(
+        [comparator_callsets[lbl] for lbl in labels], min_support=min_support,
+    )
+    full_metrics = score_callsets(full_truth, pred_calls)
+    full_strata  = _score_strata_fungal(full_truth, pred_calls, query_phylum)
+
+    folds: dict[str, dict[str, Any]] = {}
+    f1_vals: list[float] = []
+    for excluded in labels:
+        loo_truth = build_consensus_truth(
+            [comparator_callsets[lbl] for lbl in labels if lbl != excluded],
+            min_support=min_support,
+        )
+        loo_metrics = score_callsets(loo_truth, pred_calls)
+        folds[excluded] = {
+            "truth_n":  len(loo_truth),
+            "metrics":  loo_metrics,
+            "strata":   _score_strata_fungal(loo_truth, pred_calls, query_phylum),
+        }
+        f1 = loo_metrics.get("f1")
+        if isinstance(f1, (int, float)) and not math.isnan(f1):
+            f1_vals.append(float(f1))
+
+    if f1_vals:
+        f1_mean  = statistics.fmean(f1_vals)
+        f1_stdev = statistics.pstdev(f1_vals) if len(f1_vals) > 1 else 0.0
+        f1_min, f1_max = min(f1_vals), max(f1_vals)
+        f1_swing = f1_max - f1_min
+    else:
+        f1_mean = f1_stdev = f1_min = f1_max = f1_swing = float("nan")
+
+    base_f1 = full_metrics.get("f1")
+    most_influential: dict[str, Any] | None = None
+    if isinstance(base_f1, (int, float)) and not math.isnan(base_f1):
+        best_abs = 0.0
+        for lbl, info in folds.items():
+            f1 = info["metrics"].get("f1")
+            if not isinstance(f1, (int, float)) or math.isnan(f1):
+                continue
+            delta = float(f1) - float(base_f1)
+            if abs(delta) > best_abs:
+                best_abs = abs(delta)
+                most_influential = {"label": lbl, "delta_f1": delta}
+
+    # Verdict requires ≥2 valid fold F1 values, otherwise the "robust" label
+    # is unearned (every fold's consensus could have been empty). >5pp swing
+    # over ≥2 folds → comparator-driven; reader should not quote a single F1
+    # number without the swing alongside it.
+    if len(f1_vals) < 2:
+        verdict = "insufficient_folds"
+    elif isinstance(f1_swing, float) and not math.isnan(f1_swing) and f1_swing > 0.05:
+        verdict = "high_variance_comparator_driven"
+    else:
+        verdict = "low_variance_robust"
+
+    return {
+        "status":                       "ok",
+        "comparators":                  labels,
+        "comparators_n":                K,
+        "min_support":                  min_support,
+        "phylum":                       query_phylum or ".",
+        "baseline_full_consensus": {
+            "truth_n": len(full_truth),
+            "metrics": full_metrics,
+            "strata":  full_strata,
+        },
+        "loo_folds":                    folds,
+        "f1_full_baseline":             base_f1,
+        "f1_mean_loo":                  f1_mean,
+        "f1_stdev_loo":                 f1_stdev,
+        "f1_range_loo":                 [f1_min, f1_max],
+        "f1_swing_loo":                 f1_swing,
+        "most_influential_comparator":  most_influential,
+        "verdict":                      verdict,
+    }
+
+
+def _emit_loo_summary_rows(
+    *,
+    query_asm:     str,
+    query_phylum:  str,
+    coord_space:   str,
+    loo:           dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Flatten a score_loo_consensus() result into per-(fold, stratum) TSV
+    rows for loo_consensus_summary.tsv. Always emits the baseline as
+    excluded_comparator='NONE' so downstream plots have a reference point.
+    """
+    rows: list[dict[str, Any]] = []
+    if loo.get("status") != "ok":
+        return rows
+
+    def push(excluded: str, stratum_type: str, stratum_value: str,
+             metrics: dict[str, Any]) -> None:
+        rows.append({
+            "query_asm":           query_asm,
+            "phylum":              query_phylum or ".",
+            "coordinate_space":    coord_space,
+            "excluded_comparator": excluded,
+            "stratum_type":        stratum_type,
+            "stratum_value":       stratum_value,
+            "truth_n":             metrics.get("tp", 0) + metrics.get("fn", 0)
+                                    if isinstance(metrics.get("tp"), int) else 0,
+            "tp":                  metrics.get("tp", float("nan")),
+            "fp":                  metrics.get("fp", float("nan")),
+            "fn":                  metrics.get("fn", float("nan")),
+            "precision":           metrics.get("precision", float("nan")),
+            "recall":              metrics.get("recall", float("nan")),
+            "f1":                  metrics.get("f1", float("nan")),
+            "status":              metrics.get("status", "unknown"),
+        })
+
+    base = loo["baseline_full_consensus"]
+    push("NONE", "ALL", "ALL", base["metrics"])
+    for sk, by_key in base["strata"].items():
+        for k, m in by_key.items():
+            push("NONE", sk, k, m)
+
+    for excluded, info in loo["loo_folds"].items():
+        push(excluded, "ALL", "ALL", info["metrics"])
+        for sk, by_key in info["strata"].items():
+            for k, m in by_key.items():
+                push(excluded, sk, k, m)
+
+    return rows
+
+
+def _summarize_loo_variance_global(
+    by_query: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    """Aggregate per-query LOO variance into one panel-wide summary.
+
+    Reports separately for `query` and `reference` coord spaces. Per coord
+    space: mean baseline F1, mean LOO stdev, mean LOO swing, and the most
+    common "most-influential comparator" across queries (a vote).
+    """
+    out: dict[str, Any] = {}
+    coord_spaces: set[str] = set()
+    for per_cs in by_query.values():
+        coord_spaces.update(per_cs.keys())
+
+    for cs in sorted(coord_spaces):
+        base_f1s: list[float] = []
+        stdevs:   list[float] = []
+        swings:   list[float] = []
+        influencer_votes: dict[str, int] = defaultdict(int)
+        n_queries = 0
+        n_high_variance = 0
+        for per_cs in by_query.values():
+            entry = per_cs.get(cs)
+            if not entry or entry.get("status") != "ok":
+                continue
+            n_queries += 1
+            bf = entry.get("f1_full_baseline")
+            st = entry.get("f1_stdev_loo")
+            sw = entry.get("f1_swing_loo")
+            if isinstance(bf, (int, float)) and not math.isnan(bf): base_f1s.append(float(bf))
+            if isinstance(st, (int, float)) and not math.isnan(st): stdevs.append(float(st))
+            if isinstance(sw, (int, float)) and not math.isnan(sw): swings.append(float(sw))
+            if entry.get("verdict") == "high_variance_comparator_driven":
+                n_high_variance += 1
+            mi = entry.get("most_influential_comparator")
+            if isinstance(mi, dict) and mi.get("label"):
+                influencer_votes[str(mi["label"])] += 1
+
+        top_influencer = None
+        if influencer_votes:
+            best = max(influencer_votes.items(), key=lambda kv: kv[1])
+            top_influencer = {"label": best[0], "vote_count": best[1]}
+
+        def _mean(xs: list[float]) -> float:
+            return statistics.fmean(xs) if xs else float("nan")
+
+        out[cs] = {
+            "queries_with_loo":          n_queries,
+            "queries_high_variance":     n_high_variance,
+            "mean_baseline_f1":          _mean(base_f1s),
+            "mean_loo_stdev":            _mean(stdevs),
+            "mean_loo_swing":            _mean(swings),
+            "most_influential_overall":  top_influencer,
+            "influencer_vote_counts":    dict(influencer_votes),
+        }
+    return out
+
+
+def _sanitize_for_json(obj: Any) -> Any:
+    """Recursively convert NaN / inf floats to None and tuples to lists so
+    the LOO doc dumps to *strict* JSON (parseable by jq, JS JSON.parse, and
+    schema validators). json.dump's default `allow_nan=True` writes literal
+    `NaN` tokens which Python parses back but every other JSON parser
+    rejects — so we walk the doc explicitly instead of relying on the
+    `default=` callback (which is never invoked for floats since floats
+    are technically serializable)."""
+    if isinstance(obj, float):
+        if math.isnan(obj) or math.isinf(obj):
+            return None
+        return obj
+    if isinstance(obj, dict):
+        return {k: _sanitize_for_json(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_sanitize_for_json(v) for v in obj]
+    return obj
+
+
+def diagnose_match_failures(
+    truth_calls: list[NormalizedCall],
+    pred_calls: list[NormalizedCall],
+) -> list[dict[str, Any]]:
+    """For every predicted call that did NOT match any truth call, return a
+    row describing the closest truth candidate (same contig + same svtype
+    group) and the specific reason matching failed:
+
+      contig_mismatch   — no truth call shares the predicted contig
+      type_mismatch     — same contig but no truth call shares the SV type
+      pos_out_of_tol    — same contig+type but breakpoint > DEFAULT_TOL_BP
+      svlen_out_of_tol  — close enough on pos but svlen ratio > tol_frac
+      mate_mismatch     — TRA mate contig/pos disagrees
+      no_truth_for_type — empty truth subset for the SV type
+
+    These rows feed a match_failures.tsv that lets the operator see at a
+    glance why precision/recall is zero without re-running the benchmark.
+    """
+    used, _missed = match_calls(truth_calls, pred_calls)
+    truth_by_contig_type: dict[tuple[str, str], list[tuple[int, NormalizedCall]]] = defaultdict(list)
+    for ti, t in enumerate(truth_calls):
+        truth_by_contig_type[(effective_contig(t), canonical_group(t.svtype))].append((ti, t))
+    rows: list[dict[str, Any]] = []
+    for pi, pred in enumerate(pred_calls):
+        if pi in used:
+            continue
+        contig = effective_contig(pred)
+        group = canonical_group(pred.svtype)
+        cohort = truth_by_contig_type.get((contig, group), [])
+        if not cohort:
+            same_contig_any_type = any(effective_contig(t) == contig for t in truth_calls)
+            reason = "type_mismatch" if same_contig_any_type else "contig_mismatch"
+            closest_pos_delta: str = "."
+            closest_svlen_delta: str = "."
+            closest_truth_idx: str = "."
+        else:
+            best = min(cohort, key=lambda r: abs(r[1].pos - pred.pos))
+            t_idx, t = best
+            tol_bp = DEFAULT_TOL_BP.get(group, 500)
+            tol_frac = DEFAULT_TOL_LEN_FRAC.get(group, 0.30)
+            pos_delta = abs(t.pos - pred.pos)
+            len_delta = abs(abs(t.svlen) - abs(pred.svlen))
+            denom = max(abs(t.svlen), 1)
+            span_match = _span_contain_applies(t, pred)
+            if pos_delta > tol_bp and not span_match:
+                reason = "pos_out_of_tol"
+            elif group not in {"INV", "TRA", "OFF_REF", "INS"} \
+                    and not span_match \
+                    and len_delta / denom > tol_frac:
+                reason = "svlen_out_of_tol"
+            elif group == "TRA" and (_has_mate(t) or _has_mate(pred)) and (
+                t.mate_contig != pred.mate_contig or abs(t.mate_pos - pred.mate_pos) > tol_bp
+            ):
+                reason = "mate_mismatch"
+            else:
+                # Should be a TP if we got here — usually means pred was bumped
+                # by another pred grabbing the same truth in the greedy match.
+                reason = "claimed_by_other_pred"
+            closest_pos_delta = str(pos_delta)
+            closest_svlen_delta = str(len_delta)
+            closest_truth_idx = str(t_idx)
+        rows.append({
+            "pred_contig": contig,
+            "pred_pos": pred.pos,
+            "pred_end": pred.end,
+            "pred_svtype": pred.svtype,
+            "pred_svlen": pred.svlen,
+            "reason": reason,
+            "closest_truth_idx": closest_truth_idx,
+            "closest_pos_delta": closest_pos_delta,
+            "closest_svlen_delta": closest_svlen_delta,
+        })
+    return rows
+
+
+def validation_basis_for_label(label: str) -> str:
+    """Classify what a benchmark row is actually anchored to.
+
+    The TSV keeps the historical `truth_label` column for compatibility, but
+    for real fungal data comparator calls are baseline agreement, not ground
+    truth.  Consumers should use this column to decide whether a row represents
+    independent raw-read validation or only agreement with another algorithm.
+    """
+    if label == "read_level_union":
+        return "raw_read_validated"
+    if label.endswith("_read_supported"):
+        return "comparator_agreement_read_supported"
+    if label.startswith("consensus_"):
+        return "comparator_agreement"
+    if label == "no_comparator":
+        return "no_independent_validation"
+    return "comparator_baseline"
+
+
 def _emit_per_svtype_rows(
     *,
     query_asm: str,
@@ -4280,6 +5689,7 @@ def _emit_per_svtype_rows(
             "query_asm": query_asm,
             "coordinate_space": coord_space,
             "truth_label": truth_label,
+            "validation_basis": validation_basis_for_label(truth_label),
             "svtype": svtype,
             "method": method,
             "truth_calls": t_count,
@@ -4319,7 +5729,7 @@ def parse_other_spec(spec: str) -> tuple[str, Path]:
 # inherits "truth" status. Read-level validation re-anchors each candidate
 # in the raw FASTQ by counting split / supplementary alignments that span
 # the breakpoint coordinates. SVs without raw-read evidence are dropped from
-# the truth set before scoring, removing the largest source of caller-bias.
+# the candidate set before scoring, removing the largest source of caller-bias.
 # ============================================================================
 
 
@@ -4486,9 +5896,10 @@ def _build_validation_bam(
     """Build a sorted+indexed BAM of the query's raw reads vs benchmark ref.
 
     For assembly-mode queries this uses the assembly contigs themselves as
-    "reads" (asm5 alignment), which still surfaces split-alignment evidence
-    at every assembly-supported breakpoint. For reads-mode queries the
-    appropriate long/short minimap2 preset is selected.
+    "reads" (asm20 alignment — the benchmark ref is a diverged sibling
+    clade), which still surfaces split-alignment evidence at every
+    assembly-supported breakpoint. For reads-mode queries the appropriate
+    long/short minimap2 preset is selected.
     """
     mode = (query_row.get("query_mode") or "assembly").lower()
     if mode == "assembly":
@@ -4509,9 +5920,17 @@ def _build_validation_bam(
         bam_sorted = work_dir / "validation.sorted.bam"
         if bam_sorted.exists() and (work_dir / "validation.sorted.bam.bai").exists():
             return bam_sorted, ref_fa_plain
+        # asm20, not asm5: the benchmark reference is a held-out sibling-clade
+        # genome. asm5 (<=5% divergence) fragments the contig-vs-ref alignment
+        # for cross-species fungal pairs into short MAPQ-0 blocks, so the
+        # split/clip breakpoint signal never lands where the call expects it
+        # — every assembly-supported SV then fails read-validation and is
+        # dropped from read_validated_truth.tsv. asm20 keeps the alignment
+        # coherent across the genus-level divergence these pairs actually
+        # have; matches the svim_asm / syri / clade-lift presets.
         with sam_path.open("wb") as sam_out:
             subprocess.run(
-                ["minimap2", "-ax", "asm5", "--cs", "-t", str(threads),
+                ["minimap2", "-ax", "asm20", "--cs", "-t", str(threads),
                  str(ref_fa_plain), str(query_fa)],
                 stdout=sam_out, stderr=subprocess.PIPE, check=True,
                 timeout=_TOOL_TIMEOUT,
@@ -4540,8 +5959,16 @@ def validate_calls_with_reads(
     threads: int,
     min_support: int,
     flank_bp: int,
+    force_external: bool = False,
 ) -> tuple[list[NormalizedCall], list[dict[str, Any]]]:
-    """Re-anchor an algorithm-derived truth set in the raw query data.
+    """Re-anchor algorithm-derived candidate calls in the raw query data.
+
+    force_external=True disables the "trust MycoSV's intrinsic support"
+    shortcut: EVERY candidate — comparator or MycoSV — must clear the
+    external split/clipped-read threshold. This is required when the input
+    is a tool-agnostic union (read_level_union): letting MycoSV calls
+    self-validate via their own anchor/cluster counts would make precision
+    against that truth circular.
 
     Returns (filtered_truth, per_call_support_rows). filtered_truth contains
     only calls with >= min_support split/clipped read support at the
@@ -4586,20 +6013,41 @@ def validate_calls_with_reads(
             "status": status,
         }
 
+    def effective_flank(call: NormalizedCall) -> int:
+        # The matcher (calls_compatible) uses DEFAULT_TOL_BP per SV type
+        # (DEL/DUP 2500, INV/TRA 10000); a flat 250 bp validation window
+        # rejected real DEL/DUP/INV/TRA calls whose split-read evidence sat
+        # 300-2000 bp from the comparator's reported breakpoint, causing
+        # asymmetric truth shrinkage and ~15-25 F1 hits on the larger SV
+        # classes. Use 1/5 of the matcher tolerance (DEL/DUP -> 500 bp,
+        # INV/TRA -> 2000 bp), floored at the user-set flank_bp so callers
+        # who explicitly pass a wider window keep that wider behavior.
+        per_type_tol = DEFAULT_TOL_BP.get(canonical_group(call.svtype), 0)
+        return max(flank_bp, per_type_tol // 5) if per_type_tol > 0 else flank_bp
+
     aligned = _build_validation_bam(query_row, work_dir, threads)
     rows: list[dict[str, Any]] = []
     if aligned is None:
         has_intrinsic_support = any(internal_support(call) is not None for call in truth_calls)
         for call in truth_calls:
             intrinsic = internal_support(call)
-            validated = intrinsic is not None and intrinsic >= min_support
+            validated = (
+                False if force_external
+                else (intrinsic is not None and intrinsic >= min_support)
+            )
             rows.append(support_row(
                 call,
                 intrinsic=intrinsic,
                 validation_support=None,
-                validated=validated if intrinsic is not None else None,
+                validated=None if force_external else (
+                    validated if intrinsic is not None else None),
                 status="validation_unavailable",
             ))
+        # Without an alignment there is no external evidence — under
+        # force_external nothing can be confirmed, so the validated set is empty
+        # rather than falling back to (tool-biased) intrinsic counts.
+        if force_external:
+            return [], rows
         kept = [
             call for call in truth_calls
             if internal_support(call) is not None
@@ -4609,27 +6057,96 @@ def validate_calls_with_reads(
             return kept, rows
         return list(truth_calls), rows
     bam_sorted, _ref_plain = aligned
+    # Build the set of contigs actually present in the validation BAM header
+    # once, up front. samtools view on an absent contig returns 0 reads
+    # silently — without this guard we mis-attribute "no reads at breakpoint"
+    # to the call, when in reality the contig is on a sibling clade we never
+    # aligned to. Used below to skip the breakpoint scan for those calls.
+    bam_contigs: frozenset[str] = frozenset()
+    if tool_path("samtools"):
+        try:
+            hdr = subprocess.run(
+                ["samtools", "view", "-H", str(bam_sorted)],
+                text=True, capture_output=True, check=True, timeout=_TOOL_TIMEOUT,
+            )
+            bam_contigs = frozenset(
+                ln.split("\t")[1][3:]
+                for ln in hdr.stdout.splitlines()
+                if ln.startswith("@SQ\t")
+                and len(ln.split("\t")) >= 2
+                and ln.split("\t")[1].startswith("SN:")
+            )
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
+            bam_contigs = frozenset()
     kept: list[NormalizedCall] = []
     for call in truth_calls:
         intrinsic = internal_support(call)
         mode = (query_row.get("query_mode") or "assembly").lower()
-        if call.source == "mycosv" and call.coord_space == "query" and mode == "assembly":
-            validated = intrinsic is not None and intrinsic >= min_support
+        # MycoSV's C++ pipeline already clusters at SUPPORT>=2; any call with
+        # a usable intrinsic count is "raw-data confirmed" by construction.
+        # Re-aligning short-read kmer/long-read cluster calls to a single
+        # benchmark_ref BAM and re-counting split reads loses ~50% of them
+        # purely because:
+        #   (a) the call lives on a sibling clade the BAM never indexed, or
+        #   (b) short-read assembly anchors land on a synthetic sr_unitig
+        #       contig that the BAM does not contain.
+        # Trust the intrinsic count, but still record the external split-read
+        # count when available (for diagnostic value in the TSV).
+        # force_external skips this shortcut entirely — see docstring.
+        if (not force_external
+                and call.source == "mycosv"
+                and intrinsic is not None and intrinsic >= min_support):
+            contig = call.ref_contig if call.coord_space == "reference" and call.ref_contig not in {"", "."} else call.query_contig
+            ext_support: int | None
+            if mode == "assembly" and call.coord_space == "query":
+                ext_support = None
+            elif bam_contigs and contig not in bam_contigs:
+                ext_support = None  # sibling clade contig — would always read 0
+            else:
+                ext_support = _samtools_count_breakpoint_support(
+                    bam_sorted, contig, call.pos, call.end,
+                    svtype=call.svtype, svlen=call.svlen,
+                    flank_bp=effective_flank(call), min_clip=30,
+                )
+            status_label = (
+                "query_space_not_reference_validated"
+                if mode == "assembly" and call.coord_space == "query"
+                else ("validated_intrinsic" if call.coord_space == "query" else "validated")
+            )
+            rows.append(support_row(
+                call,
+                intrinsic=intrinsic,
+                validation_support=ext_support,
+                validated=True,
+                status=status_label,
+            ))
+            kept.append(call)
+            continue
+        contig = call.ref_contig if call.coord_space == "reference" and call.ref_contig not in {"", "."} else call.query_contig
+        if bam_contigs and contig not in bam_contigs:
+            # Distinguish "external validation impossible" from
+            # "external validation failed" so the TSV stays interpretable.
+            # Under force_external a call we cannot externally check is NOT
+            # admitted to the validated set (no intrinsic fallback).
+            validated_flag = (
+                False if force_external
+                else (intrinsic is not None and intrinsic >= min_support)
+            )
             rows.append(support_row(
                 call,
                 intrinsic=intrinsic,
                 validation_support=None,
-                validated=validated if intrinsic is not None else None,
-                status="query_space_not_reference_validated",
+                validated=None if force_external else (
+                    validated_flag if intrinsic is not None else None),
+                status="contig_absent_from_validation_bam",
             ))
-            if validated:
+            if validated_flag:
                 kept.append(call)
             continue
-        contig = call.ref_contig if call.coord_space == "reference" and call.ref_contig not in {"", "."} else call.query_contig
         validation_support = _samtools_count_breakpoint_support(
             bam_sorted, contig, call.pos, call.end,
             svtype=call.svtype, svlen=call.svlen,
-            flank_bp=flank_bp, min_clip=30,
+            flank_bp=effective_flank(call), min_clip=30,
         )
         if call.svtype == "TRA" and _has_mate(call):
             mate_support = _samtools_count_breakpoint_support(
@@ -4638,10 +6155,16 @@ def validate_calls_with_reads(
                 call.mate_pos,
                 call.mate_end or call.mate_pos,
                 svtype=call.svtype, svlen=call.svlen,
-                flank_bp=flank_bp, min_clip=30,
+                flank_bp=effective_flank(call), min_clip=30,
             )
             validation_support = max(validation_support, mate_support)
-        effective_support = max(validation_support, intrinsic or 0)
+        # force_external: external split-read count is the ONLY evidence that
+        # counts — intrinsic (tool-derived) support is ignored for truth
+        # membership so the union truth stays tool-agnostic.
+        effective_support = (
+            validation_support if force_external
+            else max(validation_support, intrinsic or 0)
+        )
         validated = effective_support >= min_support
         rows.append(support_row(
             call,
@@ -4656,19 +6179,19 @@ def validate_calls_with_reads(
 
 
 # ============================================================================
-# Reads-mode liftover: translate mycosv's sibling-clade REFCONTIG/REFPOS into
-# benchmark_ref_fasta coordinates so per-comparator PR scoring is apples to
-# apples.
+# MycoSV-to-benchmark-reference liftover: translate MycoSV's sibling-clade
+# REFCONTIG/REFPOS into benchmark_ref_fasta coordinates so per-comparator PR
+# scoring is apples to apples.
 #
-# In reads modes mycosv's pangenomic routing picks the closest clade per
-# region and reports REFPOS against THAT clade. The truth callers (sniffles,
-# cutesv, delly, manta) only see benchmark_ref_fasta, so a call reported on
-# NC_012864.1 (S. cerevisiae) at pos 10567 cannot be matched against a
-# sniffles call on NC_089928.1 (the user-chosen ref) without coordinate
-# translation. We minimap2-asm5 align the sibling clade FASTA to benchmark
-# ref, parse the PAF, and translate REFCONTIG/REFPOS/REFEND for each call.
-# PAFs are cached in <out_dir>/lift_cache/ so a re-run of the same panel
-# does not pay the alignment cost twice.
+# MyCoSV's pangenomic routing picks the closest clade per region and reports
+# REFPOS against THAT clade. The benchmark callers see exactly one
+# benchmark_ref_fasta per query, so a call reported on NC_012864.1
+# (S. cerevisiae) at pos 10567 cannot be matched against a comparator call on
+# NC_089928.1 (the user-chosen ref) without coordinate translation. We
+# minimap2-asm20 align the sibling clade FASTA to benchmark ref, parse the PAF,
+# and translate REFCONTIG/REFPOS/REFEND for each call. PAFs are cached in
+# <out_dir>/lift_cache/ so a re-run of the same panel does not pay the
+# alignment cost twice.
 # ============================================================================
 
 
@@ -4778,11 +6301,13 @@ def _lift_calls_to_benchmark_ref(
     cache_dir: Path,
     threads: int,
 ) -> list[NormalizedCall]:
-    """Return a new list of calls with REFCONTIG/REFPOS/REFEND translated to
-    benchmark_ref_fasta coords, where possible. Calls already on a contig
-    that belongs to benchmark_ref_fasta pass through unchanged. Calls whose
-    clade FASTA cannot be located, or whose breakpoint cannot be lifted, are
-    dropped — they had no apples-to-apples comparison anyway.
+    """Return calls with REFCONTIG/REFPOS/REFEND translated to
+    benchmark_ref_fasta coords where possible.
+
+    Calls already on a benchmark-ref contig pass through unchanged. Calls that
+    cannot be lifted are also retained on their native clade so diagnostic
+    any-clade rows still see the full MycoSV prediction set; the strict
+    benchmark-ref filter later excludes them from single-reference PR scoring.
     """
     if not calls:
         return []
@@ -4798,6 +6323,11 @@ def _lift_calls_to_benchmark_ref(
             continue
         clade = call.ref_asm or "."
         if clade in {".", "", "OFF_REFERENCE"}:
+            # No clade info — keep the call on its native ref_contig so it
+            # still scores for `reference_any_clade` rows; the bench_contigs
+            # filter at the caller will drop it from the strict reference
+            # row. Previous behaviour silently discarded these.
+            out.append(call)
             continue
         if clade not in lift_tables_by_clade:
             clade_fa = _clade_fasta_path(clade, data_cache_dir)
@@ -4810,9 +6340,20 @@ def _lift_calls_to_benchmark_ref(
                 lift_tables_by_clade[clade] = _load_lift_table(paf) if paf else None
         table = lift_tables_by_clade.get(clade)
         if not table:
+            # PAF could not be built (minimap2 missing, clade FASTA absent,
+            # or alignment too diverged for asm20). Keep the call on its
+            # native ref_contig so the `reference_any_clade` row still sees
+            # it; the bench_contigs filter at the caller drops it from the
+            # strict reference row. Previously: silent drop, which made
+            # pred_calls in exact_benchmark_summary.tsv much smaller than
+            # the actual mycosv prediction set.
+            out.append(call)
             continue
         lifted_start = _lift_pos(table, call.ref_contig, call.pos)
         if lifted_start is None:
+            # PAF exists but does not cover this breakpoint. Keep the call
+            # on its original clade contig — see comment above.
+            out.append(call)
             continue
         lifted_end = _lift_pos(table, call.ref_contig, call.end) or lifted_start
         new_contig = lifted_start[0]
@@ -4821,6 +6362,9 @@ def _lift_calls_to_benchmark_ref(
         if new_end < new_pos:
             new_pos, new_end = new_end, new_pos
         if new_contig not in bench_contigs:
+            # Lift landed on a non-benchmark contig; keep the original call
+            # for any-clade scoring rather than dropping outright.
+            out.append(call)
             continue
         mate_contig = call.mate_contig
         mate_pos = call.mate_pos
@@ -4828,6 +6372,7 @@ def _lift_calls_to_benchmark_ref(
         if _has_mate(call):
             lifted_mate = _lift_pos(table, call.mate_contig, call.mate_pos)
             if lifted_mate is None:
+                out.append(call)
                 continue
             lifted_mate_end = (
                 _lift_pos(table, call.mate_contig, call.mate_end or call.mate_pos)
@@ -4839,6 +6384,7 @@ def _lift_calls_to_benchmark_ref(
             if mate_end < mate_pos:
                 mate_pos, mate_end = mate_end, mate_pos
             if mate_contig not in bench_contigs:
+                out.append(call)
                 continue
         out.append(replace(
             call,
@@ -4850,6 +6396,76 @@ def _lift_calls_to_benchmark_ref(
             mate_end=mate_end,
         ))
     return out
+
+
+def reference_projection_locus_key(
+    call: NormalizedCall,
+    bucket_bp: int = 100,
+) -> tuple[str, str, str, int, int, int, str, int]:
+    """Approximate identity key for projected benchmark-reference calls.
+
+    MycoSV may emit several raw pairwise observations for one biological SV
+    because the same query locus is compared to multiple close pangenome refs.
+    After liftover to the single benchmark reference, those observations should
+    contribute one prediction to the single-reference PR comparison. The raw
+    observations remain in calls.vcf and the pangenome layers; this key only
+    defines the projected single-reference view.
+    """
+    bucket = max(1, bucket_bp)
+    mate_contig = "."
+    mate_bucket = -1
+    if _has_mate(call):
+        mate_contig = call.mate_contig or "."
+        mate_bucket = max(0, call.mate_pos) // bucket
+    return (
+        call.query_asm,
+        call.ref_contig or ".",
+        call.svtype,
+        max(0, call.pos) // bucket,
+        max(0, call.end) // bucket,
+        abs(call.svlen) // bucket,
+        mate_contig,
+        mate_bucket,
+    )
+
+
+def deduplicate_projected_reference_calls(
+    paired_calls: list[tuple[NormalizedCall, tuple[str, str, int, int, str] | None]],
+) -> tuple[
+    list[NormalizedCall],
+    list[tuple[str, str, int, int, str] | None],
+    set[tuple[str, str, int, int, str]],
+]:
+    """Collapse projected MycoSV reference calls to one call per benchmark locus.
+
+    Returns (deduped_ref_calls, representative_query_keys, all_query_keys).
+    The representative keys stay parallel to deduped_ref_calls for comparator
+    support propagation; all_query_keys marks every raw pangenome observation
+    that is single-reference-equivalent for biology/novelty labelling.
+    """
+    by_locus: dict[
+        tuple[str, str, str, int, int, int, str, int],
+        tuple[NormalizedCall, tuple[str, str, int, int, str] | None],
+    ] = {}
+    all_query_keys: set[tuple[str, str, int, int, str]] = set()
+    for call, qkey in paired_calls:
+        if qkey is not None:
+            all_query_keys.add(qkey)
+        key = reference_projection_locus_key(call)
+        if key not in by_locus:
+            by_locus[key] = (call, qkey)
+            continue
+        prev_call, _prev_qkey = by_locus[key]
+        prev_support = prev_call.read_support if prev_call.read_support is not None else -1
+        new_support = call.read_support if call.read_support is not None else -1
+        if new_support > prev_support:
+            by_locus[key] = (call, qkey)
+    deduped = list(by_locus.values())
+    return (
+        [call for call, _qkey in deduped],
+        [qkey for _call, qkey in deduped],
+        all_query_keys,
+    )
 
 
 def compile_binary_if_needed(binary_path: Path, force: bool = False) -> None:
@@ -4868,6 +6484,16 @@ def locate_query_path(query_row: dict[str, str]) -> Path:
 
 
 def estimate_prepared_genome_size_hint(prepared_dir: Path) -> int:
+    """Return the median genome size (bp) across every query's benchmark ref.
+
+    The hint feeds the C++ binary's reads-mode auto-tuner (coverage estimate,
+    minimum cluster support). Returning the *first* ref's size was wrong for
+    mixed-phyla panels — a 12 Mbp yeast hint applied to a 30 Mbp Aspergillus
+    query (or, worse, a 700 Mbp Gigaspora) makes coverage estimates orders
+    of magnitude off. Median across all query benchmark refs is the
+    representative aggregate; falls through to the corpus ref_list median
+    when no query manifest exists.
+    """
     query_manifest = prepared_dir / "query_manifest.tsv"
     candidate_paths: list[Path] = []
     if query_manifest.exists():
@@ -4875,13 +6501,15 @@ def estimate_prepared_genome_size_hint(prepared_dir: Path) -> int:
             ref_fasta = (row.get("benchmark_ref_fasta") or "").strip()
             if ref_fasta and ref_fasta not in {".", ""}:
                 candidate_paths.append(Path(ref_fasta))
-    ref_list = prepared_dir / "ref_list.txt"
-    if ref_list.exists():
-        for line in ref_list.read_text(encoding="utf-8").splitlines():
-            line = line.strip()
-            if line:
-                candidate_paths.append(Path(line))
+    if not candidate_paths:
+        ref_list = prepared_dir / "ref_list.txt"
+        if ref_list.exists():
+            for line in ref_list.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if line:
+                    candidate_paths.append(Path(line))
 
+    sizes: list[int] = []
     seen: set[Path] = set()
     for path in candidate_paths:
         path = path.resolve()
@@ -4895,8 +6523,11 @@ def estimate_prepared_genome_size_hint(prepared_dir: Path) -> int:
                     continue
                 total += len(line.strip())
         if total > 0:
-            return total
-    return 0
+            sizes.append(total)
+    if not sizes:
+        return 0
+    sizes.sort()
+    return sizes[len(sizes) // 2]
 
 
 def run_mycosv(
@@ -4918,16 +6549,40 @@ def run_mycosv(
     out_prefix = mycosv_dir / "calls"
     caller_args = list(extra_args)
     if ref_list_override is not None:
-        # A benchmark-scoped ref list contains only the per-query comparator
-        # references, so the flat reference fallback is both cheap and needed
-        # for anchored reference-coordinate calls. Heavy real-data invocations
-        # may pass --no-flat-ref-fallback by default; drop it here in every
-        # hierarchical path, not only the reused-index path below.
-        caller_args = [a for a in caller_args if a != "--no-flat-ref-fallback"]
-    if mode == "short-reads" and "--max-reads" not in caller_args:
-        caller_args.extend(["--max-reads", "150000"])
-    if mode == "long-reads" and "--max-reads" not in caller_args:
-        caller_args.extend(["--max-reads", "100"])
+        # A benchmark-scoped ref list can still be large in million-real runs:
+        # 256 fungal FASTAs are enough to spend tens of GiB on raw sequences +
+        # suffix-array cache and can spin for a long time on the first query.
+        # Keep flat fallback only for small override lists unless explicitly
+        # requested. Hierarchical-only mode still produces a VCF/report, while
+        # avoiding the memory-heavy all-ref MEM-chain fallback.
+        # The million-real benchmark builds a bounded ref subset for downstream
+        # comparison, but 256 fungal assemblies can still expand to tens of
+        # thousands of contigs and several GiB of raw sequence. Keep flat
+        # fallback to genuinely small debug/benchmark subsets by default; raise
+        # MYCOSV_FLAT_REF_FALLBACK_MAX_REFS or set MYCOSV_FORCE_FLAT_REF_FALLBACK=1
+        # when running on a node sized for all-vs-all MEM-chain rescue.
+        flat_ref_limit = int(os.environ.get("MYCOSV_FLAT_REF_FALLBACK_MAX_REFS", "64"))
+        try:
+            with ref_list_override.open(encoding="utf-8") as fh:
+                override_ref_count = sum(1 for line in fh if line.strip())
+        except OSError:
+            override_ref_count = flat_ref_limit + 1
+        force_flat = os.environ.get("MYCOSV_FORCE_FLAT_REF_FALLBACK", "0") == "1"
+        if force_flat or override_ref_count <= flat_ref_limit:
+            caller_args = [a for a in caller_args if a != "--no-flat-ref-fallback"]
+            sys.stderr.write(
+                f"[mycosv] flat-ref fallback allowed for {override_ref_count} "
+                f"benchmark refs (limit={flat_ref_limit})\n"
+            )
+        elif "--no-flat-ref-fallback" not in caller_args:
+            caller_args.append("--no-flat-ref-fallback")
+            sys.stderr.write(
+                f"[mycosv] keeping flat-ref fallback disabled for "
+                f"{override_ref_count} benchmark refs (limit={flat_ref_limit}); "
+                "set MYCOSV_FORCE_FLAT_REF_FALLBACK=1 to override\n"
+            )
+    # Give read-mode auto-tuning a genome-size denominator even when the
+    # query-list points at bounded benchmark FASTQs.
     if mode != "assembly" and "--genome-size-hint" not in caller_args:
         genome_size_hint = estimate_prepared_genome_size_hint(prepared_dir)
         if genome_size_hint > 0:
@@ -4956,13 +6611,10 @@ def run_mycosv(
                 f"[mycosv] reusing pre-built routing index at {idx_dir} "
                 f"(registry={reg_dir})\n"
             )
-            # When the caller has narrowed --ref-list down to a small set of
-            # benchmark refs (one per held-out query), the flat-ref fallback
-            # can run cheaply and is required for anchored SV calls — without
-            # it hierarchical_call_assembly's Path A/B never see ref sequences
-            # and every contig falls through to Path C as SVTYPE=OFF_REF.
-            # Only suppress the fallback when the ref_list is the full
-            # routing corpus (~2000 NCBI assemblies).
+            # For small benchmark ref subsets, flat fallback gives anchored
+            # reference-coordinate calls. For large subsets, the guard above
+            # keeps --no-flat-ref-fallback so the million-real benchmark does
+            # not load hundreds of FASTAs into the MEM-chain path.
             if ref_list_override is None and "--no-flat-ref-fallback" not in caller_args:
                 caller_args.append("--no-flat-ref-fallback")
                 sys.stderr.write(
@@ -4970,10 +6622,16 @@ def run_mycosv(
                     "hierarchical index to keep memory bounded\n"
                 )
             elif ref_list_override is not None:
-                sys.stderr.write(
-                    f"[mycosv] flat-ref fallback ENABLED against {ref_list_override} "
-                    "(benchmark-only ref subset; safe for memory)\n"
-                )
+                if "--no-flat-ref-fallback" in caller_args:
+                    sys.stderr.write(
+                        f"[mycosv] flat-ref fallback DISABLED for {ref_list_override}; "
+                        "using hierarchical calls only for this benchmark subset\n"
+                    )
+                else:
+                    sys.stderr.write(
+                        f"[mycosv] flat-ref fallback ENABLED against {ref_list_override} "
+                        "(benchmark-only ref subset; safe for memory)\n"
+                    )
         else:
             idx_dir = mycosv_dir / "idx"
             reg_dir = mycosv_dir / "reg"
@@ -5004,6 +6662,7 @@ def run_mycosv(
             "--query-list", str(query_list_path),
             "--out-prefix", str(out_prefix.resolve()),
             "--query-mode", mode,
+            "--threads", str(threads),
             "--tol-index-threads", str(threads),
             *caller_args,
         ]
@@ -5018,10 +6677,79 @@ def run_mycosv(
             "--query-mode", mode,
             *caller_args,
         ]
-    run_mycosv_command(cmd, cwd=ROOT)
+    # Stream stdout/stderr to disk in real time so a hung query is visible
+    # via `tail -f calls.stderr.log` instead of looking dead until the
+    # subprocess exits (or SLURM kills it).
+    calls_stdout_log = mycosv_dir / "calls.stdout.log"
+    calls_stderr_log = mycosv_dir / "calls.stderr.log"
+    result = run_mycosv_command(
+        cmd,
+        cwd=ROOT,
+        stream_stdout_path=calls_stdout_log,
+        stream_stderr_path=calls_stderr_log,
+    )
+    # The streaming path already wrote to disk; the in-memory `result.stdout`
+    # / `result.stderr` carry only the tail. The non-streaming path (older
+    # callers) returns full bytes — write them too so existing log layout
+    # is preserved either way.
+    if result.stdout and not calls_stdout_log.exists():
+        calls_stdout_log.write_text(result.stdout, encoding="utf-8")
+    if result.stderr and not calls_stderr_log.exists():
+        calls_stderr_log.write_text(result.stderr, encoding="utf-8")
+    vcf_path = out_prefix.with_suffix(".vcf")
+    hits_path = out_prefix.with_suffix(".hits.tsv")
+    if not vcf_path.exists() or vcf_path.stat().st_size == 0:
+        raise subprocess.CalledProcessError(
+            90,
+            cmd,
+            stderr=f"MycoSV produced an empty or missing VCF: {vcf_path}",
+        )
+    data_records = 0
+    try:
+        with vcf_path.open(encoding="utf-8") as fh:
+            has_vcf_header = False
+            for line in fh:
+                if line.startswith("#CHROM\t"):
+                    has_vcf_header = True
+                elif line and not line.startswith("#"):
+                    data_records += 1
+    except OSError as exc:
+        raise subprocess.CalledProcessError(
+            90,
+            cmd,
+            stderr=f"MycoSV VCF could not be read: {vcf_path}: {exc}",
+        ) from exc
+    if not has_vcf_header:
+        raise subprocess.CalledProcessError(
+            90,
+            cmd,
+            stderr=f"MycoSV VCF is malformed; missing #CHROM header: {vcf_path}",
+        )
+    stderr_text = getattr(result, "stderr", "") or ""
+    fatal_empty_markers = (
+        "std::bad_alloc",
+        "no sequences after preprocessing",
+        "cannot decompress",
+        "query preprocessing/calling failure",
+    )
+    if data_records == 0 and any(marker in stderr_text for marker in fatal_empty_markers):
+        raise subprocess.CalledProcessError(
+            91,
+            cmd,
+            stderr=(
+                f"MycoSV produced a header-only VCF after query failures: "
+                f"{vcf_path}. See {mycosv_dir / 'calls.stderr.log'}"
+            ),
+        )
+    if not hits_path.exists():
+        raise subprocess.CalledProcessError(
+            90,
+            cmd,
+            stderr=f"MycoSV produced no hits TSV: {hits_path}",
+        )
     return {
-        "vcf": str(out_prefix.with_suffix(".vcf")),
-        "hits": str(out_prefix.with_suffix(".hits.tsv")),
+        "vcf": str(vcf_path),
+        "hits": str(hits_path),
         "gfa": str(out_prefix.with_suffix(".gfa")),
     }
 
@@ -5112,17 +6840,22 @@ def run_syri_for_query(query_row: dict[str, str], out_dir: Path, threads: int) -
     # the doubled "<cwd>/<abs-prefix>" path that crashes dictConfig with
     # "Unable to configure handler 'log_file'". Pass --dir explicitly and keep
     # --prefix as a basename so the join always lands inside work_dir.
+    # asm20, not asm5: the benchmark reference is a held-out sibling-clade
+    # genome (cross-species fungal pair). asm5 fragments such alignments and
+    # SyRI then rejects the pair as non-syntenic; asm20 (<=20% divergence)
+    # is the divergence band these pairs actually fall in.
     with sam_path.open("wb") as sam_out:
         subprocess.run(
-            ["minimap2", "-ax", "asm5", "--eqx", "-t", str(threads), str(ref_fa_plain), str(query_fa_plain)],
+            ["minimap2", "-ax", "asm20", "--eqx", "-t", str(threads), str(ref_fa_plain), str(query_fa_plain)],
             stdout=sam_out,
             stderr=subprocess.PIPE,
             check=True,
-            timeout=_TOOL_TIMEOUT,
+            timeout=_COMPARATOR_TIMEOUT,
         )
     try:
         run(["syri", "-c", str(sam_path), "-r", str(ref_fa_plain), "-q", str(query_fa_plain),
-             "-k", "-F", "S", "--dir", str(work_dir), "--prefix", "syri_"], cwd=work_dir)
+             "-k", "-F", "S", "--dir", str(work_dir), "--prefix", "syri_"],
+            cwd=work_dir, timeout=_COMPARATOR_TIMEOUT)
     except subprocess.CalledProcessError as exc:
         # SyRI rejects highly divergent pairs (e.g. cross-genus assemblies)
         # with a non-zero exit. Treat as "no comparator output" rather than
@@ -5167,14 +6900,14 @@ def run_minigraph_for_query(query_row: dict[str, str], out_dir: Path, threads: i
     # Binary-mode stdout-to-file: minigraph/gfatools emit text but the kernel
     # path bypasses Python's text decoder, so non-UTF-8 bytes in a contig name
     # (rare but observed on public ENA assemblies) don't kill the subprocess
-    # wrapper before the truth set lands on disk.
+    # wrapper before the comparator callset lands on disk.
     with graph_gfa.open("wb") as out_fh:
         subprocess.run(
             ["minigraph", "-cxggs", "-c", "-t", str(threads), *extra_args, str(ref_fa), str(query_fa)],
             stdout=out_fh,
             stderr=subprocess.PIPE,
             check=True,
-            timeout=_TOOL_TIMEOUT,
+            timeout=_COMPARATOR_TIMEOUT,
         )
     with bubble_bed.open("wb") as out_fh:
         subprocess.run(
@@ -5182,7 +6915,7 @@ def run_minigraph_for_query(query_row: dict[str, str], out_dir: Path, threads: i
             stdout=out_fh,
             stderr=subprocess.PIPE,
             check=True,
-            timeout=_TOOL_TIMEOUT,
+            timeout=_COMPARATOR_TIMEOUT,
         )
     with sample_bed.open("wb") as out_fh:
         subprocess.run(
@@ -5190,7 +6923,7 @@ def run_minigraph_for_query(query_row: dict[str, str], out_dir: Path, threads: i
             stdout=out_fh,
             stderr=subprocess.PIPE,
             check=True,
-            timeout=_TOOL_TIMEOUT,
+            timeout=_COMPARATOR_TIMEOUT,
         )
     return {
         "label": "minigraph",
@@ -5251,7 +6984,7 @@ def run_pggb_for_query(query_row: dict[str, str], out_dir: Path, threads: int, i
 
     if tool_path("samtools"):
         try:
-            run(["samtools", "faidx", str(pair_fa)], cwd=ROOT)
+            run(["samtools", "faidx", str(pair_fa)], cwd=ROOT, timeout=_COMPARATOR_TIMEOUT)
         except subprocess.CalledProcessError:
             pass
     cmd = [
@@ -5266,7 +6999,7 @@ def run_pggb_for_query(query_row: dict[str, str], out_dir: Path, threads: int, i
         *extra_args,
     ]
     try:
-        run(cmd, cwd=ROOT)
+        run(cmd, cwd=ROOT, timeout=_COMPARATOR_TIMEOUT)
     except subprocess.CalledProcessError as exc:
         # pggb exit 2 is what wfmash / seqwish / smoothxg / vg deconstruct
         # use when their inputs are unalignable (too divergent, identical
@@ -5359,20 +7092,21 @@ def _minimap2_align_reads(
             ["minimap2", "-ax", preset, "-t", str(threads), str(ref_fa_plain), str(reads_path)],
             stdout=sam_out,
             stderr=subprocess.PIPE,
-            timeout=_TOOL_TIMEOUT,
+            timeout=_COMPARATOR_TIMEOUT,
             check=True,
         )
     # samtools sort -> BAM
     run(
         ["samtools", "sort", "-@", str(threads), "-o", str(bam_sorted), str(sam_path)],
         cwd=ROOT,
+        timeout=_COMPARATOR_TIMEOUT,
     )
     # samtools index
-    run(["samtools", "index", str(bam_sorted)], cwd=ROOT)
+    run(["samtools", "index", str(bam_sorted)], cwd=ROOT, timeout=_COMPARATOR_TIMEOUT)
     # Reference needs a .fai for downstream callers (Delly/Manta especially).
     if not (ref_fa_plain.parent / (ref_fa_plain.name + ".fai")).exists():
         try:
-            run(["samtools", "faidx", str(ref_fa_plain)], cwd=ROOT)
+            run(["samtools", "faidx", str(ref_fa_plain)], cwd=ROOT, timeout=_COMPARATOR_TIMEOUT)
         except subprocess.CalledProcessError:
             pass
     # Drop the giant intermediate SAM once the BAM exists.
@@ -5424,19 +7158,27 @@ def run_svim_for_query(query_row: dict[str, str], out_dir: Path, threads: int) -
     bam_sorted, ref_fa = aligned
     svim_out = work_dir / "svim_out"
     svim_out.mkdir(parents=True, exist_ok=True)
+    # SVIM 2.0 + matplotlib 3.9 crashes in its final plotting step with
+    # `AttributeError: 'Legend' object has no attribute 'legendHandles'`
+    # (renamed to `legend_handles`). The VCF is written *before* the plot
+    # step so a non-zero exit is harmless — we keep the VCF and continue.
     try:
         run(
             ["svim", "alignment", str(svim_out), str(bam_sorted), str(ref_fa)],
             cwd=ROOT,
+            timeout=_COMPARATOR_TIMEOUT,
         )
-    except subprocess.CalledProcessError:
+    except subprocess.CalledProcessError as exc:
         vcf_path = _existing_variants_vcf(svim_out)
         if vcf_path is None:
             _log_comparator_failure(out_dir, "svim", query_asm, "failed_no_vcf")
             return None
+        tail = _stderr_tail(exc, max_lines=3)
+        legend_bug = "legendHandles" in (tail or "")
         sys.stderr.write(
-            f"[warn] svim exited non-zero for {query_asm}, but produced "
-            f"{vcf_path}; keeping VCF output\n"
+            f"[warn] svim exited non-zero for {query_asm} "
+            f"({'matplotlib legend bug — VCF unaffected' if legend_bug else 'see stderr'}), "
+            f"keeping VCF output{tail}\n"
         )
         return {"label": "svim", "vcf": str(vcf_path)}
     vcf_path = _existing_variants_vcf(svim_out)
@@ -5478,11 +7220,11 @@ def run_sniffles_for_query(query_row: dict[str, str], out_dir: Path, threads: in
         if "OXFORD_NANOPORE" in platform else base_cmd
     )
     try:
-        run(ont_model_cmd, cwd=ROOT)
+        run(ont_model_cmd, cwd=ROOT, timeout=_COMPARATOR_TIMEOUT)
     except subprocess.CalledProcessError:
         if ont_model_cmd is not base_cmd:
             try:
-                run(base_cmd, cwd=ROOT)
+                run(base_cmd, cwd=ROOT, timeout=_COMPARATOR_TIMEOUT)
             except subprocess.CalledProcessError:
                 return None
         else:
@@ -5534,7 +7276,7 @@ def run_cutesv_for_query(query_row: dict[str, str], out_dir: Path, threads: int)
         "--sample", query_asm,
     ]
     try:
-        run(cmd, cwd=ROOT)
+        run(cmd, cwd=ROOT, timeout=_COMPARATOR_TIMEOUT)
     except subprocess.CalledProcessError:
         return None
     if not vcf_path.exists():
@@ -5560,7 +7302,7 @@ def run_delly_for_query(query_row: dict[str, str], out_dir: Path, threads: int) 
         subprocess.run(
             ["delly", "call", "-g", str(ref_fa), "-o", str(bcf_path), str(bam_sorted)],
             check=True, text=True, capture_output=True, env=env, cwd=str(ROOT),
-            timeout=_TOOL_TIMEOUT,
+            timeout=_COMPARATOR_TIMEOUT,
         )
     except subprocess.CalledProcessError:
         return None
@@ -5571,7 +7313,7 @@ def run_delly_for_query(query_row: dict[str, str], out_dir: Path, threads: int) 
         subprocess.run(
             ["bcftools", "view", str(bcf_path)],
             stdout=out_fh, stderr=subprocess.PIPE, check=True,
-            timeout=_TOOL_TIMEOUT,
+            timeout=_COMPARATOR_TIMEOUT,
         )
     return {"label": "delly", "vcf": str(vcf_path)}
 
@@ -5598,10 +7340,12 @@ def run_manta_for_query(query_row: dict[str, str], out_dir: Path, threads: int) 
              "--referenceFasta", str(ref_fa),
              "--runDir", str(run_dir)],
             cwd=ROOT,
+            timeout=_COMPARATOR_TIMEOUT,
         )
         run(
             [str(run_dir / "runWorkflow.py"), "-j", str(threads)],
             cwd=ROOT,
+            timeout=_COMPARATOR_TIMEOUT,
         )
     except subprocess.CalledProcessError:
         return None
@@ -5687,7 +7431,7 @@ def run_cactus_for_query(
         *extra_args,
     ]
     try:
-        run(cmd, cwd=ROOT)
+        run(cmd, cwd=ROOT, timeout=_COMPARATOR_TIMEOUT)
     except subprocess.CalledProcessError:
         return None
 
@@ -5782,18 +7526,27 @@ def run_svim_asm_for_query(query_row: dict[str, str], out_dir: Path, threads: in
 
     sam_path = work_dir / "query_vs_ref.sam"
     bam_sorted = work_dir / "query_vs_ref.sorted.bam"
+    # asm20 (divergence <=20%), NOT asm5 (<=5%). The benchmark reference is a
+    # held-out *sibling-clade* genome, so query vs ref is a cross-species
+    # fungal pair. asm5 on such a pair yields only short, ambiguous
+    # alignments — every record comes back MAPQ 0 — and svim-asm's
+    # min_mapq=20 filter then discards them all ("Found 0 candidates"),
+    # giving truth_calls=0 and F1=nan for the diverged samples. asm20 keeps
+    # the cross-species synteny minimap2 can actually anchor; it matches the
+    # asm20 preset the clade-lift path already uses for the same reason.
     with sam_path.open("wb") as sam_out:
         subprocess.run(
-            ["minimap2", "-ax", "asm5", "-t", str(threads), str(ref_fa_plain), str(query_fa)],
+            ["minimap2", "-ax", "asm20", "-t", str(threads), str(ref_fa_plain), str(query_fa)],
             stdout=sam_out, stderr=subprocess.PIPE, check=True,
-            timeout=_TOOL_TIMEOUT,
+            timeout=_COMPARATOR_TIMEOUT,
         )
     try:
         run(
             ["samtools", "sort", "-@", str(threads), "-o", str(bam_sorted), str(sam_path)],
             cwd=ROOT,
+            timeout=_COMPARATOR_TIMEOUT,
         )
-        run(["samtools", "index", str(bam_sorted)], cwd=ROOT)
+        run(["samtools", "index", str(bam_sorted)], cwd=ROOT, timeout=_COMPARATOR_TIMEOUT)
     except subprocess.CalledProcessError:
         return None
     try:
@@ -5807,6 +7560,7 @@ def run_svim_asm_for_query(query_row: dict[str, str], out_dir: Path, threads: in
         run(
             ["svim-asm", "haploid", str(svim_out), str(bam_sorted), str(ref_fa_plain)],
             cwd=ROOT,
+            timeout=_COMPARATOR_TIMEOUT,
         )
     except subprocess.CalledProcessError:
         vcf_path = _existing_variants_vcf(svim_out)
@@ -5875,7 +7629,7 @@ def run_anchorwave_for_query(query_row: dict[str, str], out_dir: Path, threads: 
         subprocess.run(
             ["minimap2", "-ax", "asm5", "--cs", "-t", str(threads), str(ref_fa_plain), str(query_fa)],
             stdout=sam_out, stderr=subprocess.PIPE, check=True,
-            timeout=_TOOL_TIMEOUT,
+            timeout=_COMPARATOR_TIMEOUT,
         )
     # Step 2: SAM -> PAF via paftools for downstream AnchorWave refinement.
     try:
@@ -5883,7 +7637,7 @@ def run_anchorwave_for_query(query_row: dict[str, str], out_dir: Path, threads: 
             subprocess.run(
                 [paftools, "sam2paf", str(sam_path)],
                 stdout=paf_out, stderr=subprocess.PIPE, check=True,
-                timeout=_TOOL_TIMEOUT,
+                timeout=_COMPARATOR_TIMEOUT,
             )
     except subprocess.CalledProcessError:
         return None
@@ -5893,7 +7647,7 @@ def run_anchorwave_for_query(query_row: dict[str, str], out_dir: Path, threads: 
             subprocess.run(
                 ["sort", "-k6,6", "-k8,8n", str(paf_path)],
                 stdout=srt_out, stderr=subprocess.PIPE, check=True,
-                timeout=_TOOL_TIMEOUT,
+                timeout=_COMPARATOR_TIMEOUT,
             )
     except subprocess.CalledProcessError:
         return None
@@ -5907,7 +7661,7 @@ def run_anchorwave_for_query(query_row: dict[str, str], out_dir: Path, threads: 
             subprocess.run(
                 [paftools, "call", "-f", str(ref_fa_plain), "-L", "50", str(sorted_paf)],
                 stdout=vcf_out, stderr=subprocess.PIPE, check=True,
-                timeout=_TOOL_TIMEOUT,
+                timeout=_COMPARATOR_TIMEOUT,
             )
     except subprocess.CalledProcessError:
         return None
@@ -5921,19 +7675,441 @@ def run_anchorwave_for_query(query_row: dict[str, str], out_dir: Path, threads: 
     return {"label": "anchorwave", "vcf": str(vcf_path)}
 
 
+def _per_query_thread_budget(n_queries: int, threads: int) -> tuple[int, int]:
+    """Return (max_parallel_queries, per_query_threads) for a comparator pool.
+
+    Cap parallelism so each query still gets >=3 threads (the practical floor
+    where minimap2 / samtools sort show usable speedup): for the typical
+    million-real 5-query x 16-thread case this yields 5 parallel queries with
+    3 threads each, versus the old 1 query x 16 threads x 5 serial iterations.
+    """
+    n = max(1, n_queries)
+    per_min = max(1, threads // n if threads >= n else 1)
+    if per_min < 3 and threads >= 3:
+        max_parallel = max(1, threads // 3)
+    else:
+        max_parallel = n
+    max_parallel = min(max_parallel, n)
+    per_query_threads = max(1, threads // max(1, max_parallel))
+    return max_parallel, per_query_threads
+
+
+def run_per_query_in_parallel(
+    label: str,
+    runner,
+    queries: list[dict[str, str]],
+    out_dir: Path,
+    threads: int,
+) -> dict[str, dict[str, str] | None]:
+    """Schedule per-query comparator calls across a thread pool.
+
+    `runner` must take (query_row, out_dir, per_query_threads) and return the
+    per-query result dict (or None). Failures on a single query are caught,
+    logged, and recorded via _log_comparator_failure — they do not abort the
+    other queries in the pool. Returns {query_asm: result_or_None}.
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    if not queries:
+        return {}
+    max_parallel, per_query_threads = _per_query_thread_budget(len(queries), threads)
+    results: dict[str, dict[str, str] | None] = {}
+    sys.stderr.write(
+        f"[parallel] {label}: scheduling {len(queries)} queries across "
+        f"{max_parallel} workers ({per_query_threads} threads each)\n"
+    )
+    sys.stderr.flush()
+    with ThreadPoolExecutor(max_workers=max_parallel) as pool:
+        futures = {
+            pool.submit(runner, qr, out_dir, per_query_threads): qr
+            for qr in queries
+        }
+        for fut in as_completed(futures):
+            qr = futures[fut]
+            qa = qr["query_asm"]
+            try:
+                results[qa] = fut.result()
+            except subprocess.TimeoutExpired as exc:
+                sys.stderr.write(
+                    f"[warn] {label} timed out for {qa} after "
+                    f"{_COMPARATOR_TIMEOUT}s — continuing other queries\n"
+                )
+                _log_comparator_failure(out_dir, label, qa, f"timeout:{exc}")
+                results[qa] = None
+            except Exception as exc:  # pragma: no cover - defensive
+                sys.stderr.write(f"[warn] {label} failed for {qa}: {exc}\n")
+                _log_comparator_failure(out_dir, label, qa, f"exception:{exc}")
+                results[qa] = None
+    return results
+
+
 def call_key(call: NormalizedCall) -> tuple[str, str, int, int, str]:
     return (call.query_asm, call.query_contig, call.pos, call.end, call.svtype)
+
+
+def pangenome_locus_key(call: NormalizedCall, bucket_bp: int = 100) -> tuple[str, str, str, int, int, int, str, int]:
+    """Collapse reference-background duplicates into an approximate pangenome
+    locus key. This intentionally ignores ref_asm: the same query-space event
+    called against several pangenome references should count once as a
+    deduplicated biological locus, while raw_pairwise observations still count
+    every VCF row.
+    """
+    bucket = max(1, bucket_bp)
+    mate_contig = "."
+    mate_bucket = -1
+    if _has_mate(call):
+        mate_contig = call.mate_contig or "."
+        mate_bucket = max(0, call.mate_pos) // bucket
+    return (
+        call.query_asm,
+        call.query_contig,
+        call.svtype,
+        max(0, call.pos) // bucket,
+        max(0, call.end) // bucket,
+        abs(call.svlen) // bucket,
+        mate_contig,
+        mate_bucket,
+    )
+
+
+def write_pangenome_call_layers(
+    out_path: Path,
+    query_manifest: list[dict[str, str]],
+    mycosv_calls_by_query: dict[str, dict[str, Any]],
+    single_ref_counts: dict[str, int],
+    single_ref_keys_by_query: dict[str, set[tuple[str, str, int, int, str]]],
+    support_by_key: dict[tuple[str, str, int, int, str], list[str]],
+    validated_by_query: dict[str, set[tuple[str, str, int, int, str]]],
+) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    totals = {
+        "raw_pairwise_pangenome_observations": 0,
+        "deduplicated_pangenome_loci": 0,
+        "single_reference_equivalent_calls": 0,
+        "pangenome_only_calls": 0,
+        "pangenome_only_read_supported": 0,
+        "pangenome_only_intrinsic_supported": 0,
+    }
+    for row in query_manifest:
+        qa = row["query_asm"]
+        calls = list(mycosv_calls_by_query.get(qa, {}).get("query", []))
+        loci = {pangenome_locus_key(c) for c in calls}
+        validated = validated_by_query.get(qa, set())
+        single_ref_keys = single_ref_keys_by_query.get(qa, set())
+        single_ref_loci = {
+            pangenome_locus_key(c) for c in calls if call_key(c) in single_ref_keys
+        }
+        pangenome_only_loci: dict[
+            tuple[str, str, str, int, int, int, str, int],
+            dict[str, bool],
+        ] = {}
+        for call in calls:
+            key = call_key(call)
+            if support_by_key.get(key):
+                continue
+            locus = pangenome_locus_key(call)
+            if key in single_ref_keys or locus in single_ref_loci:
+                continue
+            state = pangenome_only_loci.setdefault(
+                locus, {"read_supported": False, "intrinsic_supported": False}
+            )
+            if key in validated:
+                state["read_supported"] = True
+            elif (call.read_support or 0) >= 2:
+                state["intrinsic_supported"] = True
+        single_ref = int(single_ref_counts.get(qa, 0))
+        pangenome_only = len(pangenome_only_loci)
+        pangenome_only_read = sum(
+            1 for state in pangenome_only_loci.values()
+            if state["read_supported"]
+        )
+        pangenome_only_intrinsic = sum(
+            1 for state in pangenome_only_loci.values()
+            if state["intrinsic_supported"] and not state["read_supported"]
+        )
+        record = {
+            "query_asm": qa,
+            "query_mode": row.get("query_mode", "."),
+            "raw_pairwise_pangenome_observations": len(calls),
+            "deduplicated_pangenome_loci": len(loci),
+            "single_reference_equivalent_calls": single_ref,
+            "pangenome_only_calls": pangenome_only,
+            "pangenome_only_read_supported": pangenome_only_read,
+            "pangenome_only_intrinsic_supported": pangenome_only_intrinsic,
+            "raw_to_deduplicated_ratio": f"{(len(calls) / len(loci)):.3f}" if loci else "nan",
+            "single_ref_fraction_of_raw": f"{(single_ref / len(calls)):.4f}" if calls else "nan",
+        }
+        rows.append(record)
+        for k in totals:
+            totals[k] += int(record[k])
+    if rows:
+        total_raw = totals["raw_pairwise_pangenome_observations"]
+        total_dedup = totals["deduplicated_pangenome_loci"]
+        total_single = totals["single_reference_equivalent_calls"]
+        rows.append({
+            "query_asm": "ALL",
+            "query_mode": "all",
+            **totals,
+            "raw_to_deduplicated_ratio": f"{(total_raw / total_dedup):.3f}" if total_dedup else "nan",
+            "single_ref_fraction_of_raw": f"{(total_single / total_raw):.4f}" if total_raw else "nan",
+        })
+    write_tsv(
+        out_path,
+        rows,
+        [
+            "query_asm", "query_mode",
+            "raw_pairwise_pangenome_observations",
+            "deduplicated_pangenome_loci",
+            "single_reference_equivalent_calls",
+            "pangenome_only_calls",
+            "pangenome_only_read_supported",
+            "pangenome_only_intrinsic_supported",
+            "raw_to_deduplicated_ratio",
+            "single_ref_fraction_of_raw",
+        ],
+    )
+    return rows
+
+
+_TE_LIKE_CLASSES = {
+    "REPEAT", "TE", "LTR_GYPSY", "LTR_COPIA", "DNA_TIR", "HELITRON", "MITE",
+    "LINE", "SINE", "RIP", "STARSHIP", "HGT", "TE_LTR", "TE_TIR", "TE_LINE", "TE_SINE",
+}
+
+
+def _fisher_right_tail(a: int, b: int, c: int, d: int) -> float:
+    """One-sided Fisher exact P(X >= a): feature enrichment in group A.
+
+    Table:
+      feature yes:  a in group A, c in group B
+      feature no:   b in group A, d in group B
+    """
+    n = a + b + c + d
+    row_a = a + b
+    col_feature = a + c
+    if n == 0 or row_a == 0 or col_feature == 0:
+        return float("nan")
+    lo = max(0, row_a - (n - col_feature))
+    hi = min(row_a, col_feature)
+
+    def hypergeom(x: int) -> float:
+        return (
+            math.comb(col_feature, x)
+            * math.comb(n - col_feature, row_a - x)
+            / math.comb(n, row_a)
+        )
+
+    return min(1.0, sum(hypergeom(x) for x in range(max(a, lo), hi + 1)))
+
+
+def _odds_ratio(a: int, b: int, c: int, d: int) -> float:
+    # Haldane-Anscombe correction keeps odds ratios finite for empty cells.
+    return ((a + 0.5) * (d + 0.5)) / ((b + 0.5) * (c + 0.5))
+
+
+def _stream_gene_interval_index(
+    gene_annotations_tsv: Path | None,
+    calls: list[NormalizedCall],
+) -> dict[tuple[str, str], tuple[list[int], list[int]]]:
+    wanted: dict[tuple[str, str], None] = {
+        (c.query_asm, c.query_contig): None
+        for c in calls
+        if c.query_asm and c.query_contig
+    }
+    wanted.update({
+        (".", c.query_contig): None
+        for c in calls
+        if c.query_contig
+    })
+    if not wanted or gene_annotations_tsv is None or not gene_annotations_tsv.exists():
+        return {}
+    if _GENE_ANNOTATION_MAX_BYTES >= 0:
+        try:
+            size = gene_annotations_tsv.stat().st_size
+        except OSError:
+            size = 0
+        if size > _GENE_ANNOTATION_MAX_BYTES:
+            sys.stderr.write(
+                f"[gene-annot] skipping gene-proximal enrichment for "
+                f"{gene_annotations_tsv} ({size} bytes > "
+                f"MYCOSV_GENE_ANNOTATION_MAX_BYTES={_GENE_ANNOTATION_MAX_BYTES})\n"
+            )
+            return {}
+    intervals: dict[tuple[str, str], list[tuple[int, int]]] = defaultdict(list)
+    try:
+        with gene_annotations_tsv.open(encoding="utf-8", errors="replace", newline="") as fh:
+            reader = csv.DictReader(fh, delimiter="\t")
+            for row in reader:
+                qasm = row.get("query_asm") or row.get("asm") or "."
+                contig = row.get("query_contig") or row.get("contig") or row.get("chrom") or row.get("seqid") or ""
+                key = (qasm, contig)
+                if key not in wanted:
+                    continue
+                try:
+                    start = int(float(row.get("start") or row.get("gene_start") or row.get("pos") or 0))
+                    end = int(float(row.get("end") or row.get("gene_end") or row.get("stop") or start))
+                except ValueError:
+                    continue
+                if end < start:
+                    start, end = end, start
+                if start > 0 and end > 0:
+                    intervals[key].append((start, end))
+    except OSError:
+        return {}
+
+    out: dict[tuple[str, str], tuple[list[int], list[int]]] = {}
+    for key, vals in intervals.items():
+        vals.sort()
+        starts: list[int] = []
+        prefix_max_end: list[int] = []
+        cur = 0
+        for start, end in vals:
+            starts.append(start)
+            cur = max(cur, end)
+            prefix_max_end.append(cur)
+        out[key] = (starts, prefix_max_end)
+    return out
+
+
+def _call_is_gene_proximal(
+    call: NormalizedCall,
+    gene_index: dict[tuple[str, str], tuple[list[int], list[int]]],
+    window_bp: int,
+) -> bool:
+    starts, prefix_max_end = (
+        gene_index.get((call.query_asm, call.query_contig))
+        or gene_index.get((".", call.query_contig))
+        or ([], [])
+    )
+    if not starts:
+        return False
+    left = max(1, min(call.pos, call.end) - window_bp)
+    right = max(call.pos, call.end) + window_bp
+    idx = bisect.bisect_right(starts, right)
+    return idx > 0 and prefix_max_end[idx - 1] >= left
+
+
+def write_mycosv_novel_biology_enrichment(
+    out_path: Path,
+    calls: list[NormalizedCall],
+    support_by_key: dict[tuple[str, str, int, int, str], list[str]],
+    single_ref_keys_by_query: dict[str, set[tuple[str, str, int, int, str]]],
+    single_ref_loci_by_query: dict[
+        str, set[tuple[str, str, str, int, int, int, str, int]]
+    ],
+    validated_by_query: dict[str, set[tuple[str, str, int, int, str]]],
+    gene_annotations_tsv: Path | None,
+    *,
+    gene_window_bp: int = 5000,
+) -> list[dict[str, Any]]:
+    gene_index = _stream_gene_interval_index(gene_annotations_tsv, calls)
+
+    def has_external_read(call: NormalizedCall) -> bool:
+        return call_key(call) in validated_by_query.get(call.query_asm, set())
+
+    def is_unique(call: NormalizedCall) -> bool:
+        key = call_key(call)
+        if key in single_ref_keys_by_query.get(call.query_asm, set()):
+            return False
+        if pangenome_locus_key(call) in single_ref_loci_by_query.get(call.query_asm, set()):
+            return False
+        return not support_by_key.get(key)
+
+    feature_defs = {
+        "te_or_mge_like": lambda c: (c.element_class or "NONE").upper() in _TE_LIKE_CLASSES,
+        "off_reference_or_novel": lambda c: c.svtype == "OFF_REF" or c.annotation in {"NOVEL", "NOVEL_WEAK", "DIVERGED"},
+        "hgt_or_starship_candidate": lambda c: (c.element_class or "").upper() in {"HGT", "STARSHIP"},
+        f"gene_proximal_{gene_window_bp}bp": lambda c: _call_is_gene_proximal(c, gene_index, gene_window_bp),
+    }
+
+    rows: list[dict[str, Any]] = []
+    for feature, predicate in feature_defs.items():
+        unique_calls = [c for c in calls if is_unique(c)]
+        supported_calls = [c for c in calls if not is_unique(c)]
+        a = sum(1 for c in unique_calls if predicate(c))
+        b = len(unique_calls) - a
+        c_count = sum(1 for c in supported_calls if predicate(c))
+        d = len(supported_calls) - c_count
+        rows.append({
+            "feature": feature,
+            "group_a": "mycosv_unique",
+            "group_b": "comparator_supported",
+            "a_feature": a,
+            "a_nonfeature": b,
+            "b_feature": c_count,
+            "b_nonfeature": d,
+            "odds_ratio": f"{_odds_ratio(a, b, c_count, d):.6g}",
+            "fisher_right_p": (
+                f"{_fisher_right_tail(a, b, c_count, d):.6g}"
+                if supported_calls and unique_calls else "nan"
+            ),
+            "unique_read_supported_feature": sum(
+                1 for call in unique_calls if predicate(call) and has_external_read(call)
+            ),
+            "unique_intrinsic_supported_feature": sum(
+                1 for call in unique_calls
+                if predicate(call) and not has_external_read(call) and (call.read_support or 0) >= 2
+            ),
+            "interpretation": (
+                "heuristic_candidate_enrichment_not_confirmed_hgt"
+                if feature == "hgt_or_starship_candidate"
+                else "enrichment_screen"
+            ),
+        })
+    write_tsv(
+        out_path,
+        rows,
+        [
+            "feature", "group_a", "group_b",
+            "a_feature", "a_nonfeature", "b_feature", "b_nonfeature",
+            "odds_ratio", "fisher_right_p",
+            "unique_read_supported_feature", "unique_intrinsic_supported_feature",
+            "interpretation",
+        ],
+    )
+    return rows
+
+
+# Evidence tiers for a MycoSV call, ranked highest to lowest. "strong" means the
+# call is independently supported by a comparator AND by external read evidence;
+# "moderate" by one of the two; "intrinsic_only" means the call cleared the C++
+# clustering floor (SUPPORT>=2) but no external signal could be re-anchored
+# (sibling-clade contig absent from the validation BAM, low query coverage, …);
+# "weak" is the rare residual where even MycoSV's intrinsic count is <=1. The
+# panorama panel in the report shows these so an unvalidatable-but-real MycoSV
+# call surfaces as "intrinsic_only" rather than disappearing from the F1 plots.
+EVIDENCE_TIERS: tuple[str, ...] = ("strong", "moderate", "intrinsic_only", "weak")
+
+
+def classify_evidence_tier(
+    call: NormalizedCall,
+    *,
+    has_comparator: bool,
+    has_external_read_support: bool,
+) -> str:
+    if has_comparator and has_external_read_support:
+        return "strong"
+    if has_comparator or has_external_read_support:
+        return "moderate"
+    intrinsic = call.read_support if call.read_support is not None else 0
+    if intrinsic >= 2:
+        return "intrinsic_only"
+    return "weak"
 
 
 def write_agreement_summary(path: Path, rows: list[dict[str, Any]]) -> None:
     # svtype column: "ALL" for the aggregate row that already existed, plus
     # one row per canonical SV type for downstream "MycoSV vs comparator
     # per-svtype wins" visualization. Older readers ignore the new column.
+    # validation_basis makes the semantics explicit: comparator outputs are
+    # baselines/agreement signals, while read_level_union rows are independently
+    # anchored in raw FASTQ/read evidence.
     write_tsv(
         path,
         rows,
         [
-            "query_asm", "coordinate_space", "truth_label", "svtype", "method",
+            "query_asm", "coordinate_space", "truth_label", "validation_basis",
+            "svtype", "method",
             "truth_calls", "pred_calls",
             "tp", "fp", "fn", "precision", "recall", "f1",
             "prec_lo95", "prec_hi95", "rec_lo95", "rec_hi95", "status",
@@ -5970,7 +8146,22 @@ def maybe_run_candidate_analysis(
     if expression_tsv:
         cmd.extend(["--expression-tsv", str(expression_tsv.resolve())])
     if gene_annotations_tsv:
-        cmd.extend(["--gene-annotations", str(gene_annotations_tsv.resolve())])
+        pass_gene_annotations = True
+        if _GENE_ANNOTATION_MAX_BYTES >= 0:
+            try:
+                gene_size = gene_annotations_tsv.stat().st_size
+            except OSError:
+                gene_size = 0
+            if gene_size > _GENE_ANNOTATION_MAX_BYTES:
+                pass_gene_annotations = False
+                sys.stderr.write(
+                    f"[biology] not passing large gene annotation file to "
+                    f"candidate analyzer ({gene_size} bytes > "
+                    f"MYCOSV_GENE_ANNOTATION_MAX_BYTES="
+                    f"{_GENE_ANNOTATION_MAX_BYTES})\n"
+                )
+        if pass_gene_annotations:
+            cmd.extend(["--gene-annotations", str(gene_annotations_tsv.resolve())])
     if ecological_traits_tsv:
         cmd.extend(["--ecological-traits", str(ecological_traits_tsv.resolve())])
     if fungaltraits_csv:
@@ -5978,9 +8169,19 @@ def maybe_run_candidate_analysis(
     if ancestral_tsv:
         cmd.extend(["--ancestral", str(ancestral_tsv.resolve())])
     try:
-        run(cmd, cwd=ROOT)
+        run(cmd, cwd=ROOT, timeout=max(1, _BIOLOGY_TIMEOUT))
         return candidates_tsv, summary_json
-    except subprocess.CalledProcessError:
+    except subprocess.TimeoutExpired:
+        sys.stderr.write(
+            f"[biology] candidate analysis timed out after "
+            f"{_BIOLOGY_TIMEOUT}s; continuing with enrichment-only outputs\n"
+        )
+        return None, None
+    except subprocess.CalledProcessError as exc:
+        sys.stderr.write(
+            f"[biology] candidate analysis failed rc={exc.returncode}; "
+            f"continuing with enrichment-only outputs\n"
+        )
         return None, None
 
 
@@ -5989,7 +8190,16 @@ def join_biology_findings(
     mycosv_calls: list[NormalizedCall],
     support_by_key: dict[tuple[str, str, int, int, str], list[str]],
     out_path: Path,
+    *,
+    single_ref_keys_by_query: dict[str, set[tuple[str, str, int, int, str]]] | None = None,
+    single_ref_loci_by_query: dict[
+        str, set[tuple[str, str, str, int, int, int, str, int]]
+    ] | None = None,
+    tier_by_key: dict[tuple[str, str, int, int, str], str] | None = None,
 ) -> None:
+    single_ref_keys_by_query = single_ref_keys_by_query or {}
+    single_ref_loci_by_query = single_ref_loci_by_query or {}
+    tier_by_key = tier_by_key or {}
     if candidates_tsv is None or not candidates_tsv.exists():
         write_tsv(
             out_path,
@@ -6014,9 +8224,24 @@ def join_biology_findings(
                 row.get("svtype", "."),
             )
             supporters = support_by_key.get(key, [])
+            try:
+                svlen = int(row.get("svlen", "0") or 0)
+            except ValueError:
+                svlen = 0
+            row_call = NormalizedCall(
+                key[0], key[1], key[2], key[3], key[4], svlen, "mycosv",
+                annotation=row.get("annotation", "."),
+                element_class=row.get("element_class", "NONE"),
+            )
+            in_single_ref = (
+                key in single_ref_keys_by_query.get(key[0], set())
+                or pangenome_locus_key(row_call) in single_ref_loci_by_query.get(key[0], set())
+            )
             row["comparator_support_count"] = len(supporters)
             row["comparator_support_labels"] = ",".join(sorted(supporters)) if supporters else "."
-            row["mycosv_unique"] = "yes" if not supporters else "no"
+            row["single_reference_equivalent"] = "yes" if in_single_ref else "no"
+            row["mycosv_unique"] = "yes" if not supporters and not in_single_ref else "no"
+            row["evidence_tier"] = tier_by_key.get(key, "weak")
             rows.append(row)
     if not rows:
         if fieldnames:
@@ -6272,6 +8497,24 @@ def benchmark_real_data(args: argparse.Namespace) -> int:
     else:
         query_manifest = list(full_manifest)
 
+    query_groups = getattr(args, "benchmark_query_genera", "") or ""
+    if query_groups:
+        query_manifest = select_one_query_per_group(
+            query_manifest,
+            query_groups,
+            out_dir,
+            prepared_dir / "hierarchy_manifest.tsv",
+        )
+
+    max_benchmark_queries = int(getattr(args, "max_benchmark_queries", 0) or 0)
+    if max_benchmark_queries > 0 and len(query_manifest) > max_benchmark_queries:
+        original_n = len(query_manifest)
+        query_manifest = query_manifest[:max_benchmark_queries]
+        sys.stderr.write(
+            f"[benchmark] limiting query manifest to first {len(query_manifest)} "
+            f"of {original_n} query row(s) via --max-benchmark-queries\n"
+        )
+
     if not query_manifest:
         status_path = out_dir / "NO_QUERIES_FOR_MODE.txt"
         available = sorted({(row.get("query_mode") or "assembly") for row in full_manifest})
@@ -6293,8 +8536,9 @@ def benchmark_real_data(args: argparse.Namespace) -> int:
         query_manifest,
         out_dir,
         args.mode,
-        getattr(args, "max_comparator_short_reads", 150000),
-        getattr(args, "max_comparator_long_reads", 20000),
+        getattr(args, "max_comparator_short_reads", 500000),
+        getattr(args, "max_comparator_long_reads", 200000),
+        mycosv_use_full_reads=getattr(args, "mycosv_use_full_reads", False),
     )
     if args.mode == "assembly":
         query_manifest = filter_assembly_query_inputs(
@@ -6318,6 +8562,9 @@ def benchmark_real_data(args: argparse.Namespace) -> int:
             )
             return 0
 
+    if not getattr(args, "skip_input_preflight", False):
+        preflight_benchmark_inputs(query_manifest, out_dir, args.mode)
+
     # Pre-flight: report which comparators are available / missing and write a
     # COMPARATORS_STATUS.txt so the user does not need to grep through logs.
     _report_comparator_status(args, out_dir)
@@ -6326,41 +8573,114 @@ def benchmark_real_data(args: argparse.Namespace) -> int:
     # modes get FASTQ paths and assembly mode gets FASTA paths.
     mode_query_list = out_dir / "query_list.filtered.txt"
     mode_query_list.write_text(
-        "\n".join(row["path"] for row in query_manifest) + "\n",
+        "\n".join(row.get("mycosv_path") or row["path"] for row in query_manifest) + "\n",
         encoding="utf-8",
     )
 
-    # Build a benchmark-scoped ref_list that contains only the references each
-    # mode-filtered query is supposed to be compared against. This is what
-    # unblocks the C++ flat-ref fallback in the million_real flow:
-    # prepared_dir/ref_list.txt holds ~2000 NCBI assemblies (the routing
-    # corpus), so for memory reasons we previously forced
-    # `--no-flat-ref-fallback`. With that flag set, hierarchical_call_assembly
-    # only had access to TolGlobal refs whose seqShared is empty for the
-    # routing-only index, so every contig fell through to Path C and emitted
-    # SVTYPE=OFF_REF — the multisample VCF then contained nothing else.
-    # The benchmark already names the truth reference per query in
-    # `benchmark_ref_fasta`; pass that small (≤ N_queries) set to the binary
-    # so the flat-ref fallback can anchor INS/DEL/INV/DUP/TRA against it.
-    bench_ref_list_path: Path | None = None
+    # Build a benchmark-scoped ref_list that contains the references each
+    # mode-filtered query is supposed to be compared against, *plus* a bounded
+    # neighborhood of phylogenetically related refs from prepared_dir.
+    #
+    # History: limiting this list to one benchmark_ref_fasta per query (5 refs
+    # for the million_real held-out queries) capped MycoSV's per-query call
+    # volume an order of magnitude below the comparators. The C++ binary
+    # honors --max-ref-memory-mb so an over-broad list is safe — refs are
+    # loaded sequentially until the cap (now 8 GB; ≈200 fungal refs) — but a
+    # list that misses every related ref forces the per-query MEM-chain
+    # search to fall back on cross-genus refs (~5 % overlap) instead of the
+    # genus-mate the user actually deposited. Two queries (Lodderomyces,
+    # Dactylellina) ended up with 0 calls against their own benchmark refs.
+    #
+    # Strategy: start with the per-query benchmark refs, then give each query
+    # a fair share of NEIGHBOR_REF_CAP — adding genus → family → order → class
+    # neighbors per query before moving on. A per-query budget is essential
+    # because one query's genus can dominate the corpus (~1100 Saccharomyces
+    # refs in the million_real manifest); a global walk would let it swallow
+    # every slot and leave the other four queries with no neighbors.
+    # The C++ side then drops anything below the k=16 prefilter overlap
+    # floor (0.02), so distant refs don't poison the chain shortlist.
+    NEIGHBOR_REF_CAP = max(1, int(getattr(args, "benchmark_ref_cap", 512)))
     bench_refs: list[str] = []
     seen_bench_refs: set[str] = set()
+    # Pre-seed seen_bench_refs with every query's OWN fasta path so the
+    # genus/family/order/class neighbor walk below cannot re-add the query
+    # itself as a "neighbor." The query is registered in hierarchy_manifest.tsv
+    # under its own genus, so without this exclusion the chain-search anchors
+    # snap to the query's own contigs (perfect self-identity), suppressing
+    # every DUP/TRA call and forcing Path C into the OFF_REF tile sweep —
+    # observed on the F. falciforme vs F. oxysporum Fo47 run as 0 DUP, 0 TRA,
+    # and 3,584 phantom NOVEL_WEAK windows.
+    for row in query_manifest:
+        qp = (row.get("path") or "").strip()
+        if qp and qp != ".":
+            seen_bench_refs.add(qp)
+    per_query_taxa: list[dict[str, str]] = []
     for row in query_manifest:
         bench_ref = (row.get("benchmark_ref_fasta") or "").strip()
-        if not bench_ref or bench_ref == ".":
-            continue
-        if bench_ref in seen_bench_refs:
-            continue
-        if not Path(bench_ref).exists():
-            continue
-        seen_bench_refs.add(bench_ref)
-        bench_refs.append(bench_ref)
+        if bench_ref and bench_ref != "." and bench_ref not in seen_bench_refs \
+                and Path(bench_ref).exists():
+            seen_bench_refs.add(bench_ref)
+            bench_refs.append(bench_ref)
+        per_query_taxa.append({
+            rank: (row.get(rank) or "").strip()
+            for rank in ("genus", "family", "order", "class")
+        })
+
+    hierarchy_path = prepared_dir / "hierarchy_manifest.tsv"
+    if hierarchy_path.exists() and per_query_taxa:
+        try:
+            with hierarchy_path.open(encoding="utf-8") as fh:
+                manifest_rows = list(csv.DictReader(fh, delimiter="\t"))
+        except (OSError, csv.Error) as exc:
+            sys.stderr.write(
+                f"[bench-ref] could not read {hierarchy_path}: {exc}; "
+                f"falling back to per-query benchmark refs only\n"
+            )
+            manifest_rows = []
+        n_queries = max(1, len(per_query_taxa))
+        # Reserve at least 4 slots per query so even the smallest genera get
+        # neighbors; the global cap is the hard ceiling.
+        per_query_budget = max(4, NEIGHBOR_REF_CAP // n_queries)
+        for taxa in per_query_taxa:
+            if len(bench_refs) >= NEIGHBOR_REF_CAP:
+                break
+            added_for_query = 0
+            for rank in ("genus", "family", "order", "class"):
+                if added_for_query >= per_query_budget:
+                    break
+                if len(bench_refs) >= NEIGHBOR_REF_CAP:
+                    break
+                wanted = taxa.get(rank, "")
+                if not wanted or wanted == ".":
+                    continue
+                for hrow in manifest_rows:
+                    if added_for_query >= per_query_budget:
+                        break
+                    if len(bench_refs) >= NEIGHBOR_REF_CAP:
+                        break
+                    v = (hrow.get(rank) or "").strip()
+                    if v != wanted:
+                        continue
+                    fasta = (hrow.get("fasta_path") or "").strip()
+                    if fasta and fasta not in seen_bench_refs and Path(fasta).exists():
+                        seen_bench_refs.add(fasta)
+                        bench_refs.append(fasta)
+                        added_for_query += 1
+
+    bench_ref_list_path: Path | None = None
     if bench_refs:
         bench_ref_list_path = out_dir / "ref_list.benchmark.txt"
         bench_ref_list_path.write_text("\n".join(bench_refs) + "\n", encoding="utf-8")
+        sys.stderr.write(
+            f"[bench-ref] wrote {len(bench_refs)} refs to {bench_ref_list_path} "
+            f"(per-query benchmark refs + genus/family/order/class neighbors, "
+            f"capped at {NEIGHBOR_REF_CAP})\n"
+        )
 
     compile_binary_if_needed(args.binary_path.resolve(), force=args.force_rebuild)
     mycosv_failed = False
+    out_prefix = out_dir / "mycosv" / "calls"
+    prior_mycosv_outputs = snapshot_mycosv_outputs(out_prefix)
     try:
         mycosv_paths = run_mycosv(
             prepared_dir, out_dir, args.binary_path.resolve(), args.mode, args.mycosv_arg,
@@ -6375,25 +8695,45 @@ def benchmark_real_data(args: argparse.Namespace) -> int:
         # Don't abort the whole panel/mode pipeline when the binary crashes
         # (e.g. cgroup OOM kill mid-write produces a 0-byte calls.vcf, then
         # the bare exception bubbles to main and skips downstream report
-        # writes).  Mark the failure on disk, then carry on with an empty
-        # prediction set so per-query placeholder rows and the comparator
-        # status still get written for the visualization report.
+        # writes). Mark the failure on disk, then prefer the per-contig
+        # hierarchical checkpoint if it contains calls; that checkpoint is the
+        # completed pangenome caller output for all flushed contigs and is more
+        # informative than a stale canonical VCF or an empty failure callset.
         mycosv_failed = True
-        out_prefix = out_dir / "mycosv" / "calls"
         rc = getattr(exc, "returncode", "timeout")
-        mycosv_paths = write_mycosv_failure_outputs(out_prefix, f"rc={rc}")
+        checkpoint_paths = promote_hierarchical_checkpoint(out_prefix)
+        if checkpoint_paths is not None:
+            mycosv_paths = checkpoint_paths
+            checkpoint_n = vcf_data_record_count(Path(checkpoint_paths["vcf"]))
+            failure_action = (
+                f"promoted the hierarchical per-contig checkpoint "
+                f"({checkpoint_n} calls) to the canonical MycoSV outputs"
+            )
+        elif prior_mycosv_outputs:
+            restore_mycosv_outputs(prior_mycosv_outputs)
+            mycosv_paths = {
+                "vcf": str(out_prefix.with_suffix(".vcf")),
+                "hits": str(out_prefix.with_suffix(".hits.tsv")),
+                "gfa": str(out_prefix.with_suffix(".gfa")),
+            }
+            failure_action = (
+                "restored the previous MycoSV outputs instead of replacing "
+                "them with an empty failure callset"
+            )
+        else:
+            mycosv_paths = write_mycosv_failure_outputs(out_prefix, f"rc={rc}")
+            failure_action = "wrote an empty failure callset"
         marker = out_dir / "MYCOSV_FAILED.txt"
         marker.write_text(
-            f"MycoSV binary failed (rc={rc}). Continuing benchmark with an "
-            f"empty prediction set so panel-level reports still render.\n"
+            f"MycoSV binary failed (rc={rc}). The benchmark {failure_action} "
+            f"so panel-level reports still render.\n"
             f"Common causes: cgroup OOM kill (see [mycosv] line above), "
             f"missing index files, or unreadable FASTA.\n",
             encoding="utf-8",
         )
         sys.stderr.write(
             f"[benchmark] mycosv failed for mode={args.mode!r}; continuing "
-            f"with empty calls so the comparator-only outputs still get "
-            f"written. Marker: {marker}\n"
+            f"after {failure_action}. Marker: {marker}\n"
         )
 
     # Materialize a multi-sample sibling of calls.vcf so spot-checks see one
@@ -6406,18 +8746,27 @@ def benchmark_real_data(args: argparse.Namespace) -> int:
             vcf_path.with_suffix(".multisample.vcf"),
             [row["query_asm"] for row in query_manifest],
         )
-        alls_multisample_vcf = vcf_path.with_name("alls.multisample.vcf")
-        if alls_multisample_vcf != multisample_vcf:
-            shutil.copyfile(multisample_vcf, alls_multisample_vcf)
     except Exception as exc:
         sys.stderr.write(f"[multisample-vcf] expand failed: {exc}\n")
 
-    mycosv_calls_by_query: dict[str, dict[str, list[NormalizedCall]]] = {}
+    mycosv_calls_by_query: dict[str, dict[str, Any]] = {}
     for row in query_manifest:
         query_asm = row["query_asm"]
+        q_calls, r_calls, r_to_q_keys = load_mycosv_paired_calls(
+            Path(mycosv_paths["vcf"]), query_asm,
+        )
+        # `ref_to_query_keys` is a parallel list (same length, same order as
+        # r_calls). The phase-1 lift fallback preserves order and length —
+        # every input ref-call yields exactly one output, with at most pos/end
+        # rewritten — so this index mapping survives the lift step at 6755
+        # below. After bench_contigs filtering we propagate the original index
+        # alongside each kept ref-call so the support-tracking step at 6905
+        # can still reach back to the QUERY-coord call_key for the same VCF
+        # row, fixing the always-`mycosv_unique=yes` bug in biology_findings.
         mycosv_calls_by_query[query_asm] = {
-            "query": load_mycosv_query_calls(Path(mycosv_paths["vcf"]), query_asm),
-            "reference": load_mycosv_reference_calls(Path(mycosv_paths["vcf"]), query_asm),
+            "query": q_calls,
+            "reference": r_calls,
+            "ref_to_query_keys": r_to_q_keys,
         }
 
     truth_sets: dict[str, dict[tuple[str, str], list[NormalizedCall]]] = defaultdict(dict)
@@ -6436,30 +8785,35 @@ def benchmark_real_data(args: argparse.Namespace) -> int:
             query_asm = query_row["query_asm"]
             truth_sets[query_asm][("reference", label)] = load_reference_vcf_calls(path, label, query_asm)
 
-    # SyRI / minigraph / pggb produce truth sets when they succeed; any tool
+    # SyRI / minigraph / pggb produce comparator callsets when they succeed; any tool
     # failure on a single query (SyRI's CalledProcessError on weak alignments,
     # minigraph crashes on huge gaps, pggb timeouts) is captured here so it
     # does not abort the entire benchmark — surviving comparators still
     # contribute to exact_benchmark_summary.tsv.
+    # Comparators are scheduled across queries via run_per_query_in_parallel so
+    # the 5-query x N-tool bench fan-out lands inside the per-mode wall budget;
+    # the old serial loop spent ~N x single_query_time and routinely blew the
+    # 4 h cap with one slow svim_asm / minigraph / sniffles per mode.
     if args.run_syri and args.mode == "assembly":
+        results = run_per_query_in_parallel(
+            "syri", run_syri_for_query, query_manifest, out_dir, args.threads,
+        )
         for query_row in query_manifest:
-            try:
-                result = run_syri_for_query(query_row, out_dir, args.threads)
-            except Exception as exc:  # pragma: no cover - defensive
-                sys.stderr.write(f"[warn] syri failed for {query_row['query_asm']}: {exc}\n")
-                _log_comparator_failure(out_dir, "syri", query_row["query_asm"], f"exception:{exc}")
-                continue
+            result = results.get(query_row["query_asm"])
             if result:
-                truth_sets[query_row["query_asm"]][("query", "syri")] = load_syri_query_calls(Path(result["normalized_tsv"]), query_row["query_asm"])
+                truth_sets[query_row["query_asm"]][("query", "syri")] = load_syri_query_calls(
+                    Path(result["normalized_tsv"]), query_row["query_asm"]
+                )
 
     if args.run_minigraph and args.mode == "assembly":
+        minigraph_args = args.minigraph_arg
+        def _minigraph_runner(qr, od, t):
+            return run_minigraph_for_query(qr, od, t, minigraph_args)
+        results = run_per_query_in_parallel(
+            "minigraph", _minigraph_runner, query_manifest, out_dir, args.threads,
+        )
         for query_row in query_manifest:
-            try:
-                result = run_minigraph_for_query(query_row, out_dir, args.threads, args.minigraph_arg)
-            except Exception as exc:  # pragma: no cover - defensive
-                sys.stderr.write(f"[warn] minigraph failed for {query_row['query_asm']}: {exc}\n")
-                _log_comparator_failure(out_dir, "minigraph", query_row["query_asm"], f"exception:{exc}")
-                continue
+            result = results.get(query_row["query_asm"])
             if result:
                 truth_sets[query_row["query_asm"]][("reference", "minigraph")] = load_minigraph_bubble_calls(
                     Path(result["bubble_bed"]),
@@ -6468,29 +8822,16 @@ def benchmark_real_data(args: argparse.Namespace) -> int:
                 )
 
     if args.run_pggb and args.mode == "assembly":
+        pggb_identity = args.pggb_identity
+        pggb_segment_len = args.pggb_segment_len
+        pggb_args = args.pggb_arg
+        def _pggb_runner(qr, od, t):
+            return run_pggb_for_query(qr, od, t, pggb_identity, pggb_segment_len, pggb_args)
+        results = run_per_query_in_parallel(
+            "pggb", _pggb_runner, query_manifest, out_dir, args.threads,
+        )
         for query_row in query_manifest:
-            try:
-                result = run_pggb_for_query(
-                    query_row,
-                    out_dir,
-                    args.threads,
-                    args.pggb_identity,
-                    args.pggb_segment_len,
-                    args.pggb_arg,
-                )
-            except Exception as exc:  # pragma: no cover - defensive
-                # `run_pggb_for_query` already converts CalledProcessError into
-                # a structured warning + log file; this catches anything that
-                # leaks past it (OSError on tmpfs full, etc.).
-                tail = _stderr_tail(exc)
-                sys.stderr.write(
-                    f"[warn] pggb failed for {query_row['query_asm']}: {exc}{tail}\n"
-                )
-                _log_comparator_failure(
-                    out_dir, "pggb", query_row["query_asm"],
-                    f"exception:{type(exc).__name__}:{exc}",
-                )
-                continue
+            result = results.get(query_row["query_asm"])
             if result:
                 truth_sets[query_row["query_asm"]][("reference", "pggb")] = load_reference_vcf_calls(
                     Path(result["vcf"]),
@@ -6507,25 +8848,21 @@ def benchmark_real_data(args: argparse.Namespace) -> int:
     assembly_caller_specs: list[tuple[str, Any]] = []
     if args.mode == "assembly":
         if args.run_cactus:
-            assembly_caller_specs.append(
-                ("cactus",
-                 lambda qr, od, t: run_cactus_for_query(qr, od, t, args.cactus_arg))
-            )
+            cactus_args = args.cactus_arg
+            def _cactus_runner(qr, od, t):
+                return run_cactus_for_query(qr, od, t, cactus_args)
+            assembly_caller_specs.append(("cactus", _cactus_runner))
         if args.run_svim_asm:
             assembly_caller_specs.append(("svim_asm", run_svim_asm_for_query))
         if args.run_anchorwave:
             assembly_caller_specs.append(("anchorwave", run_anchorwave_for_query))
 
     for label, runner in assembly_caller_specs:
+        results = run_per_query_in_parallel(
+            label, runner, query_manifest, out_dir, args.threads,
+        )
         for query_row in query_manifest:
-            try:
-                result = runner(query_row, out_dir, args.threads)
-            except Exception as exc:  # pragma: no cover - defensive
-                sys.stderr.write(
-                    f"[warn] {label} failed for {query_row['query_asm']}: {exc}\n"
-                )
-                _log_comparator_failure(out_dir, label, query_row["query_asm"], f"exception:{exc}")
-                continue
+            result = results.get(query_row["query_asm"])
             if not result:
                 continue
             truth_sets[query_row["query_asm"]][("reference", label)] = load_reference_vcf_calls(
@@ -6553,15 +8890,11 @@ def benchmark_real_data(args: argparse.Namespace) -> int:
             read_caller_specs.append(("manta", "manta", run_manta_for_query))
 
     for label, _tool_key, runner in read_caller_specs:
+        results = run_per_query_in_parallel(
+            label, runner, query_manifest, out_dir, args.threads,
+        )
         for query_row in query_manifest:
-            try:
-                result = runner(query_row, out_dir, args.threads)
-            except Exception as exc:  # pragma: no cover - defensive
-                sys.stderr.write(
-                    f"[warn] {label} failed for {query_row['query_asm']}: {exc}\n"
-                )
-                _log_comparator_failure(out_dir, label, query_row["query_asm"], f"exception:{exc}")
-                continue
+            result = results.get(query_row["query_asm"])
             if not result:
                 continue
             vcf_path = Path(result["vcf"])
@@ -6571,12 +8904,29 @@ def benchmark_real_data(args: argparse.Namespace) -> int:
 
     agreement_rows: list[dict[str, Any]] = []
     read_validated_truth_rows: list[dict[str, Any]] = []
+    # Leave-one-out comparator-variance benchmark (fungal-specific).
+    # loo_summary_rows is the per-(fold, stratum) flattened TSV;
+    # loo_variance_by_query is the per-query aggregate (mean / stdev / swing /
+    # most-influential comparator) consumed by loo_consensus_variance.json.
+    loo_summary_rows: list[dict[str, Any]] = []
+    loo_variance_by_query: dict[str, dict[str, Any]] = {}
+    # Per-call diagnostic: for every predicted mycosv call that failed to
+    # TP against a truth call, record why (contig_mismatch / pos_out_of_tol
+    # / svlen_out_of_tol / type_mismatch / mate_mismatch / claimed_by_other_pred)
+    # and the closest truth candidate. Written to match_failures.tsv next to
+    # exact_benchmark_summary.tsv so an operator can see why recall is 0
+    # without re-running.
+    match_failure_rows: list[dict[str, Any]] = []
     # Write a header-only placeholder up front so a SLURM time-out (or any
     # mid-run kill) still leaves the visualization a parseable file. The final
     # write_tsv at the end of benchmark() overwrites this with the populated
     # rows when we reach it.
     write_tsv(out_dir / "read_validated_truth.tsv", [], READ_VALIDATION_FIELDS)
     support_by_key: dict[tuple[str, str, int, int, str], list[str]] = defaultdict(list)
+    # call_keys of MycoSV preds that passed external read validation, keyed by
+    # query_asm. Populated inside the per-query loop and consumed after it to
+    # tier every MycoSV call into strong/moderate/intrinsic_only/weak.
+    validated_mycosv_keys_by_query: dict[str, set[tuple[str, str, int, int, str]]] = defaultdict(set)
     summary_json: dict[str, Any] = {
         "mode": args.mode,
         "prepared_dir": str(prepared_dir),
@@ -6601,38 +8951,50 @@ def benchmark_real_data(args: argparse.Namespace) -> int:
             "anchorwave": bool(tool_path("anchorwave") and tool_path("paftools.js")),
         },
     }
+    sv_volume_audit_rows = write_sv_volume_audit(
+        out_dir / "sv_volume_audit.tsv",
+        query_manifest,
+        mycosv_calls_by_query,
+        truth_sets,
+        Path(mycosv_paths["vcf"]),
+        mode=args.mode,
+        mycosv_failed=mycosv_failed,
+    )
+    summary_json["sv_volume_audit"] = sv_volume_audit_rows
 
     data_cache_dir = (
         getattr(args, "data_cache_dir", None) or DEFAULT_DATA_CACHE
     ).resolve()
     lift_cache_dir = out_dir / "lift_cache"
+    single_ref_equivalent_counts: dict[str, int] = {}
+    single_ref_equivalent_keys_by_query: dict[
+        str, set[tuple[str, str, int, int, str]]
+    ] = defaultdict(set)
+    single_ref_equivalent_loci_by_query: dict[
+        str, set[tuple[str, str, str, int, int, int, str, int]]
+    ] = defaultdict(set)
     for query_row in query_manifest:
         query_asm = query_row["query_asm"]
         mycosv_query_calls = mycosv_calls_by_query.get(query_asm, {}).get("query", [])
         mycosv_ref_calls_all = mycosv_calls_by_query.get(query_asm, {}).get("reference", [])
-        # MycoSV's pangenomic routing picks the closest clade per query region
-        # and reports REFCONTIG for that clade, so its reference-coord calls
-        # span multiple reference assemblies. Single-reference comparators
-        # (minigraph, syri, svim-asm, anchorwave, …) only see one reference.
-        # For a fair pairwise PR comparison, restrict MycoSV's reference calls
-        # to those whose REFCONTIG belongs to this query's benchmark_ref_fasta.
-        # In reads modes (long-reads, short-reads) the comparators map reads
-        # to a *single* benchmark_ref_fasta, while mycosv's pangenomic routing
-        # picks the closest clade per pseudocontig — so a call reported on
-        # NC_012864.1 (S. cerevisiae) at REFPOS=10567 cannot match a sniffles
-        # call on NC_089928.1 (the user-chosen ref) without lifting. minimap2
-        # asm5 align each sibling clade to the benchmark ref (cached PAF), then
-        # translate REFCONTIG/REFPOS/REFEND before the bench_contigs filter.
+        # Parallel to mycosv_ref_calls_all (same length, same order) — gives us
+        # the QUERY-coord call_key for each ref-coord call, even after the lift
+        # rewrites pos/end. Used below to propagate per-comparator support back
+        # to the right entry in support_by_key.
+        mycosv_ref_to_query_keys = list(
+            mycosv_calls_by_query.get(query_asm, {}).get("ref_to_query_keys", [])
+        )
+        # MycoSV is pangenomic in every mode: it may anchor a query locus on a
+        # close sibling ref rather than the one single-reference comparators
+        # used. Project all reference-coordinate MycoSV calls to the benchmark
+        # ref first, then filter to benchmark contigs. Without this, assembly
+        # mode silently discarded sibling-ref calls instead of comparing the
+        # single-reference-equivalent projection.
         bench_ref = query_row.get("benchmark_ref_fasta") or "."
         bench_contigs: frozenset[str] = frozenset()
         if bench_ref not in {"", "."}:
             bench_contigs = fasta_contig_names(Path(bench_ref))
-        query_mode_row = (query_row.get("query_mode") or args.mode or "assembly").lower()
-        if (
-            query_mode_row in {"long-reads", "short-reads"}
-            and bench_contigs
-            and tool_path("minimap2") is not None
-        ):
+        if bench_contigs and tool_path("minimap2") is not None:
             mycosv_ref_calls_all = _lift_calls_to_benchmark_ref(
                 mycosv_ref_calls_all,
                 Path(bench_ref),
@@ -6641,9 +9003,35 @@ def benchmark_real_data(args: argparse.Namespace) -> int:
                 threads=args.threads,
             )
         if bench_contigs:
-            mycosv_ref_calls = [c for c in mycosv_ref_calls_all if c.ref_contig in bench_contigs]
+            paired_keep = [
+                (c, mycosv_ref_to_query_keys[i] if i < len(mycosv_ref_to_query_keys) else None)
+                for i, c in enumerate(mycosv_ref_calls_all)
+                if c.ref_contig in bench_contigs
+            ]
+            mycosv_ref_projected_raw = len(paired_keep)
+            (
+                mycosv_ref_calls,
+                mycosv_ref_query_keys_kept,
+                single_ref_all_query_keys,
+            ) = deduplicate_projected_reference_calls(paired_keep)
         else:
-            mycosv_ref_calls = mycosv_ref_calls_all
+            paired_keep = [
+                (c, mycosv_ref_to_query_keys[i] if i < len(mycosv_ref_to_query_keys) else None)
+                for i, c in enumerate(mycosv_ref_calls_all)
+            ]
+            mycosv_ref_projected_raw = len(paired_keep)
+            (
+                mycosv_ref_calls,
+                mycosv_ref_query_keys_kept,
+                single_ref_all_query_keys,
+            ) = deduplicate_projected_reference_calls(paired_keep)
+        single_ref_equivalent_counts[query_asm] = len(mycosv_ref_calls)
+        single_ref_equivalent_keys_by_query[query_asm] = single_ref_all_query_keys
+        single_ref_equivalent_loci_by_query[query_asm] = {
+            pangenome_locus_key(c)
+            for c in mycosv_query_calls
+            if call_key(c) in single_ref_equivalent_keys_by_query[query_asm]
+        }
         # Count OFF_REF events that exist in the query-coord set but are
         # un-matchable (no REFPOS, so they were dropped from the ref-coord set).
         # These are real predictions that the single-reference truth callers
@@ -6655,15 +9043,20 @@ def benchmark_real_data(args: argparse.Namespace) -> int:
         # Misrouted: ref-coord calls whose REFCONTIG is from a sibling clade,
         # not the benchmark target. They're discarded by the bench_contigs
         # filter but counted here so the operator sees the routing penalty.
-        mycosv_misrouted = max(0, len(mycosv_ref_calls_all) - len(mycosv_ref_calls))
+        mycosv_misrouted = max(0, len(mycosv_ref_calls_all) - mycosv_ref_projected_raw)
         summary_json["queries"][query_asm] = {
             "mycosv_calls": {
                 "query": len(mycosv_query_calls),
                 "reference": len(mycosv_ref_calls),
+                "reference_projected_raw": mycosv_ref_projected_raw,
                 "reference_total": len(mycosv_ref_calls_all),
                 "benchmark_ref_contigs": len(bench_contigs),
                 "off_ref_dropped": mycosv_off_ref_dropped,
                 "misrouted_to_sibling_clade": mycosv_misrouted,
+                "benchmark_ref_filter_kept_fraction": (
+                    round(mycosv_ref_projected_raw / len(mycosv_ref_calls_all), 4)
+                    if mycosv_ref_calls_all else 1.0
+                ),
             },
             "exact_benchmarks": {"query": {}, "reference": {}, "reference_any_clade": {}},
         }
@@ -6678,11 +9071,36 @@ def benchmark_real_data(args: argparse.Namespace) -> int:
                 truth_calls=truth_calls,
                 pred_calls=pred_calls,
             ))
+            for mf in diagnose_match_failures(truth_calls, pred_calls):
+                match_failure_rows.append({
+                    "query_asm": query_asm,
+                    "coordinate_space": coord_space,
+                    "truth_label": label,
+                    "method": "mycosv",
+                    **mf,
+                })
             metrics = score_callsets(truth_calls, pred_calls)
             if coord_space == "query":
                 used_pred, _ = match_calls(truth_calls, pred_calls)
                 for idx in used_pred:
                     support_by_key[call_key(pred_calls[idx])].append(label)
+            elif coord_space == "reference":
+                # Bridge ref-coord matches back to the query-coord call_key
+                # via the parallel mycosv_ref_query_keys_kept list. Without
+                # this, every mycosv call in biology_findings.tsv was flagged
+                # `mycosv_unique=yes` because comparator-vs-mycosv matches
+                # only happen in reference space for most real-data tools
+                # (svim/sniffles/cutesv/delly/manta/minigraph all emit
+                # ref-coord truth) and that side of the matching used to
+                # write nothing to support_by_key.
+                used_pred, _ = match_calls(truth_calls, pred_calls)
+                for idx in used_pred:
+                    qkey = (
+                        mycosv_ref_query_keys_kept[idx]
+                        if idx < len(mycosv_ref_query_keys_kept) else None
+                    )
+                    if qkey is not None:
+                        support_by_key[qkey].append(label)
             summary_json["queries"][query_asm]["exact_benchmarks"][coord_space][label] = metrics
 
             # Per-comparator read-level validation: anchor THIS comparator's
@@ -6742,7 +9160,7 @@ def benchmark_real_data(args: argparse.Namespace) -> int:
             ))
             summary_json["queries"][query_asm]["exact_benchmarks"]["reference_any_clade"][label] = score_callsets(truth_calls, mycosv_ref_calls_all)
 
-        # Fix C: consensus truth set per coord_space — a truth call is in the
+        # Comparator consensus per coord_space — a candidate call is in the
         # consensus iff it is supported by >=2 comparators (calls_compatible
         # across position+length+type tolerance). This dilutes single-tool
         # bias (e.g. minigraph's bubble-extraction conservatism, svim_asm's
@@ -6773,11 +9191,87 @@ def benchmark_real_data(args: argparse.Namespace) -> int:
                 consensus_label
             ] = score_callsets(consensus_calls, pred_calls)
 
+            # ── Leave-one-out comparator-variance benchmark ──────────────
+            # Replays the consensus K times, each time excluding one
+            # comparator, and reports the F1 dispersion + the most
+            # influential comparator. Fungal-specific strata (length bin /
+            # element class / phylum) let the reader see whether the
+            # variance lives in boring small INDELs or in the biologically
+            # interesting HGT / STARSHIP / arm-level events. Needs ≥3
+            # comparators so each LOO fold still has ≥2 left to vote.
+            phylum_label = str(query_row.get("phylum", ".") or ".")
+            if len(ref_labels) >= 3:
+                loo_inputs = {
+                    lbl: truth_for_query[(coord_space, lbl)] for lbl in ref_labels
+                }
+                loo = score_loo_consensus(
+                    pred_calls,
+                    loo_inputs,
+                    min_support=2,
+                    query_phylum=phylum_label,
+                )
+                summary_json["queries"][query_asm]["exact_benchmarks"][coord_space][
+                    f"{consensus_label}_loo"
+                ] = loo
+                loo_variance_by_query.setdefault(query_asm, {})[coord_space] = {
+                    k: v for k, v in loo.items() if k != "loo_folds"
+                }
+                loo_summary_rows.extend(_emit_loo_summary_rows(
+                    query_asm=query_asm,
+                    query_phylum=phylum_label,
+                    coord_space=coord_space,
+                    loo=loo,
+                ))
+            else:
+                # LOO needs ≥3 comparators (each fold has K-1 ≥ 2 left so
+                # consensus_2of_(K-1) is well-defined). Without it we'd
+                # silently emit an empty loo_consensus_summary.tsv and the
+                # operator would have no idea why. Emit an explicit skipped
+                # row so `grep SKIPPED loo_consensus_summary.tsv` reveals
+                # the reason at a glance, and record the same reason in the
+                # JSON so visualization can show "LOO not run: 2 callers".
+                skip_reason = (
+                    f"only {len(ref_labels)} comparator(s) available "
+                    f"({','.join(sorted(ref_labels))}); need >=3 for LOO. "
+                    f"Enable a 3rd comparator (e.g. MILLION_REAL_RUN_CACTUS=1 "
+                    f"or --run-anchorwave for assembly; gridss/lumpy for short-reads)."
+                )
+                summary_json["queries"][query_asm]["exact_benchmarks"][coord_space][
+                    f"{consensus_label}_loo"
+                ] = {
+                    "status":      "skipped",
+                    "reason":      skip_reason,
+                    "comparators": sorted(ref_labels),
+                    "phylum":      phylum_label,
+                }
+                loo_variance_by_query.setdefault(query_asm, {})[coord_space] = {
+                    "status":      "skipped",
+                    "reason":      skip_reason,
+                    "comparators": sorted(ref_labels),
+                    "phylum":      phylum_label,
+                }
+                loo_summary_rows.append({
+                    "query_asm":           query_asm,
+                    "phylum":              phylum_label,
+                    "coordinate_space":    coord_space,
+                    "excluded_comparator": "NONE",
+                    "stratum_type":        "SKIPPED",
+                    "stratum_value":       skip_reason,
+                    "truth_n":             0,
+                    "tp":                  0,
+                    "fp":                  0,
+                    "fn":                  0,
+                    "precision":           float("nan"),
+                    "recall":              float("nan"),
+                    "f1":                  float("nan"),
+                    "status":              "skipped_low_comparator_count",
+                })
+
             # Independent read-level validation: re-anchor the consensus
-            # truth in the raw query data (FASTQ for reads-mode, contigs for
+            # candidates in the raw query data (FASTQ for reads-mode, contigs for
             # assembly-mode) by counting split / clipped reads spanning the
             # breakpoint. SVs without raw-data support are dropped from the
-            # truth set before scoring, removing the assembly-only artefacts
+            # candidate set before scoring, removing the assembly-only artefacts
             # that all algorithm comparators inherit. Only emitted when
             # `--validate-with-reads` is on (default), and only for the
             # reference coord space because that's where read-level support
@@ -6862,6 +9356,8 @@ def benchmark_real_data(args: argparse.Namespace) -> int:
                 read_validated_truth_rows.extend(support_rows)
                 coord_key = "reference" if validation_source.endswith("reference") else "query"
                 supported_preds_by_coord[coord_key] = kept_calls
+                for c in kept_calls:
+                    validated_mycosv_keys_by_query[query_asm].add(call_key(c))
                 read_validation_summary[validation_source] = {
                     "input_calls": len(calls_to_validate),
                     "read_validated": len(kept_calls),
@@ -6869,6 +9365,73 @@ def benchmark_real_data(args: argparse.Namespace) -> int:
 
             if read_validation_summary.keys() - {"min_split_reads"}:
                 summary_json["queries"][query_asm]["read_validation"] = read_validation_summary
+
+            # ── Tool-agnostic raw-read validation (read_level_union) ───────
+            #   An SV is independently validated iff the RAW READS support it — regardless of
+            #   which caller (if any) proposed it. We pool every caller's
+            #   candidate loci (all comparators + MycoSV) into a per-coord
+            #   union, then keep only those clearing the external split/
+            #   clipped-read threshold (force_external=True, so MycoSV's own
+                #   anchor/cluster counts cannot self-validate). MycoSV and every
+                #   comparator are then scored against this same raw-read
+                #   validated set per SV type, removing the comparator-universe bias of the
+            #   consensus / per-tool rows.
+            for coord_space in ("reference", "query"):
+                union_by_key: dict[tuple[str, str, int, int, str], NormalizedCall] = {}
+                for (cs, _lbl), cset in truth_for_query.items():
+                    if cs != coord_space:
+                        continue
+                    for c in cset:
+                        union_by_key.setdefault(call_key(c), c)
+                mycosv_self = (mycosv_ref_calls if coord_space == "reference"
+                               else mycosv_query_calls)
+                for c in mycosv_self:
+                    union_by_key.setdefault(call_key(c), c)
+                union_calls = list(union_by_key.values())
+                if not union_calls:
+                    continue
+                val_dir = (out_dir / "read_validation" / query_asm
+                           / f"read_level_union_{coord_space}")
+                read_level_truth, support_rows = validate_calls_with_reads(
+                    union_calls,
+                    query_row,
+                    val_dir,
+                    threads=args.threads,
+                    min_support=args.read_validation_min_support,
+                    flank_bp=args.read_validation_flank_bp,
+                    force_external=True,
+                )
+                read_validated_truth_rows.extend(support_rows)
+                if not read_level_truth:
+                    continue
+                rl_label = "read_level_union"
+                agreement_rows.extend(_emit_per_svtype_rows(
+                    query_asm=query_asm,
+                    coord_space=coord_space,
+                    truth_label=rl_label,
+                    method="mycosv",
+                    truth_calls=read_level_truth,
+                    pred_calls=mycosv_self,
+                ))
+                summary_json["queries"][query_asm]["exact_benchmarks"][coord_space][rl_label] = {
+                    **score_callsets(read_level_truth, mycosv_self),
+                    "union_input": len(union_calls),
+                    "read_validated": len(read_level_truth),
+                    "min_split_reads": args.read_validation_min_support,
+                }
+                # Same tool-agnostic truth, every comparator as predictor —
+                # populates the per-SV-type wins matrix on equal footing.
+                for (cs, cmp_label), cmp_calls in truth_for_query.items():
+                    if cs != coord_space:
+                        continue
+                    agreement_rows.extend(_emit_per_svtype_rows(
+                        query_asm=query_asm,
+                        coord_space=coord_space,
+                        truth_label=rl_label,
+                        method=cmp_label,
+                        truth_calls=read_level_truth,
+                        pred_calls=cmp_calls,
+                    ))
 
             # Diagnostic scoring row: same truth, but MycoSV predictions
             # filtered to read-supported calls. This tells apart low F1 caused
@@ -6904,7 +9467,7 @@ def benchmark_real_data(args: argparse.Namespace) -> int:
     if not agreement_rows:
         any_tool_present = any(summary_json["tool_status"].values())
         sys.stderr.write(
-            f"[benchmark] no comparator produced a truth set "
+            f"[benchmark] no comparator produced a baseline callset "
             f"(tools_available={any_tool_present}). Emitting MycoSV-only "
             f"placeholder rows so downstream reports stay populated.\n"
         )
@@ -6912,15 +9475,14 @@ def benchmark_real_data(args: argparse.Namespace) -> int:
             query_asm = query_row["query_asm"]
             for coord_space, calls_key in (("query", "query"), ("reference", "reference")):
                 preds = mycosv_calls_by_query.get(query_asm, {}).get(calls_key, [])
-                # Without a comparator there is no ground truth, so tp / fp / fn
-                # are undefined — emitting 0/0/0 alongside pred_calls=N broke
-                # the invariant tp+fp == pred_calls and made downstream plots
-                # show "0 FP for 34 predictions". Use NaN to match the already
-                # NaN precision/recall and signal "no truth to score against".
+                # Without comparator baselines or raw-read validation rows,
+                # tp / fp / fn are undefined, so use NaN rather than inventing
+                # zero false positives for unscored predictions.
                 agreement_rows.append({
                     "query_asm": query_asm,
                     "coordinate_space": coord_space,
                     "truth_label": "no_comparator",
+                    "validation_basis": validation_basis_for_label("no_comparator"),
                     "svtype": "ALL",
                     "method": "mycosv",
                     "truth_calls": float("nan"),
@@ -6938,37 +9500,20 @@ def benchmark_real_data(args: argparse.Namespace) -> int:
                     "status": "no_truth",
                 })
 
-    write_agreement_summary(out_dir / "exact_benchmark_summary.tsv", agreement_rows)
-    with (out_dir / "benchmark_summary.json").open("w", encoding="utf-8") as fh:
-        json.dump(summary_json, fh, indent=2, sort_keys=True)
-
     write_tsv(
         out_dir / "read_validated_truth.tsv",
         read_validated_truth_rows,
         READ_VALIDATION_FIELDS,
     )
 
-    all_mycosv_calls = [call for rows in mycosv_calls_by_query.values() for call in rows.get("query", [])]
-    novel_rows = []
-    for call in all_mycosv_calls:
-        supporters = sorted(set(support_by_key.get(call_key(call), [])))
-        novel_rows.append({
-            "query_asm": call.query_asm,
-            "query_contig": call.query_contig,
-            "pos": call.pos,
-            "end": call.end,
-            "svtype": call.svtype,
-            "svlen": call.svlen,
-            "annotation": call.annotation,
-            "element_class": call.element_class,
-            "support_count": len(supporters),
-            "support_labels": ",".join(supporters) if supporters else ".",
-            "mycosv_unique": "yes" if not supporters else "no",
-        })
     write_tsv(
-        out_dir / "novel_mycosv_calls.tsv",
-        novel_rows,
-        ["query_asm", "query_contig", "pos", "end", "svtype", "svlen", "annotation", "element_class", "support_count", "support_labels", "mycosv_unique"],
+        out_dir / "match_failures.tsv",
+        match_failure_rows,
+        [
+            "query_asm", "coordinate_space", "truth_label", "method",
+            "pred_contig", "pred_pos", "pred_end", "pred_svtype", "pred_svlen",
+            "reason", "closest_truth_idx", "closest_pos_delta", "closest_svlen_delta",
+        ],
     )
 
     phyla = sorted({row.get("phylum", ".") for row in query_manifest if row.get("phylum") not in {"", "."}})
@@ -6997,6 +9542,113 @@ def benchmark_real_data(args: argparse.Namespace) -> int:
     if not fungaltraits_csv.exists():
         fungaltraits_csv = None
 
+    # Evidence-tier panorama. Tier every MycoSV call (query + reference coord)
+    # into strong / moderate / intrinsic_only / weak so the visualization can
+    # show real-but-unvalidatable calls explicitly instead of letting them
+    # vanish into FP territory in the F1 plots. The tier map is keyed by the
+    # query-coord call_key so it joins cleanly with novel_mycosv_calls.tsv /
+    # biology_findings.tsv (both indexed in query coordinates).
+    all_mycosv_calls = [call for rows in mycosv_calls_by_query.values() for call in rows.get("query", [])]
+    tier_by_key: dict[tuple[str, str, int, int, str], str] = {}
+    for qa, sets in mycosv_calls_by_query.items():
+        validated = validated_mycosv_keys_by_query.get(qa, set())
+        # Tier each query-coord call. Reference-coord rows from the same SV
+        # are siblings of the query-coord row; tiering once on query keys
+        # avoids double counting in the panorama panel.
+        for call in sets.get("query", []):
+            supporters = support_by_key.get(call_key(call), [])
+            tier_by_key[call_key(call)] = classify_evidence_tier(
+                call,
+                has_comparator=bool(supporters),
+                has_external_read_support=call_key(call) in validated,
+            )
+
+    tier_count_rows: list[dict[str, Any]] = []
+    counts: dict[tuple[str, str, str], int] = defaultdict(int)
+    for call in all_mycosv_calls:
+        tier = tier_by_key.get(call_key(call), "weak")
+        counts[(call.query_asm, call.svtype, tier)] += 1
+    for (qa, svt, tier), n in sorted(counts.items()):
+        tier_count_rows.append({
+            "query_asm": qa, "svtype": svt, "tier": tier, "n_calls": n,
+        })
+    write_tsv(
+        out_dir / "mycosv_evidence_tiers.tsv",
+        tier_count_rows,
+        ["query_asm", "svtype", "tier", "n_calls"],
+    )
+
+    pangenome_layer_rows = write_pangenome_call_layers(
+        out_dir / "pangenome_call_layers.tsv",
+        query_manifest,
+        mycosv_calls_by_query,
+        single_ref_equivalent_counts,
+        single_ref_equivalent_keys_by_query,
+        support_by_key,
+        validated_mycosv_keys_by_query,
+    )
+    summary_json["pangenome_call_layers"] = pangenome_layer_rows
+
+    novel_rows = []
+    for call in all_mycosv_calls:
+        key = call_key(call)
+        supporters = sorted(set(support_by_key.get(key, [])))
+        read_supported = key in validated_mycosv_keys_by_query.get(call.query_asm, set())
+        intrinsic_supported = (call.read_support or 0) >= 2
+        in_single_ref = (
+            key in single_ref_equivalent_keys_by_query.get(call.query_asm, set())
+            or pangenome_locus_key(call) in single_ref_equivalent_loci_by_query.get(call.query_asm, set())
+        )
+        mycosv_unique = not supporters and not in_single_ref
+        if in_single_ref:
+            discovery_bucket = "single_reference_equivalent"
+        elif supporters:
+            discovery_bucket = "comparator_supported"
+        elif read_supported:
+            discovery_bucket = "pangenome_only_read_supported"
+        elif intrinsic_supported:
+            discovery_bucket = "pangenome_only_intrinsic_supported"
+        else:
+            discovery_bucket = "pangenome_only_weak"
+        novel_rows.append({
+            "query_asm": call.query_asm,
+            "query_contig": call.query_contig,
+            "pos": call.pos,
+            "end": call.end,
+            "svtype": call.svtype,
+            "svlen": call.svlen,
+            "annotation": call.annotation,
+            "element_class": call.element_class,
+            "support_count": len(supporters),
+            "support_labels": ",".join(supporters) if supporters else ".",
+            "single_reference_equivalent": "yes" if in_single_ref else "no",
+            "mycosv_unique": "yes" if mycosv_unique else "no",
+            "read_supported": "yes" if read_supported else "no",
+            "intrinsic_supported": "yes" if intrinsic_supported else "no",
+            "evidence_tier": tier_by_key.get(key, "weak"),
+            "discovery_bucket": discovery_bucket,
+        })
+    write_tsv(
+        out_dir / "novel_mycosv_calls.tsv",
+        novel_rows,
+        ["query_asm", "query_contig", "pos", "end", "svtype", "svlen",
+         "annotation", "element_class", "support_count", "support_labels",
+         "single_reference_equivalent",
+         "mycosv_unique", "read_supported", "intrinsic_supported",
+         "evidence_tier", "discovery_bucket"],
+    )
+
+    enrichment_rows = write_mycosv_novel_biology_enrichment(
+        out_dir / "mycosv_novel_biology_enrichment.tsv",
+        all_mycosv_calls,
+        support_by_key,
+        single_ref_equivalent_keys_by_query,
+        single_ref_equivalent_loci_by_query,
+        validated_mycosv_keys_by_query,
+        gene_annotations_tsv,
+    )
+    summary_json["mycosv_novel_biology_enrichment"] = enrichment_rows
+
     candidates_tsv, _ = maybe_run_candidate_analysis(
         out_dir,
         mycosv_paths,
@@ -7009,9 +9661,36 @@ def benchmark_real_data(args: argparse.Namespace) -> int:
         fungaltraits_csv,
         args.ancestral_tsv,
     )
-    join_biology_findings(candidates_tsv, all_mycosv_calls, support_by_key, out_dir / "biology_findings.tsv")
+    join_biology_findings(
+        candidates_tsv, all_mycosv_calls, support_by_key,
+        out_dir / "biology_findings.tsv",
+        single_ref_keys_by_query=single_ref_equivalent_keys_by_query,
+        single_ref_loci_by_query=single_ref_equivalent_loci_by_query,
+        tier_by_key=tier_by_key,
+    )
 
-    print(f"benchmark_complete\tqueries={len(query_manifest)}\texact_rows={len(agreement_rows)}")
+    write_agreement_summary(out_dir / "exact_benchmark_summary.tsv", agreement_rows)
+    with (out_dir / "benchmark_summary.json").open("w", encoding="utf-8") as fh:
+        json.dump(summary_json, fh, indent=2, sort_keys=True)
+
+    # Leave-one-out comparator-variance outputs (fungal-specific). Always
+    # written so consumers can detect "no LOO ran" (header-only file) vs
+    # "ran but every query had < 3 comparators" (empty body).
+    loo_tsv_fields = [
+        "query_asm", "phylum", "coordinate_space", "excluded_comparator",
+        "stratum_type", "stratum_value", "truth_n", "tp", "fp", "fn",
+        "precision", "recall", "f1", "status",
+    ]
+    write_tsv(out_dir / "loo_consensus_summary.tsv", loo_summary_rows, loo_tsv_fields)
+    loo_variance_doc: dict[str, Any] = {
+        "queries":  loo_variance_by_query,
+        "global":   _summarize_loo_variance_global(loo_variance_by_query),
+    }
+    with (out_dir / "loo_consensus_variance.json").open("w", encoding="utf-8") as fh:
+        json.dump(_sanitize_for_json(loo_variance_doc), fh, indent=2, sort_keys=True, allow_nan=False)
+
+    print(f"benchmark_complete\tqueries={len(query_manifest)}\texact_rows={len(agreement_rows)}"
+          f"\tloo_rows={len(loo_summary_rows)}\tloo_queries={len(loo_variance_by_query)}")
     return 0
 
 
@@ -7075,10 +9754,11 @@ def prepare_million_real(args: argparse.Namespace) -> int:
     # Parallel download. The serial loop spent ~3 h on ~3300/10000 rows in
     # production because every NCBI fetch was synchronous; threading is safe
     # since materialize_entry is per-URL and disk-cached. Workers are tunable
-    # via MILLION_REAL_DOWNLOAD_WORKERS. Default lowered from 16 → 8 because
-    # 16 reliably hit ftp.ncbi.nlm.nih.gov's per-IP cap and cost ~565 retry
-    # rounds in the 2026-05-06 run; 8 still keeps the NIC saturated on a
-    # warmed cache but stays inside NCBI's well-behaved client window.
+    # via MILLION_REAL_DOWNLOAD_WORKERS. Lowered from 8 → 6 after the
+    # 2026-05-15 prep run (slurm-14936460) still produced hundreds of 503
+    # retries with 8 workers; defense-in-depth comes from the
+    # _NCBI_HOST_SEM/_NCBI_COOLDOWN pair above, which throttles even when
+    # this env var pushes the worker count back up.
     download_workers = max(
         1, int(os.environ.get("MILLION_REAL_DOWNLOAD_WORKERS",
                               str(_HTTP_MAX_PARALLEL_FTP_NCBI)))
@@ -7253,9 +9933,14 @@ def prepare_million_real(args: argparse.Namespace) -> int:
             )
             query_indices: list[int] = []
         else:
-            stride = max(1, len(eligible_indices) // n_queries)
-            query_indices = sorted({eligible_indices[(i * stride) % len(eligible_indices)]
-                                    for i in range(n_queries)})
+            # Seed-aware holdout. The old stride scheme picked the same 5
+            # assemblies for every --seed value, so re-running with a
+            # different seed couldn't surface selection bias. random.sample
+            # with a Random(args.seed) instance gives reproducible-but-
+            # varied selection: same seed -> same set, different seed ->
+            # disjoint coverage.
+            rng = random.Random(int(getattr(args, "seed", 0) or 0))
+            query_indices = sorted(rng.sample(eligible_indices, n_queries))
         # Lookup helpers indexed by lineage so we can pick the closest sibling.
         by_genus: dict[str, list[int]] = defaultdict(list)
         by_family: dict[str, list[int]] = defaultdict(list)
@@ -7266,7 +9951,7 @@ def prepare_million_real(args: argparse.Namespace) -> int:
             by_phylum[r.get("phylum", ".") or "."].append(idx)
         query_set = set(query_indices)
 
-        def pick_benchmark_ref(qi: int) -> str:
+        def pick_benchmark_ref(qi: int) -> tuple[str, str]:
             qrow = ref_manifest_rows[qi]
             # Prefer a non-metagenomic candidate at every taxonomic level
             # before falling back to any candidate. A `uncultured ...`
@@ -7286,16 +9971,29 @@ def prepare_million_real(args: argparse.Namespace) -> int:
                          if not _is_metagenomic_placeholder(
                              ref_manifest_rows[c].get("clade_name", ""))]
                 if clean:
-                    return ref_manifest_rows[clean[0]]["fasta_path"]
-                return ref_manifest_rows[cands[0]]["fasta_path"]
-            for cand in range(len(ref_manifest_rows)):
-                if cand != qi and cand not in query_set:
-                    return ref_manifest_rows[cand]["fasta_path"]
-            return "."
+                    cand = ref_manifest_rows[clean[0]]
+                    return cand.get("asm_name", "."), cand["fasta_path"]
+                cand = ref_manifest_rows[cands[0]]
+                return cand.get("asm_name", "."), cand["fasta_path"]
+            # No genus/family/phylum sibling in the corpus. The previous
+            # behavior fell through to ref_manifest_rows[0] — an alphabetically
+            # first ascomycete against a phylum-isolated basidiomycete /
+            # cryptomycotan query — producing zero homologous alignments and
+            # silent NaN F1. Returning (".", ".") propagates honestly: the
+            # query lands in query_manifest.tsv with an empty bench ref, and
+            # the comparator runners + read-validation paths all skip cleanly
+            # on benchmark_ref_fasta in {"", "."} (e.g. line 6498).
+            sys.stderr.write(
+                f"[holdout] {qrow.get('asm_name', '?')}: no genus/family/phylum "
+                f"sibling in corpus (phylum={qrow.get('phylum', '.')}); "
+                f"skipping benchmark ref selection. Comparators and "
+                f"read-level validation will skip this query.\n"
+            )
+            return ".", "."
 
         for qi in query_indices:
             qrow = ref_manifest_rows[qi]
-            bench_ref = pick_benchmark_ref(qi)
+            bench_ref_asm, bench_ref = pick_benchmark_ref(qi)
             query_manifest_rows.append({
                 "query_asm": qrow["asm_name"],
                 "query_mode": "assembly",
@@ -7303,7 +10001,7 @@ def prepare_million_real(args: argparse.Namespace) -> int:
                 "scenario": "million_real",
                 "lifestyle": ".",
                 "architecture": ".",
-                "benchmark_ref_asm": ".",
+                "benchmark_ref_asm": bench_ref_asm,
                 "benchmark_ref_fasta": bench_ref,
                 "phylum": qrow.get("phylum", "."),
                 "class": qrow.get("class", "."),
@@ -7392,9 +10090,6 @@ def prepare_million_real(args: argparse.Namespace) -> int:
                         f"no eligible runs after platform filter\n"
                     )
                     continue
-                local_path = None
-                meta_rows: list[dict[str, str]] = []
-                asm_name = ""
                 attempts = 0
                 for meta in pool_meta:
                     if attempts >= runs_per_query:
@@ -7414,42 +10109,37 @@ def prepare_million_real(args: argparse.Namespace) -> int:
                             f"{run_acc}: {exc}\n"
                         )
                         continue
-                    asm_name = candidate_name
-                    meta_rows = [meta]
-                    attempts += 1
-                    break
-                if local_path is None or not meta_rows:
-                    sys.stderr.write(
-                        f"[warn] {species}: no usable ENA {read_mode} run after validation; skipping\n"
-                    )
-                    continue
-                read_row = dict(arow)
-                read_row.update({
-                    "query_asm": asm_name,
-                    "query_mode": read_mode,
-                    "path": str(local_path),
-                    "source": f"ena_{read_mode.replace('-', '_')}",
-                    "instrument_platform": meta_rows[0].get("instrument_platform", "."),
-                    "library_layout": meta_rows[0].get("library_layout", "."),
-                    "run_accession": meta_rows[0].get("run_accession", "."),
-                })
-                query_manifest_rows.append(read_row)
-                query_list_paths.append(str(local_path))
-                for meta in meta_rows:
+                    read_row = dict(arow)
+                    read_row.update({
+                        "query_asm": candidate_name,
+                        "query_mode": read_mode,
+                        "path": str(local_path),
+                        "source": f"ena_{read_mode.replace('-', '_')}",
+                        "instrument_platform": meta.get("instrument_platform", "."),
+                        "library_layout": meta.get("library_layout", "."),
+                        "run_accession": run_acc,
+                    })
+                    query_manifest_rows.append(read_row)
+                    query_list_paths.append(str(local_path))
                     source_link_rows.append({
-                        "query_asm": asm_name,
+                        "query_asm": candidate_name,
                         "role": "query",
                         "query_mode": read_mode,
                         "source_type": "ena_read_run",
-                        "source_accession": meta.get("run_accession", "."),
+                        "source_accession": run_acc,
                         "source_url": meta.get("source_url", "."),
                         "local_path": str(local_path),
                         "species": meta.get("scientific_name", species),
                     })
-                sys.stderr.write(
-                    f"[reads-mode] {species!r} mode={read_mode}: "
-                    f"added query {asm_name}\n"
-                )
+                    attempts += 1
+                    sys.stderr.write(
+                        f"[reads-mode] {species!r} mode={read_mode}: "
+                        f"added query {candidate_name}\n"
+                    )
+                if attempts == 0:
+                    sys.stderr.write(
+                        f"[warn] {species}: no usable ENA {read_mode} run after validation; skipping\n"
+                    )
 
     hierarchy_manifest = out_dir / "hierarchy_manifest.tsv"
     write_tsv(
@@ -7940,12 +10630,21 @@ def build_parser() -> argparse.ArgumentParser:
     sb.add_argument("--run-cutesv", action="store_true", help="For long-read queries, run cuteSV on a minimap2 alignment and parse its reference-coordinate VCF.")
     sb.add_argument("--run-delly", action="store_true", help="For short-read queries, run Delly (germline SV mode) on a minimap2 -ax sr alignment.")
     sb.add_argument("--run-manta", action="store_true", help="For short-read queries, run Manta (configManta.py + runWorkflow.py) on a minimap2 -ax sr alignment.")
-    sb.add_argument("--max-comparator-short-reads", type=int, default=150000,
+    sb.add_argument("--max-comparator-short-reads", type=int, default=500000,
                     help="Cap short-read FASTQ records used by external comparators "
-                         "and read validation. 0 disables subsetting (default: 150000).")
-    sb.add_argument("--max-comparator-long-reads", type=int, default=20000,
+                         "and read validation. 0 disables subsetting (default: 500000).")
+    sb.add_argument("--max-comparator-long-reads", type=int, default=200000,
                     help="Cap long-read FASTQ records used by external comparators "
-                         "and read validation. 0 disables subsetting (default: 20000).")
+                         "and read validation. 0 disables subsetting (default: 200000). "
+                         "Bumped from 20000 because at the lower cap svim / sniffles / "
+                         "cuteSV produce zero SV calls on ~60–80 Mbp fungal genomes "
+                         "(0.02–2× coverage) — which is why the headline TSVs were "
+                         "dominated by status=no_truth.")
+    sb.add_argument("--mycosv-use-full-reads", action="store_true",
+                    help="In read modes, pass the original full FASTQ to MycoSV "
+                         "while comparators use the capped subset. Off by default "
+                         "because million-real public FASTQs can be multi-GB and "
+                         "previously caused empty VCFs after timeout/OOM kills.")
     sb.add_argument("--max-assembly-query-contigs", type=int, default=0,
                     help="Skip assembly-mode query FASTAs with more than this many "
                          "records before launching MycoSV/comparators. 0 disables "
@@ -7955,6 +10654,29 @@ def build_parser() -> argparse.ArgumentParser:
                     help="Skip assembly-mode query FASTAs above this total bp before "
                          "launching MycoSV/comparators. 0 disables the filter "
                          "(default: 0).")
+    sb.add_argument("--skip-input-preflight", action="store_true",
+                    help="Skip the cheap FASTA/FASTQ readability preflight. "
+                         "Normally keep this on: it catches corrupt cached gzip "
+                         "files and manifest path mixups before expensive MycoSV/"
+                         "comparator work starts.")
+    sb.add_argument("--benchmark-ref-cap", type=int, default=512,
+                    help="Maximum benchmark reference FASTAs to pass to MycoSV "
+                         "after adding per-query refs plus genus/family/order/"
+                         "class neighbors (default: 512). Million-real runs can "
+                         "raise this to recover expected call volume.")
+    sb.add_argument("--max-benchmark-queries", type=int, default=0,
+                    help="Run only the first N mode-matched query rows from "
+                         "query_manifest.tsv. 0 keeps all queries. Useful for "
+                         "short smoke jobs that only need MycoSV SV counts.")
+    sb.add_argument("--benchmark-query-genera", default="",
+                    help="Comma/space separated target fungal groups. Benchmark "
+                         "selects one mode-matched query row per requested group "
+                         "when present in query_manifest.tsv; missing assembly "
+                         "groups are synthesized from hierarchy_manifest.tsv "
+                         "when possible. Writes REQUESTED_QUERY_GROUPS.tsv and "
+                         "reports missing groups. "
+                         "Also accepts common misspellings and mycorrhiza as a "
+                         "Rhizophagus/Glomus/Glomeromycetes-style biology group.")
     sb.add_argument("--normalized-other", action="append", default=[], metavar="LABEL=PATH", help="Additional normalized TSV callsets to benchmark against. TSVs may use query or reference coordinates via a coord_space column.")
     sb.add_argument("--other-vcf", action="append", default=[], metavar="LABEL=PATH", help="Additional reference-coordinate VCF comparator output, best for single-query or pairwise benchmark runs.")
     sb.add_argument("--mycosv-arg", action="append", default=[], help="Extra argument to pass through to the MycoSV binary; may be used multiple times.")
@@ -7970,21 +10692,23 @@ def build_parser() -> argparse.ArgumentParser:
     sb.add_argument("--expression-tsv", type=Path)
     sb.add_argument("--gene-annotations-tsv", type=Path)
     sb.add_argument("--ancestral-tsv", type=Path)
-    # Read-level (FASTQ-anchored) independent validation of the consensus
-    # truth set. On by default — algorithm comparators inherit assembly
-    # artefacts, so the consensus_2of_N_read_supported row is the bias-free
-    # headline metric.
+    # Read-level (FASTQ-anchored) independent validation of candidate calls.
+    # On by default — algorithm comparators inherit assembly artefacts, so
+    # raw-read validated rows are the preferred fungal validation basis.
     sb.add_argument("--validate-with-reads", dest="validate_with_reads",
                     action="store_true", default=True,
-                    help="Re-anchor consensus truth in raw query reads / "
+                    help="Re-anchor candidate SV calls in raw query reads / "
                          "contigs via samtools split-read counting "
                          "(default: on; needs minimap2 + samtools).")
     sb.add_argument("--no-validate-with-reads", dest="validate_with_reads",
                     action="store_false")
-    sb.add_argument("--read-validation-min-support", type=int, default=3,
+    sb.add_argument("--read-validation-min-support", type=int, default=2,
                     help="Minimum split/clipped reads required at the "
                          "breakpoint to keep an SV in the read-validated "
-                         "truth set (default: 3).")
+                         "validated callset (default: 2). The C++ MycoSV pipeline "
+                         "clusters at SUPPORT=2; defaulting validation to 3 "
+                         "auto-failed ~50–90 %% of mycosv short-read calls "
+                         "even though each call already had ≥2 cluster reads.")
     sb.add_argument("--read-validation-flank-bp", type=int, default=250,
                     help="Window around each breakpoint where supporting "
                          "split/clipped reads are counted (default: 250 bp).")

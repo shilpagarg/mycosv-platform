@@ -22,14 +22,16 @@
 //   detect_line_helitron      — AT-rich + poly-A/T tails (LINE/Helitron)
 //   detect_sine               — short + high-GC + terminal repeat
 //   detect_starship           — AT-rich hull (GC < cladeGc-0.10) + ~genic cargo ≥1 kb
-//   detect_hgt_island         — GC deviation >±0.08 over ≥500 bp (published range ±0.05-0.10)
-//   detect_rip_window         — C/G ratio >2.5 in a 500 bp window (benchmark rule)
+//   detect_hgt_island         — GC deviation >±0.10 over ≥500 bp
+//   detect_rip_window         — lightweight RIP-product index in a 500 bp window
 //   classify_repeat_element   — master dispatcher returning ElementClass
 
 #include <algorithm>
 #include <array>
 #include <climits>
 #include <cstdint>
+#include <cctype>
+#include <deque>
 #include <fstream>
 #include <memory>
 #include <sstream>
@@ -39,6 +41,7 @@
 #include <set>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 #include <cmath>
@@ -63,17 +66,100 @@ struct SyncmerParams {
 };
 
 // =========================================================================
-// BaseBlockSegmenter — syncmer stub (real implementation compiled separately)
+// BaseBlockSegmenter — Hong & Buhler (2016) open syncmer seeding.
+//
+// A k-mer is a syncmer iff the minimum-hash s-mer among its (k - s + 1)
+// constituent s-mers occurs at offset `t` inside the k-mer. Hashing is
+// canonical (lex-min of forward and reverse-complement) so seeds are
+// strand-agnostic. Implementation: monotonic-deque sliding minimum,
+// O(N) over the input sequence. Defaults match SyncmerParams (k=21, s=11,
+// t=2) so existing call sites passing only (seq, k, s) keep working.
+// k-mers containing any non-ACGT base are skipped.
 // =========================================================================
 struct BaseBlockSegmenter {
     static std::vector<std::pair<size_t, uint64_t>>
-    syncmers(std::string_view /*seq*/, int /*k*/, int /*s*/) {
-        return {};
+    syncmers(std::string_view seq, int k, int s, int t = 2) {
+        std::vector<std::pair<size_t, uint64_t>> out;
+        const size_t N = seq.size();
+        if (k <= 0 || s <= 0 || s > k || N < static_cast<size_t>(k)) return out;
+        const int W = k - s + 1;                  // s-mers per k-mer
+        if (t < 0 || t > k - s) t = (k - s) / 2;
+
+        auto complement = [](char c) -> char {
+            switch (c) {
+                case 'A': case 'a': return 'T';
+                case 'C': case 'c': return 'G';
+                case 'G': case 'g': return 'C';
+                case 'T': case 't': return 'A';
+                default: return 'N';
+            }
+        };
+        auto fnv1a = [](const char* p, size_t len) -> uint64_t {
+            uint64_t h = 14695981039346656037ULL;
+            for (size_t i = 0; i < len; ++i) {
+                h ^= static_cast<uint64_t>(static_cast<unsigned char>(p[i]));
+                h *= 1099511628211ULL;
+            }
+            return h;
+        };
+        auto canonical_hash = [&](size_t pos, int len) -> uint64_t {
+            std::string fwd(seq.data() + pos, static_cast<size_t>(len));
+            std::string rev(static_cast<size_t>(len), 'N');
+            for (int i = 0; i < len; ++i)
+                rev[static_cast<size_t>(len - 1 - i)] =
+                    complement(fwd[static_cast<size_t>(i)]);
+            const std::string& canon = (fwd <= rev) ? fwd : rev;
+            return fnv1a(canon.data(), canon.size());
+        };
+
+        // Cumulative count of non-ACGT bases for O(1) window validity checks.
+        std::vector<size_t> nPref(N + 1, 0);
+        for (size_t i = 0; i < N; ++i) {
+            const char c = seq[i];
+            const bool isACGT = (c == 'A' || c == 'C' || c == 'G' || c == 'T'
+                              || c == 'a' || c == 'c' || c == 'g' || c == 't');
+            nPref[i + 1] = nPref[i] + (isACGT ? 0 : 1);
+        }
+
+        const size_t M = N - static_cast<size_t>(s) + 1;   // # s-mer positions
+        std::vector<uint64_t> sHash(M, 0);
+        std::vector<unsigned char> sOk(M, 0);
+        for (size_t i = 0; i < M; ++i) {
+            if (nPref[i + static_cast<size_t>(s)] - nPref[i] == 0) {
+                sOk[i] = 1;
+                sHash[i] = canonical_hash(i, s);
+            }
+        }
+
+        // Monotonic deque: front = argmin s-mer index in the current k-mer
+        // window. Any N inside an s-mer breaks the chain (clear deque).
+        std::deque<size_t> dq;
+        out.reserve(M / static_cast<size_t>(W) + 8);
+        for (size_t i = 0; i < M; ++i) {
+            if (!sOk[i]) { dq.clear(); continue; }
+            while (!dq.empty() && sHash[dq.back()] >= sHash[i]) dq.pop_back();
+            dq.push_back(i);
+            if (i + 1 < static_cast<size_t>(W)) continue;
+            const size_t kStart = i + 1 - static_cast<size_t>(W);
+            while (!dq.empty() && dq.front() < kStart) dq.pop_front();
+            if (dq.empty()) continue;
+            if (nPref[kStart + static_cast<size_t>(k)] - nPref[kStart] != 0)
+                continue;
+            if (dq.front() == kStart + static_cast<size_t>(t)) {
+                out.emplace_back(kStart, canonical_hash(kStart, k));
+            }
+        }
+        return out;
     }
 };
 
 // =========================================================================
-// CladeGraph — pangenome graph node (minimal stub; full engine compiled separately)
+// CladeGraph — per-clade pangenome graph (nodes, oriented edges, paths).
+// Built by build_clade_graph() below (collapses ImportSegments into nodes via
+// sketch-Jaccard buckets, reconstructs per-asm/contig paths, aggregates
+// oriented edge counts, and tallies bubble / block contexts that downstream
+// callers use as SV-bubble candidates). CladeGraphBuilder in
+// layer2_registry.hpp wraps it for streaming construction.
 // =========================================================================
 struct CladeGraph {
     struct Node {
@@ -781,6 +867,12 @@ inline bool detect_starship(std::string_view seq,
     return false;
 }
 
+inline bool starship_supported_phylum(std::string_view phylum) {
+    if (phylum.empty() || phylum == "." || phylum == "unknown" || phylum == "UNKNOWN")
+        return true;  // no taxonomic context available; preserve sequence-only classifier.
+    return phylum == "Ascomycota";
+}
+
 // ── detect_hgt_island ────────────────────────────────────────────────────
 // Horizontal gene transfer island: GC content deviates from clade background
 // by > ±gcDeviation over a sliding window of ≥ minLen bases.
@@ -788,7 +880,7 @@ inline bool detect_starship(std::string_view seq,
 // cladeGc: background GC of the clade (computed externally or passed as 0.45).
 inline bool detect_hgt_island(std::string_view seq,
                                double cladeGc     = 0.45,
-                               double gcDeviation = 0.12,  // benchmark rule: > ±0.12 from clade background
+                               double gcDeviation = 0.10,  // candidate screen, not proof of HGT
                                int    minLen      = 500) {
     const int n = static_cast<int>(seq.size());
     if (n < minLen) return false;
@@ -802,32 +894,36 @@ inline bool detect_hgt_island(std::string_view seq,
 }
 
 // ── detect_rip_window ────────────────────────────────────────────────────
-// RIP (Repeat-Induced Point mutation): benchmark rule for this pipeline is a
-// simple C/G imbalance proxy in a 500 bp sliding window.
-//
-// Detection rule requested for the fungal benchmark suite:
-//   C/G ratio > 2.5 over >= 500 bp.
-//
-// This is intentionally a lightweight, portable heuristic for simulation and
-// OFF_REF annotation rather than a full RIP-index estimator.
+// RIP (Repeat-Induced Point mutation): lightweight RIP-product proxy in a
+// sliding window.  RIP leaves a C->T / G->A signature in repeated DNA, commonly
+// summarized with dinucleotide indices such as TpA/CpA or composite RIP
+// indices.  This detector intentionally stays portable and alignment-free, but
+// it now uses the expected CpA depletion / TpA enrichment signal instead of the
+// older C/G imbalance proxy, which could mark merely C-rich sequence as RIP.
 inline bool detect_rip_window(std::string_view seq,
-                               double cgRatioThresh = 2.5,
+                               double productIndexThresh = 1.5,
                                int    winLen        = 500) {
     const int n = static_cast<int>(seq.size());
     if (n < winLen) return false;
 
     for (int i = 0; i + winLen <= n; i += winLen / 2) {
-        int cCount = 0, gCount = 0;
-        for (int j = i; j < i + winLen; ++j) {
-            const char c = seq[static_cast<size_t>(j)];
-            if (c == 'C' || c == 'c') ++cCount;
-            else if (c == 'G' || c == 'g') ++gCount;
+        int cpa = 0, tpa = 0, tpg = 0, apc = 0, gpt = 0, apt = 0;
+        for (int j = i; j + 1 < i + winLen; ++j) {
+            const char a = static_cast<char>(std::toupper(static_cast<unsigned char>(seq[static_cast<size_t>(j)])));
+            const char b = static_cast<char>(std::toupper(static_cast<unsigned char>(seq[static_cast<size_t>(j + 1)])));
+            if (a == 'C' && b == 'A') ++cpa;
+            else if (a == 'T' && b == 'A') ++tpa;
+            else if (a == 'T' && b == 'G') ++tpg;
+            else if (a == 'A' && b == 'C') ++apc;
+            else if (a == 'G' && b == 'T') ++gpt;
+            else if (a == 'A' && b == 'T') ++apt;
         }
-        if (gCount == 0) {
-            if (cCount > 0) return true;
-            continue;
-        }
-        if (static_cast<double>(cCount) / static_cast<double>(gCount) > cgRatioThresh)
+
+        const double productIndex =
+            static_cast<double>(tpa + tpg + 1) / static_cast<double>(cpa + 1);
+        const double compositeIndex =
+            static_cast<double>(tpa + tpg + 1) / static_cast<double>(apc + gpt + apt + 1);
+        if (productIndex >= productIndexThresh && compositeIndex >= 0.8 && tpa >= 20)
             return true;
     }
     return false;
@@ -839,17 +935,21 @@ inline bool detect_rip_window(std::string_view seq,
 //
 // cladeGc: pass the background GC for the relevant clade; default 0.45.
 inline ElementClass classify_repeat_element(std::string_view seq,
-                                             double cladeGc = 0.45) {
+                                             double cladeGc = 0.45,
+                                             std::string_view phylum = ".") {
     if (seq.size() < 50u) return ElementClass::NONE;
 
     // RIP takes priority (post-translational; affects any repeated element)
     if (detect_rip_window(seq))                        return ElementClass::RIP;
 
+    // Starship: large AT-rich element with GC-rich cargo.  Treat this as a
+    // taxon-aware label when phylum is known; without context retain the old
+    // sequence-only behavior for standalone detector tests and legacy callers.
+    if (starship_supported_phylum(phylum) &&
+        detect_starship(seq, cladeGc))                 return ElementClass::STARSHIP;
+
     // HGT: GC-shifted island
     if (detect_hgt_island(seq, cladeGc))               return ElementClass::HGT;
-
-    // Starship: large AT-rich element with GC-rich cargo
-    if (detect_starship(seq, cladeGc))                 return ElementClass::STARSHIP;
 
     // TE subtypes
     if (detect_sine(seq))                              return ElementClass::TE_SINE;
@@ -1180,7 +1280,18 @@ struct SuffixArray {
                    lcp[static_cast<size_t>(hi2 + 1)] >= best_len)
                 ++hi2;
 
-            for (int k = lo2; k <= hi2; ++k) {
+            // Repetitive fungal sequence can yield thousands of equally long
+            // SA hits for one query position. Emitting the whole interval
+            // creates a MEM cloud that downstream chaining repeatedly mines
+            // without adding breakpoint information. Keep a deterministic,
+            // evenly spaced slice per query position; the global cap remains
+            // as a final safety net across the whole query.
+            constexpr int kMaxHitsPerQueryPos = 64;
+            const int intervalN = hi2 - lo2 + 1;
+            const int emitN = std::min(intervalN, kMaxHitsPerQueryPos);
+            const int stride = std::max(1, intervalN / emitN);
+            int emitted = 0;
+            for (int k = lo2; k <= hi2 && emitted < emitN; k += stride, ++emitted) {
                 Mem m;
                 m.qPos = i;
                 m.rPos = sa[static_cast<size_t>(k)];
@@ -1454,6 +1565,14 @@ struct ChainTreap {
     struct Node {
         int   qPos = 0, rPos = 0, len = 0;
         float score = 0.0f, best = 0.0f;
+        // subtreeBest = max(best) over this node's whole subtree. Maintained
+        // on insert/rotation so find_pred_score can prune entire subtrees
+        // that cannot improve the running best — turning the predecessor
+        // search from O(n) (full left-subtree walk) into ~O(log n) amortised
+        // and the whole chain build from O(n^2) into ~O(n log n). On
+        // chromosome-scale fungal query contigs the O(n^2) walk was the
+        // dominant cost and made assembly-mode runs exceed the 4 h budget.
+        float subtreeBest = 0.0f;
         int   prev = -1, prio = 0, left = -1, right = -1;
     };
 
@@ -1472,6 +1591,7 @@ struct ChainTreap {
         nd.qPos = qPos; nd.rPos = rPos; nd.len = len;
         nd.score = matchScore;
         nd.best  = predBest + matchScore;
+        nd.subtreeBest = nd.best;
         nd.prev  = predIdx;
         nd.prio  = static_cast<int>(rng_());
         nodes_.push_back(nd);
@@ -1499,58 +1619,85 @@ struct ChainTreap {
     }
 
 private:
+    // Recompute subtreeBest for `idx` from its own best plus the children's
+    // subtreeBest. Cheap O(1); call bottom-up after any structural change.
+    void pull(int idx) {
+        Node& n = nodes_[static_cast<size_t>(idx)];
+        float b = n.best;
+        if (n.left  >= 0) b = std::max(b, nodes_[static_cast<size_t>(n.left)].subtreeBest);
+        if (n.right >= 0) b = std::max(b, nodes_[static_cast<size_t>(n.right)].subtreeBest);
+        n.subtreeBest = b;
+    }
+
     float find_pred_score(int node, int rPos, int qPos, int maxGap,
                           int& bestIdx) const {
-        if (node < 0) return 0.0f;
-        const Node& nd = nodes_[static_cast<size_t>(node)];
         float best = 0.0f;
-        // Check the current node: it qualifies as a predecessor only when
-        // both rPos and qPos are strictly less than the query's coordinates
-        // and within the chaining gap band.
-        if (nd.rPos < rPos && nd.qPos < qPos &&
-            rPos - nd.rPos <= maxGap && qPos - nd.qPos <= maxGap) {
-            best    = nd.best;
-            bestIdx = node;
-        }
-        // Left subtree (rPos ≤ nd.rPos): may contain valid predecessors.
-        {
-            int li = -1;
-            float lb = find_pred_score(nd.left, rPos, qPos, maxGap, li);
-            if (lb > best) { best = lb; bestIdx = li; }
-        }
-        // Right subtree (rPos > nd.rPos): only explore when nd.rPos < rPos,
-        // because all nodes in the right subtree have rPos >= nd.rPos.
-        // Exploring the right subtree when nd.rPos >= rPos always misses
-        // (those nodes have even larger rPos) — previously unchecked, causing
-        // O(N) wasted traversal and occasional wrong predecessor results.
-        if (nd.rPos < rPos) {
-            int ri = -1;
-            float rb = find_pred_score(nd.right, rPos, qPos, maxGap, ri);
-            if (rb > best) { best = rb; bestIdx = ri; }
-        }
+        bestIdx = -1;
+        find_pred_rec(node, rPos, qPos, maxGap, best, bestIdx);
         return best;
     }
 
+    // Predecessor search with two prunes vs. the old full-left-subtree walk:
+    //   1. subtreeBest <= best  → nothing in this subtree can beat the
+    //      running best, skip it entirely (the O(n)→O(log n) win).
+    //   2. nd.rPos < rPos - maxGap → every node in nd's LEFT subtree has
+    //      rPos <= nd.rPos and is therefore out of the gap band; skip left.
+    // Both prunes are exact: they only skip subtrees that provably cannot
+    // contain a strictly-better predecessor, so results are identical to the
+    // old exhaustive walk.
+    void find_pred_rec(int node, int rPos, int qPos, int maxGap,
+                       float& best, int& bestIdx) const {
+        if (node < 0) return;
+        const Node& nd = nodes_[static_cast<size_t>(node)];
+        if (nd.subtreeBest <= best) return;
+        // Current node qualifies as a predecessor only when both coordinates
+        // are strictly smaller and within the chaining gap band.
+        if (nd.rPos < rPos && nd.qPos < qPos &&
+            rPos - nd.rPos <= maxGap && qPos - nd.qPos <= maxGap) {
+            if (nd.best > best) { best = nd.best; bestIdx = node; }
+        }
+        // Left subtree (all rPos ≤ nd.rPos): worth visiting only if nd.rPos
+        // itself is still within the gap band's lower bound — otherwise every
+        // left node is too far back.
+        if (nd.rPos >= rPos - maxGap)
+            find_pred_rec(nd.left, rPos, qPos, maxGap, best, bestIdx);
+        // Right subtree (all rPos ≥ nd.rPos): only when nd.rPos < rPos, since
+        // nodes with rPos ≥ rPos can never be predecessors.
+        if (nd.rPos < rPos)
+            find_pred_rec(nd.right, rPos, qPos, maxGap, best, bestIdx);
+    }
+
     int insert_node(int root, int idx) {
-        if (root < 0) return idx;
-        Node& nd = nodes_[static_cast<size_t>(idx)];
-        Node& rt = nodes_[static_cast<size_t>(root)];
-        if (nd.rPos <= rt.rPos) {
-            rt.left = insert_node(rt.left, idx);
-            if (nodes_[static_cast<size_t>(rt.left)].prio > rt.prio) {
-                int nr = rt.left;
-                rt.left = nodes_[static_cast<size_t>(nr)].right;
+        if (root < 0) { pull(idx); return idx; }
+        if (nodes_[static_cast<size_t>(idx)].rPos <=
+            nodes_[static_cast<size_t>(root)].rPos) {
+            int newLeft = insert_node(nodes_[static_cast<size_t>(root)].left, idx);
+            nodes_[static_cast<size_t>(root)].left = newLeft;
+            if (nodes_[static_cast<size_t>(newLeft)].prio >
+                nodes_[static_cast<size_t>(root)].prio) {
+                int nr = newLeft;
+                nodes_[static_cast<size_t>(root)].left =
+                    nodes_[static_cast<size_t>(nr)].right;
                 nodes_[static_cast<size_t>(nr)].right = root;
+                pull(root);
+                pull(nr);
                 return nr;
             }
+            pull(root);
         } else {
-            rt.right = insert_node(rt.right, idx);
-            if (nodes_[static_cast<size_t>(rt.right)].prio > rt.prio) {
-                int nr = rt.right;
-                rt.right = nodes_[static_cast<size_t>(nr)].left;
+            int newRight = insert_node(nodes_[static_cast<size_t>(root)].right, idx);
+            nodes_[static_cast<size_t>(root)].right = newRight;
+            if (nodes_[static_cast<size_t>(newRight)].prio >
+                nodes_[static_cast<size_t>(root)].prio) {
+                int nr = newRight;
+                nodes_[static_cast<size_t>(root)].right =
+                    nodes_[static_cast<size_t>(nr)].left;
                 nodes_[static_cast<size_t>(nr)].left = root;
+                pull(root);
+                pull(nr);
                 return nr;
             }
+            pull(root);
         }
         return root;
     }
@@ -1663,27 +1810,54 @@ struct SvTypeFromChain {
 
         const int delta = qGap - rGap;
 
+        // The query span the chain physically covers. A genuine tandem
+        // duplication — its extra copy lives inside the query contig — cannot
+        // be larger than this. Cumulative rGap, by contrast, sums EVERY noisy
+        // backward MEM pair across the chain; on repeat-rich query genomes
+        // (arbuscular mycorrhizal fungi) that aggregate explodes to many× the
+        // contig length and produced 100–300 kb "DUP" calls on 20 kb contigs.
+        const int qChainSpan = chain[static_cast<size_t>(N-1)].qPos +
+                               chain[static_cast<size_t>(N-1)].len - chain[0].qPos;
+
+        // Coherence guard for the per-pair DUP signal: a genuine tandem
+        // duplication RE-TRAVERSES the duplicated window — after the backward
+        // rPos jump the chain continues forward THROUGH the same reference
+        // region. A lone repeat MEM, by contrast, jumps back once and is
+        // immediately followed by a large compensating FORWARD leap back onto
+        // the main diagonal. Require the successor MEM to stay inside the
+        // duplicated window (small forward step) rather than leap past it;
+        // an unverifiable backward jump at the very end of the chain is
+        // treated as non-coherent (precision-favouring).
+        bool perPairDupCoherent = false;
+        if (dupPairIdx >= 0 && dupPairIdx + 2 < N) {
+            const int afterRGap = chain[static_cast<size_t>(dupPairIdx + 2)].rPos -
+                (chain[static_cast<size_t>(dupPairIdx + 1)].rPos +
+                 chain[static_cast<size_t>(dupPairIdx + 1)].len);
+            perPairDupCoherent = (afterRGap * 2 < -dupPairBack);
+        }
+
         // DUP: cumulative reference overlap, OR a single backward rPos jump
         // ≥ minSvLen accompanied by a non-negative query gap (tandem-dup
         // signature: q advances by ~svLen while r returns to the original
-        // copy's coordinates).
-        const bool cumulativeDup = (rGap < -minSvLen);
+        // copy's coordinates). Both forms are bounded by qChainSpan so a
+        // noise-inflated rGap can never masquerade as a chromosome-scale DUP.
         const bool perPairDup    = (dupPairIdx >= 0 &&
                                     dupPairBack < -minSvLen &&
                                     dupPairQGap >= -minSvLen &&
-                                    -dupPairBack >= dupPairQGap);
+                                    -dupPairBack >= dupPairQGap &&
+                                    -dupPairBack <= qChainSpan &&
+                                    perPairDupCoherent);
+        const bool cumulativeDup = (rGap < -minSvLen) && (-rGap <= qChainSpan);
         if (cumulativeDup || perPairDup) {
             const int ctgOff = (c0 > 0)
                 ? sa.contigEnd[static_cast<size_t>(c0) - 1] : 0;
             res.type = Type::DUP;
-            if (cumulativeDup) {
-                res.qBreakStart = chain[0].qPos;
-                res.qBreakEnd   = chain[static_cast<size_t>(N-1)].qPos +
-                                  chain[static_cast<size_t>(N-1)].len - 1;
-                res.rBreakStart = chain[0].rPos - ctgOff;
-                res.rBreakEnd   = res.rBreakStart + (-rGap);
-                res.svLen       = -rGap;
-            } else {
+            // Prefer the dominant single backward jump: the per-pair anchor is
+            // the real tandem-dup signature (one copy, one size), whereas
+            // cumulative rGap is a noise-prone aggregate. Fall back to the
+            // cumulative view only when no single dominant backward pair
+            // exists (and only then within the qChainSpan bound above).
+            if (perPairDup) {
                 // Anchor on the offending pair: the duplicated copy sits
                 // between chain[dupPairIdx] and chain[dupPairIdx+1] in
                 // query space, mapping back to chain[dupPairIdx+1].rPos in
@@ -1695,6 +1869,13 @@ struct SvTypeFromChain {
                 res.rBreakStart = chain[static_cast<size_t>(dupPairIdx + 1)].rPos - ctgOff;
                 res.rBreakEnd   = res.rBreakStart + (-dupPairBack);
                 res.svLen       = -dupPairBack;
+            } else {
+                res.qBreakStart = chain[0].qPos;
+                res.qBreakEnd   = chain[static_cast<size_t>(N-1)].qPos +
+                                  chain[static_cast<size_t>(N-1)].len - 1;
+                res.rBreakStart = chain[0].rPos - ctgOff;
+                res.rBreakEnd   = res.rBreakStart + (-rGap);
+                res.svLen       = -rGap;
             }
             if (c0 >= 0) res.rContig = sa.contigName[static_cast<size_t>(c0)];
             return res;
@@ -1728,6 +1909,12 @@ struct SvTypeFromChain {
             res.rBreakStart = breakRPos - ctgOff;
         }
         res.svLen       = std::abs(delta);
+        // An insertion's novel sequence is physically present in the query
+        // contig, so |svLen| cannot exceed the query span the chain covers.
+        // A larger value means `delta` is an artifact of many small gaps
+        // summed across a noisy chain, not a single event — reject it rather
+        // than emit a chromosome-scale phantom INS.
+        if (delta > 0 && res.svLen > qChainSpan) return Result{};
         if (delta > 0) {
             res.type = Type::INS;
         } else {
@@ -1737,6 +1924,428 @@ struct SvTypeFromChain {
         }
         if (c0 >= 0) res.rContig = sa.contigName[static_cast<size_t>(c0)];
         return res;
+    }
+
+    // classify_all: emit ALL local INS/DEL gaps in the chain rather than only the
+    // dominant one. The original classify() returns a single Result, which on real
+    // diverged fungal genomes collapses 50–500 small SVs per query down to ~1–17
+    // calls (assembly-mode F1 0.007–0.04 on compact_yeast). This walker keeps the
+    // global TRA/INV/DUP semantics — those still return a single event — but for
+    // INS/DEL it scans every consecutive MEM pair and emits an event whenever the
+    // per-pair (qGap - rGap) difference is ≥ minSvLen, ignoring pairs that cross
+    // a contig boundary (TRA territory), flip strand (INV territory), or jump
+    // backward in r (DUP territory). All event coordinates are returned in local
+    // contig space, same convention as classify().
+    static std::vector<Result> classify_all(const std::vector<SuffixArray::Mem>& chain,
+                                            const std::vector<bool>& isRevComp,
+                                            const SuffixArray& sa,
+                                            int minSvLen = 40) {
+        std::vector<Result> events;
+        if (chain.size() < 2) return events;
+
+        Result global = classify(chain, isRevComp, sa, minSvLen);
+        if (global.type == Type::TRA ||
+            global.type == Type::INV ||
+            global.type == Type::DUP) {
+            events.push_back(global);
+            return events;
+        }
+
+        auto contig_of = [&](int rPos) -> int {
+            for (int ci = 0; ci < static_cast<int>(sa.contigEnd.size()); ++ci)
+                if (rPos < sa.contigEnd[static_cast<size_t>(ci)]) return ci;
+            return -1;
+        };
+
+        const int N = static_cast<int>(chain.size());
+        for (int i = 0; i + 1 < N; ++i) {
+            // Strand transitions belong to the global INV path.
+            if (i < static_cast<int>(isRevComp.size()) &&
+                i + 1 < static_cast<int>(isRevComp.size()) &&
+                isRevComp[static_cast<size_t>(i)] != isRevComp[static_cast<size_t>(i + 1)])
+                continue;
+
+            const int rEndA = chain[static_cast<size_t>(i)].rPos +
+                              chain[static_cast<size_t>(i)].len;
+            const int qEndA = chain[static_cast<size_t>(i)].qPos +
+                              chain[static_cast<size_t>(i)].len;
+            const int lqg   = chain[static_cast<size_t>(i + 1)].qPos - qEndA;
+            const int lrg   = chain[static_cast<size_t>(i + 1)].rPos - rEndA;
+
+            // Cross-contig pairs are TRA territory.
+            const int ciA = contig_of(chain[static_cast<size_t>(i)].rPos);
+            const int ciB = contig_of(chain[static_cast<size_t>(i + 1)].rPos);
+            if (ciA < 0 || ciB < 0 || ciA != ciB) continue;
+
+            // Backward rPos jumps are DUP territory.
+            if (lrg < 0) continue;
+            // Forward overlap in query (negative qGap) means the next MEM overlaps the
+            // previous one's footprint — likely a near-tandem repeat; skip.
+            if (lqg < 0) continue;
+
+            const int ld = lqg - lrg;
+            if (std::abs(ld) < minSvLen) continue;
+
+            Result r;
+            const int breakRPos = rEndA;
+            const int breakCi   = contig_of(breakRPos > 0 ? breakRPos - 1 : 0);
+            const int ctgOff    = (breakCi > 0)
+                ? sa.contigEnd[static_cast<size_t>(breakCi) - 1] : 0;
+            r.qBreakStart = qEndA;
+            r.rBreakStart = breakRPos - ctgOff;
+            r.svLen       = std::abs(ld);
+            if (ld > 0) {
+                r.type        = Type::INS;
+                r.qBreakEnd   = r.qBreakStart + ld;
+                r.rBreakEnd   = r.rBreakStart;
+            } else {
+                r.type        = Type::DEL;
+                r.qBreakEnd   = r.qBreakStart;
+                r.rBreakEnd   = r.rBreakStart + (-ld);
+            }
+            if (breakCi >= 0) r.rContig = sa.contigName[static_cast<size_t>(breakCi)];
+            events.push_back(std::move(r));
+        }
+
+        // If per-pair scan found nothing but the global dominant signal is INS/DEL,
+        // fall back to the single-event view rather than dropping the chain.
+        if (events.empty() &&
+            (global.type == Type::INS || global.type == Type::DEL)) {
+            events.push_back(global);
+        }
+        return events;
+    }
+};
+
+// =========================================================================
+// PangenomeBubbleSvCaller — bubble-walking SV caller over a CladeGraph.
+//
+// Walks every per-(asm,contig) path against a REF path (the longest path by
+// total node-sequence length, alphabetical tiebreak). Each ALT node is
+// either a REF-anchor (its id appears in the REF node sequence) or a
+// divergent node. A bubble closes whenever:
+//   (a) a REF-anchor is hit with a non-empty divergent buffer, OR
+//   (b) the REF-anchor's position is not exactly lastRefIdx + 1
+//       (skipped REF span → DEL signature; backward jump → DUP signature).
+//
+// Classification (per bubble):
+//   INV  : refLen == altLen > 0 and revcomp(altSeq) == refSeq
+//   DUP  : altSeq begins with two or more consecutive copies of refSeq
+//   INS  : altLen > refLen (or refLen == 0)
+//   DEL  : altLen < refLen (or altLen == 0)
+//   else : isComplex = true (same length, different sequence)
+//
+// Identical bubbles seen on multiple ALT paths are collapsed into one record
+// with `supportingPaths` listing each contributing genome path.
+//
+// TRA: not emitted — CladeGraph paths here are per (asm, contig), so a
+// genuine cross-contig translocation lives in a different path and isn't a
+// single bubble. The MEM/chain-based path (SvTypeFromChain) covers TRA.
+// =========================================================================
+struct PangenomeBubbleSV {
+    SvTypeFromChain::Type    type            = SvTypeFromChain::Type::NONE;
+    std::string              cladeName;
+    std::string              refPathName;
+    int                      refNodeStart    = 0;     // REF anchor index (exclusive lower)
+    int                      refNodeEnd      = 0;     // REF anchor index (exclusive upper)
+    int                      refLenBp        = 0;
+    int                      altLenBp        = 0;
+    int                      svLen           = 0;     // signed altLen - refLen
+    std::string              refSeq;
+    std::string              altSeq;
+    std::vector<std::string> supportingPaths;
+    bool                     isComplex       = false;
+    // TRA: at least one divergent node is also used on a contig other than
+    // the ALT path's own contig — material has moved across reference
+    // contigs. `traPartnerContigs` lists the foreign contigs implicated.
+    std::vector<std::string> traPartnerContigs;
+    // OFF_REF: ALT k-mer overlap with the union of REF-path sequences is
+    // below 5% — bubble represents sequence largely absent from the clade
+    // reference set (Path-C novelty candidate). The chain-based caller's
+    // score_cross_clade_novelty() can subsequently qualify this as HGT /
+    // NOVEL_WEAK / DIVERGED vs other clades.
+    bool                     isOffRef        = false;
+    double                   refKmerOverlap  = 1.0;
+};
+
+struct PangenomeBubbleSvCaller {
+    int    minSvLen          = 40;
+    int    maxSvLen          = 1'000'000;
+    int    offRefKmerK       = 15;
+    double offRefMaxOverlap  = 0.05;
+    int    offRefMinAltBp    = 100;
+
+    // CladeGraph path naming convention is "asm::contig" (see build_clade_graph).
+    static std::pair<std::string, std::string>
+    split_path_name(const std::string& name) {
+        const auto pos = name.find("::");
+        if (pos == std::string::npos) return {name, ""};
+        return {name.substr(0, pos), name.substr(pos + 2)};
+    }
+
+    // Inline FNV-1a k-mer hashing for the OFF_REF overlap check. Keeping it
+    // local avoids pulling fungi_tol_bridge.hpp into layer1 (which would
+    // create a header cycle: bridge already includes layer3 → layer1).
+    static void kmer_hashes_into(std::unordered_set<uint64_t>& out,
+                                 const std::string& s, int k) {
+        if (k <= 0 || static_cast<int>(s.size()) < k) return;
+        const uint64_t basis = 14695981039346656037ULL;
+        const uint64_t prime = 1099511628211ULL;
+        for (size_t i = 0; i + static_cast<size_t>(k) <= s.size(); ++i) {
+            uint64_t h = basis;
+            for (int j = 0; j < k; ++j) {
+                h ^= static_cast<uint64_t>(static_cast<unsigned char>(s[i + j]));
+                h *= prime;
+            }
+            out.insert(h);
+        }
+    }
+
+    static std::string revcomp(const std::string& s) {
+        std::string out(s.size(), 'N');
+        for (size_t i = 0; i < s.size(); ++i) {
+            const char c = s[s.size() - 1 - i];
+            switch (c) {
+                case 'A': case 'a': out[i] = 'T'; break;
+                case 'C': case 'c': out[i] = 'G'; break;
+                case 'G': case 'g': out[i] = 'C'; break;
+                case 'T': case 't': out[i] = 'A'; break;
+                default:            out[i] = 'N'; break;
+            }
+        }
+        return out;
+    }
+
+    // True iff `alt` begins with two or more consecutive copies of `ref`.
+    static bool is_tandem_dup(const std::string& alt, const std::string& ref) {
+        if (ref.empty() || alt.size() < 2 * ref.size()) return false;
+        if (alt.compare(0, ref.size(), ref) != 0) return false;
+        if (alt.compare(ref.size(), ref.size(), ref) != 0) return false;
+        return true;
+    }
+
+    std::vector<PangenomeBubbleSV> call(const CladeGraph& g) const {
+        std::vector<PangenomeBubbleSV> out;
+        if (g.paths.empty() || g.nodes.empty()) return out;
+
+        std::unordered_map<int, const std::string*> nodeSeq;
+        nodeSeq.reserve(g.nodes.size() * 2);
+        for (const auto& n : g.nodes) nodeSeq.emplace(n.id, &n.sequence);
+
+        auto path_bp = [&](const CladeGraph::Path& p) -> size_t {
+            size_t s = 0;
+            for (int nid : p.nodes) {
+                auto it = nodeSeq.find(nid);
+                if (it != nodeSeq.end()) s += it->second->size();
+            }
+            return s;
+        };
+        const CladeGraph::Path* refPath = &g.paths.front();
+        size_t refBp = path_bp(*refPath);
+        for (const auto& p : g.paths) {
+            const size_t b = path_bp(p);
+            if (b > refBp || (b == refBp && p.name < refPath->name)) {
+                refPath = &p;
+                refBp   = b;
+            }
+        }
+
+        std::unordered_map<int, std::vector<int>> refPos;
+        refPos.reserve(refPath->nodes.size() * 2);
+        for (size_t i = 0; i < refPath->nodes.size(); ++i) {
+            refPos[refPath->nodes[i]].push_back(static_cast<int>(i));
+        }
+
+        // Per-node contig set (across all paths). A node whose set exceeds
+        // {altContig} signals cross-contig material movement → TRA.
+        std::unordered_map<int, std::unordered_set<std::string>> nodeContigs;
+        nodeContigs.reserve(g.nodes.size() * 2);
+        for (const auto& p : g.paths) {
+            const std::string contig = split_path_name(p.name).second;
+            for (int nid : p.nodes) nodeContigs[nid].insert(contig);
+        }
+        const std::string refContig = split_path_name(refPath->name).second;
+
+        // REF k-mer union for the OFF_REF overlap check. Use REF path nodes
+        // as the in-clade reference proxy (CladeGraph collapses identical
+        // segments across genomes, so REF path nodes already approximate
+        // the conserved core).
+        std::unordered_set<uint64_t> refKmers;
+        for (int nid : refPath->nodes) {
+            auto it = nodeSeq.find(nid);
+            if (it != nodeSeq.end())
+                kmer_hashes_into(refKmers, *it->second, offRefKmerK);
+        }
+
+        auto concat_span = [&](int firstIdxExcl, int lastIdxExcl) -> std::string {
+            std::string s;
+            const int lo = firstIdxExcl + 1;
+            const int hi = std::min(lastIdxExcl,
+                                    static_cast<int>(refPath->nodes.size()));
+            for (int i = std::max(lo, 0); i < hi; ++i) {
+                auto it = nodeSeq.find(refPath->nodes[static_cast<size_t>(i)]);
+                if (it != nodeSeq.end()) s += *it->second;
+            }
+            return s;
+        };
+        auto concat_nodes = [&](const std::vector<int>& ids) -> std::string {
+            std::string s;
+            for (int nid : ids) {
+                auto it = nodeSeq.find(nid);
+                if (it != nodeSeq.end()) s += *it->second;
+            }
+            return s;
+        };
+
+        struct BubbleKey {
+            int         refStart;
+            int         refEnd;
+            std::string altSeq;
+            bool operator==(const BubbleKey& o) const {
+                return refStart == o.refStart && refEnd == o.refEnd &&
+                       altSeq == o.altSeq;
+            }
+        };
+        struct BubbleKeyHash {
+            size_t operator()(const BubbleKey& k) const noexcept {
+                size_t h = static_cast<size_t>(k.refStart) * 0x9E3779B185EBCA87ULL;
+                h ^= static_cast<size_t>(k.refEnd) + 0x165667B19E3779F9ULL +
+                     (h << 6) + (h >> 2);
+                h ^= std::hash<std::string>{}(k.altSeq);
+                return h;
+            }
+        };
+        std::unordered_map<BubbleKey, size_t, BubbleKeyHash> seen;
+
+        auto emit_bubble = [&](int refStartIdx, int refEndIdx,
+                               const std::vector<int>& altDivergent,
+                               const std::string& altPathName) {
+            std::string refSeq = concat_span(refStartIdx, refEndIdx);
+            std::string altSeq = concat_nodes(altDivergent);
+            const int refLen = static_cast<int>(refSeq.size());
+            const int altLen = static_cast<int>(altSeq.size());
+            if (refLen == 0 && altLen == 0) return;
+            const int absLen = std::max(refLen, altLen);
+            if (absLen < minSvLen || absLen > maxSvLen) return;
+
+            using T = SvTypeFromChain::Type;
+            PangenomeBubbleSV sv;
+            sv.cladeName    = g.cladeName;
+            sv.refPathName  = refPath->name;
+            sv.refNodeStart = refStartIdx;
+            sv.refNodeEnd   = refEndIdx;
+            sv.refLenBp     = refLen;
+            sv.altLenBp     = altLen;
+            sv.svLen        = altLen - refLen;
+            sv.refSeq       = refSeq;
+            sv.altSeq       = altSeq;
+            sv.supportingPaths.push_back(altPathName);
+
+            // Cross-contig TRA detection: union of contigs that host any
+            // divergent node, minus the alt path's own contig. Any non-empty
+            // remainder means the bubble material was moved across REF
+            // contigs in this genome.
+            const std::string altContig = split_path_name(altPathName).second;
+            std::unordered_set<std::string> partnerSet;
+            for (int nid : altDivergent) {
+                auto it = nodeContigs.find(nid);
+                if (it == nodeContigs.end()) continue;
+                for (const auto& c : it->second)
+                    if (c != altContig) partnerSet.insert(c);
+            }
+            sv.traPartnerContigs.assign(partnerSet.begin(), partnerSet.end());
+            std::sort(sv.traPartnerContigs.begin(), sv.traPartnerContigs.end());
+            const bool isCrossContig = !sv.traPartnerContigs.empty();
+
+            // OFF_REF: ALT k-mer overlap with REF path's k-mer union.
+            sv.refKmerOverlap = 1.0;
+            if (altLen >= offRefMinAltBp) {
+                std::unordered_set<uint64_t> altKmers;
+                kmer_hashes_into(altKmers, altSeq, offRefKmerK);
+                if (!altKmers.empty()) {
+                    size_t inter = 0;
+                    for (uint64_t h : altKmers) if (refKmers.count(h)) ++inter;
+                    sv.refKmerOverlap =
+                        static_cast<double>(inter) /
+                        static_cast<double>(altKmers.size());
+                    if (sv.refKmerOverlap < offRefMaxOverlap) sv.isOffRef = true;
+                }
+            }
+
+            // Classification priority:
+            //   TRA  (cross-contig signal — overrides others)
+            //   INV  (length-matched reverse-complement allele)
+            //   DUP  (tandem expansion of REF span)
+            //   INS / DEL  (length-delta sign)
+            //   COMPLEX  (equal length, non-INV substitution)
+            if (isCrossContig) {
+                sv.type = T::TRA;
+            } else if (refLen > 0 && altLen > 0 && refLen == altLen &&
+                       revcomp(altSeq) == refSeq) {
+                sv.type = T::INV;
+            } else if (is_tandem_dup(altSeq, refSeq)) {
+                sv.type = T::DUP;
+            } else if (refLen == 0 && altLen > 0) {
+                sv.type = T::INS;
+            } else if (altLen == 0 && refLen > 0) {
+                sv.type = T::DEL;
+            } else if (altLen > refLen) {
+                sv.type = T::INS;
+            } else if (altLen < refLen) {
+                sv.type = T::DEL;
+            } else {
+                sv.type      = T::NONE;
+                sv.isComplex = true;
+            }
+
+            BubbleKey key{refStartIdx, refEndIdx, altSeq};
+            auto it = seen.find(key);
+            if (it != seen.end()) {
+                out[it->second].supportingPaths.push_back(altPathName);
+            } else {
+                seen.emplace(std::move(key), out.size());
+                out.push_back(std::move(sv));
+            }
+        };
+
+        for (const auto& p : g.paths) {
+            if (&p == refPath) continue;
+            int lastRefIdx = -1;
+            std::vector<int> bubble;
+            for (int nid : p.nodes) {
+                auto it = refPos.find(nid);
+                if (it == refPos.end()) {
+                    bubble.push_back(nid);
+                    continue;
+                }
+                // Snap to the REF occurrence closest to the monotone-next slot.
+                int chosen  = it->second.front();
+                int bestGap = std::abs(chosen - (lastRefIdx + 1));
+                for (int candidate : it->second) {
+                    const int gap = std::abs(candidate - (lastRefIdx + 1));
+                    if (gap < bestGap) { bestGap = gap; chosen = candidate; }
+                }
+                const int  newRefIdx    = chosen;
+                const bool isSkipForward = (newRefIdx > lastRefIdx + 1);
+                const bool isBackward    = (newRefIdx <= lastRefIdx);
+                const bool haveBubble    = !bubble.empty();
+
+                if (haveBubble || isSkipForward || isBackward) {
+                    const int rStart = lastRefIdx;
+                    const int rEnd   = isBackward ? lastRefIdx + 1 : newRefIdx;
+                    emit_bubble(rStart, rEnd, bubble, p.name);
+                    bubble.clear();
+                }
+                lastRefIdx = newRefIdx;
+            }
+            if (!bubble.empty()) {
+                emit_bubble(lastRefIdx,
+                            static_cast<int>(refPath->nodes.size()),
+                            bubble, p.name);
+            }
+        }
+
+        return out;
     }
 };
 

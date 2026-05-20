@@ -301,6 +301,28 @@ def test_load_mycosv_calls_parse_intrinsic_read_support(tmp_path: Path):
     assert ref_calls[0].read_support == 8
 
 
+def test_deduplicate_projected_reference_calls_marks_all_single_ref_keys():
+    c1 = NormalizedCall(
+        "q1", "qctg", 10, 110, "DEL", -100, "mycosv",
+        coord_space="reference", ref_contig="bench_chr", read_support=1,
+    )
+    c2 = NormalizedCall(
+        "q1", "qctg", 12, 112, "DEL", -105, "mycosv",
+        coord_space="reference", ref_contig="bench_chr", read_support=5,
+    )
+    qk1 = ("q1", "qctg", 1000, 1100, "DEL")
+    qk2 = ("q1", "qctg", 1005, 1105, "DEL")
+
+    deduped, representative_keys, all_keys = rrfb.deduplicate_projected_reference_calls(
+        [(c1, qk1), (c2, qk2)]
+    )
+
+    assert len(deduped) == 1
+    assert deduped[0].read_support == 5
+    assert representative_keys == [qk2]
+    assert all_keys == {qk1, qk2}
+
+
 def test_expand_to_multisample_vcf_uses_manifest_samples_for_empty_vcf(tmp_path: Path):
     vcf = tmp_path / "calls.vcf"
     vcf.write_text(
@@ -327,6 +349,32 @@ def test_join_biology_findings_writes_header_when_candidates_missing(tmp_path: P
     text = out.read_text(encoding="utf-8")
     assert text.startswith("query_asm\tquery_contig\tpos\tend\tsvtype")
     assert "comparator_support_count" in text
+    assert "single_reference_equivalent" in text
+
+
+def test_join_biology_findings_excludes_single_ref_projection_from_unique(tmp_path: Path):
+    candidates = tmp_path / "candidates.tsv"
+    candidates.write_text(
+        "query_asm\tquery_contig\tpos\tend\tsvtype\tsvlen\tannotation\telement_class\n"
+        "q1\tctg\t110\t210\tDEL\t100\tNOVEL\tNONE\n",
+        encoding="utf-8",
+    )
+    out = tmp_path / "biology_findings.tsv"
+    key = ("q1", "ctg", 100, 200, "DEL")
+    projected_call = NormalizedCall("q1", "ctg", 100, 200, "DEL", 100, "mycosv")
+
+    rrfb.join_biology_findings(
+        candidates,
+        [],
+        {},
+        out,
+        single_ref_keys_by_query={"q1": {key}},
+        single_ref_loci_by_query={"q1": {rrfb.pangenome_locus_key(projected_call)}},
+    )
+
+    rows = list(csv.DictReader(out.open(), delimiter="\t"))
+    assert rows[0]["single_reference_equivalent"] == "yes"
+    assert rows[0]["mycosv_unique"] == "no"
 
 
 def test_load_mycosv_assembly_support_from_vcf(tmp_path: Path):
@@ -424,6 +472,81 @@ def test_calls_compatible_accepts_inv_whole_block_prediction():
     assert score_callsets([truth], [pred])["tp"] == 1
 
 
+def test_calls_compatible_accepts_chain_level_del_containing_fine_truth():
+    # MycoSV emits chain-level DEL spans (here: 12 kb at pos 100 000); the
+    # comparator truth from read-level callers (svim/sniffles/cutesv) emits
+    # the fine-grained nested event (here: 100 bp at pos 105 000). Without
+    # span-containment the position delta (5 000 bp) exceeds DEL tol_bp,
+    # and the 12 000:100 length ratio dwarfs tol_frac, so the call is
+    # spuriously scored as FP. With the span-contain path it counts as TP.
+    truth = NormalizedCall("q1", "ctg", 105_000, 105_100, "DEL", 100, "truth",
+                            coord_space="reference", ref_contig="chr1")
+    pred  = NormalizedCall("q1", "ctg", 100_000, 112_000, "DEL", 12_000, "mycosv",
+                            coord_space="reference", ref_contig="chr1")
+    assert rrfb.calls_compatible(truth, pred)
+    assert score_callsets([truth], [pred])["tp"] == 1
+
+
+def test_chain_level_del_only_claims_one_truth_when_many_nested():
+    # Five small truth DEL events sit inside one large mycosv chain DEL.
+    # Span-contain must NOT inflate TP by letting the single pred match all
+    # five truths — the greedy match consumes the pred after the first claim
+    # so TP=1, FN=4. Guards against over-counting.
+    truths = [
+        NormalizedCall("q1", "ctg", 101_000 + i * 1500, 101_100 + i * 1500,
+                        "DEL", 100, "truth", coord_space="reference", ref_contig="chr1")
+        for i in range(5)
+    ]
+    pred = NormalizedCall("q1", "ctg", 100_000, 112_000, "DEL", 12_000, "mycosv",
+                           coord_space="reference", ref_contig="chr1")
+    m = score_callsets(truths, [pred])
+    assert m["tp"] == 1
+    assert m["fn"] == 4
+    assert m["fp"] == 0
+
+
+def test_match_calls_uses_global_nearest_assignment():
+    # Truth-order greedy used to let the first truth consume pred_at_1200 even
+    # though pred_at_500 was also compatible with it. That left the second
+    # truth with no legal match and undercounted TP by one.
+    truths = [
+        NormalizedCall("q1", "ctg", 1000, 1000, "INS", 100, "truth", coord_space="reference", ref_contig="chr1"),
+        NormalizedCall("q1", "ctg", 1300, 1300, "INS", 100, "truth", coord_space="reference", ref_contig="chr1"),
+    ]
+    preds = [
+        NormalizedCall("q1", "ctg", 1200, 1200, "INS", 100, "pred", coord_space="reference", ref_contig="chr1"),
+        NormalizedCall("q1", "ctg", 500, 500, "INS", 100, "pred", coord_space="reference", ref_contig="chr1"),
+    ]
+    m = score_callsets(truths, preds)
+    assert m["tp"] == 2
+    assert m["fn"] == 0
+    assert m["fp"] == 0
+
+
+def test_consensus_truth_does_not_use_same_source_bridge_as_support():
+    # A1~A2 and A2~B, but A1 is not supported by B. Same-source duplicates
+    # must not bridge consensus and make A1 the representative truth call.
+    a1 = NormalizedCall("q1", "ctg", 1000, 1000, "INS", 100, "caller_a", coord_space="reference", ref_contig="chr1")
+    a2 = NormalizedCall("q1", "ctg", 1400, 1400, "INS", 100, "caller_a", coord_space="reference", ref_contig="chr1")
+    b = NormalizedCall("q1", "ctg", 1900, 1900, "INS", 100, "caller_b", coord_space="reference", ref_contig="chr1")
+
+    consensus = rrfb.build_consensus_truth([[a1, a2], [b]], min_support=2)
+
+    assert len(consensus) == 1
+    assert consensus[0].pos == 1400
+
+
+def test_calls_compatible_keeps_strict_len_check_for_same_scale_del():
+    # Two co-located DEL calls of similar magnitude — pred 100 bp, truth 80 bp.
+    # Span-contain does NOT apply (pred is not >= 2x truth), so the strict
+    # length check still gates the match. tol_frac=0.10 → |Δ|/80=0.25, fail.
+    truth = NormalizedCall("q1", "ctg", 50_000, 50_080, "DEL", 80, "truth",
+                            coord_space="reference", ref_contig="chr1")
+    pred  = NormalizedCall("q1", "ctg", 50_000, 50_100, "DEL", 100, "mycosv",
+                            coord_space="reference", ref_contig="chr1")
+    assert not rrfb.calls_compatible(truth, pred)
+
+
 def test_tra_matching_requires_mate_breakpoint_when_present():
     truth = NormalizedCall(
         "q1", ".", 1000, 1000, "TRA", 1, "truth",
@@ -497,6 +620,56 @@ def test_validate_tra_uses_mate_breakpoint_support(tmp_path: Path, monkeypatch):
     assert ("chr2", 5000, 5000) in seen
     assert rows[0]["validation_support"] == 3
     assert rows[0]["read_validated"] == "yes"
+
+
+def test_validate_uses_per_svtype_flank_window(tmp_path: Path, monkeypatch):
+    """The validation window must scale with the per-svtype matcher tolerance.
+
+    DEFAULT_TOL_BP gives DEL/DUP 2500 bp and INV/TRA 10000 bp; the scan window
+    must be at least 1/5 of that so split-read evidence within the matcher's
+    tolerance isn't missed. A flat 250 bp window was the cause of the truth
+    set shrinking faster than the prediction set and dragging F1 below 80%.
+    """
+    ref = tmp_path / "ref.fa"
+    ref.write_text(">chr1\nACGT\n", encoding="utf-8")
+    query_row = {
+        "query_asm": "q1",
+        "query_mode": "long-reads",
+        "path": str(ref),
+        "benchmark_ref_fasta": str(ref),
+    }
+    calls = [
+        NormalizedCall("q1", ".", 1000, 1050, "DEL", -50, "truth",
+                       coord_space="reference", ref_contig="chr1"),
+        NormalizedCall("q1", ".", 2000, 2500, "DUP", 500, "truth",
+                       coord_space="reference", ref_contig="chr1"),
+        NormalizedCall("q1", ".", 3000, 4000, "INV", 1000, "truth",
+                       coord_space="reference", ref_contig="chr1"),
+        NormalizedCall("q1", ".", 5000, 5000, "INS", 100, "truth",
+                       coord_space="reference", ref_contig="chr1"),
+    ]
+    captured: list[tuple[str, int]] = []
+
+    def fake_support(_bam, _contig, _pos, _end, *, flank_bp, **_kw):
+        # Look up the svtype from kwargs (the caller passes it).
+        captured.append((_kw.get("svtype"), flank_bp))
+        return 1
+
+    monkeypatch.setattr(rrfb, "_build_validation_bam",
+                        lambda *a, **k: (tmp_path / "x.bam", ref))
+    monkeypatch.setattr(rrfb, "_samtools_count_breakpoint_support", fake_support)
+
+    rrfb.validate_calls_with_reads(
+        calls, query_row, tmp_path / "validation",
+        threads=1, min_support=1, flank_bp=250,
+    )
+
+    by_type = dict(captured)
+    assert by_type["DEL"] == 500, by_type   # 2500 // 5
+    assert by_type["DUP"] == 500, by_type
+    assert by_type["INV"] == 2000, by_type  # 10000 // 5
+    # INS: 500 // 5 = 100 < user floor 250 → keep 250
+    assert by_type["INS"] == 250, by_type
 
 
 def test_cigar_indels_support_reference_breakpoints():
@@ -680,6 +853,23 @@ def test_estimate_prepared_genome_size_hint_reads_gz_benchmark_reference(tmp_pat
     assert estimate_prepared_genome_size_hint(prepared) == 11
 
 
+def _write_minimal_mycosv_outputs(cmd: list[str]) -> None:
+    out_prefix = Path(cmd[cmd.index("--out-prefix") + 1])
+    out_prefix.parent.mkdir(parents=True, exist_ok=True)
+    out_prefix.with_suffix(".vcf").write_text(
+        "##fileformat=VCFv4.3\n"
+        "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tSAMPLE\n",
+        encoding="utf-8",
+    )
+    out_prefix.with_suffix(".hits.tsv").write_text(
+        "query_asm\tquery_contig\ttype\tref_asm\tref_contig\tref_pos\tref_end"
+        "\tpos\tend\tsvlen\tblock_score\tanchors\tgenotype\tgq\tannotation"
+        "\talignment_mode\tquery_mode\tfused_posterior_alt\tfused_logodds_alt"
+        "\tfused_effective_depth\tfused_layers\tread_support\n",
+        encoding="utf-8",
+    )
+
+
 def test_run_mycosv_injects_read_mode_perf_defaults(tmp_path: Path, monkeypatch):
     prepared = tmp_path / "prepared"
     prepared.mkdir()
@@ -696,6 +886,7 @@ def test_run_mycosv_injects_read_mode_perf_defaults(tmp_path: Path, monkeypatch)
 
     def fake_run(cmd, cwd=None):
         captured["cmd"] = list(cmd)
+        _write_minimal_mycosv_outputs(cmd)
         class Dummy:
             stdout = ""
             stderr = ""
@@ -704,10 +895,66 @@ def test_run_mycosv_injects_read_mode_perf_defaults(tmp_path: Path, monkeypatch)
     monkeypatch.setattr(rrfb, "run_mycosv_command", fake_run)
     run_mycosv(prepared, tmp_path / "bench", tmp_path / "fake.exe", "short-reads", [])
     cmd = captured["cmd"]
-    assert "--max-reads" in cmd
-    assert "150000" in cmd
+    assert "--max-reads" not in cmd
     assert "--genome-size-hint" in cmd
     assert "400" in cmd
+
+
+def test_cap_read_query_inputs_uses_capped_fastq_for_mycosv_by_default(tmp_path: Path):
+    reads = tmp_path / "huge.fastq"
+    reads.write_text(
+        "@r1\nACGT\n+\n!!!!\n"
+        "@r2\nTGCA\n+\n!!!!\n"
+        "@r3\nAAAA\n+\n!!!!\n",
+        encoding="utf-8",
+    )
+    rows = [{
+        "query_asm": "sample_1",
+        "query_mode": "short-reads",
+        "path": str(reads),
+    }]
+
+    capped = rrfb.cap_read_query_inputs(rows, tmp_path / "bench", "short-reads", 2, 2)
+
+    assert capped[0]["path"] != str(reads)
+    assert "mycosv_path" not in capped[0]
+    assert Path(capped[0]["path"]).read_text(encoding="utf-8").count("@") == 2
+
+
+def test_cap_read_query_inputs_can_opt_into_full_mycosv_reads(tmp_path: Path):
+    reads = tmp_path / "huge.fastq"
+    reads.write_text("@r1\nACGT\n+\n!!!!\n@r2\nTGCA\n+\n!!!!\n", encoding="utf-8")
+    rows = [{"query_asm": "sample_1", "query_mode": "short-reads", "path": str(reads)}]
+
+    capped = rrfb.cap_read_query_inputs(
+        rows, tmp_path / "bench", "short-reads", 1, 1,
+        mycosv_use_full_reads=True,
+    )
+
+    assert capped[0]["path"] != str(reads)
+    assert capped[0]["mycosv_path"] == str(reads)
+
+
+def test_cap_read_query_inputs_caps_read_rows_in_auto_mode(tmp_path: Path):
+    reads = tmp_path / "huge.fastq"
+    reads.write_text(
+        "@r1\nACGT\n+\n!!!!\n"
+        "@r2\nTGCA\n+\n!!!!\n"
+        "@r3\nAAAA\n+\n!!!!\n",
+        encoding="utf-8",
+    )
+    asm = tmp_path / "asm.fa"
+    asm.write_text(">ctg\nACGT\n", encoding="utf-8")
+    rows = [
+        {"query_asm": "sample_reads", "query_mode": "short-reads", "path": str(reads)},
+        {"query_asm": "sample_asm", "query_mode": "assembly", "path": str(asm)},
+    ]
+
+    capped = rrfb.cap_read_query_inputs(rows, tmp_path / "bench", "auto", 2, 2)
+
+    assert capped[0]["path"] != str(reads)
+    assert Path(capped[0]["path"]).read_text(encoding="utf-8").count("@") == 2
+    assert capped[1]["path"] == str(asm)
 
 
 def test_run_mycosv_reuses_prebuilt_index(tmp_path: Path, monkeypatch):
@@ -740,8 +987,10 @@ def test_run_mycosv_reuses_prebuilt_index(tmp_path: Path, monkeypatch):
 
     invocations: list[list[str]] = []
 
-    def fake_run(cmd, cwd=None):
+    def fake_run(cmd, cwd=None, **kwargs):
         invocations.append(list(cmd))
+        if "--out-prefix" in cmd:
+            _write_minimal_mycosv_outputs(cmd)
         class Dummy:
             stdout = ""
             stderr = ""
@@ -787,8 +1036,10 @@ def test_run_mycosv_ref_override_reenables_flat_fallback_for_fresh_index(tmp_pat
 
     invocations: list[list[str]] = []
 
-    def fake_run(cmd, cwd=None):
+    def fake_run(cmd, cwd=None, **kwargs):
         invocations.append(list(cmd))
+        if "--out-prefix" in cmd:
+            _write_minimal_mycosv_outputs(cmd)
         class Dummy:
             stdout = ""
             stderr = ""
@@ -810,6 +1061,440 @@ def test_run_mycosv_ref_override_reenables_flat_fallback_for_fresh_index(tmp_pat
     assert str(bench_ref_list.resolve()) in call_cmd
     assert "--no-flat-ref-fallback" not in call_cmd
     assert "--no-gfa" in call_cmd
+
+
+def test_run_mycosv_benchmark_sized_ref_override_keeps_flat_fallback_disabled_by_default(tmp_path: Path, monkeypatch):
+    prepared = tmp_path / "prepared"
+    prepared.mkdir()
+    full_ref = prepared / "full_ref.fa"
+    full_ref.write_text(">chr1\nACGTACGTACGT\n", encoding="utf-8")
+    query = prepared / "query.fa"
+    query.write_text(">chr1\nACGTACGTACGT\n", encoding="utf-8")
+    (prepared / "ref_list.txt").write_text(str(full_ref) + "\n", encoding="utf-8")
+    (prepared / "query_list.txt").write_text(str(query) + "\n", encoding="utf-8")
+    (prepared / "query_manifest.tsv").write_text(
+        "query_asm\tbenchmark_ref_fasta\nq1\t" + str(full_ref) + "\n",
+        encoding="utf-8",
+    )
+    (prepared / "hierarchy_manifest.tsv").write_text(
+        "asm_name\tphylum\tclass\torder\tfamily\tgenus\tclade_name\tclade_rank\tfasta_path\n"
+        f"ref1\t.\t.\t.\t.\t.\t.\tspecies\t{full_ref}\n",
+        encoding="utf-8",
+    )
+    bench_ref_list = tmp_path / "bench_ref_list.txt"
+    bench_refs = []
+    for i in range(256):
+        ref = tmp_path / f"bench_ref_{i}.fa"
+        ref.write_text(">chr1\nACGTACGTACGT\n", encoding="utf-8")
+        bench_refs.append(str(ref))
+    bench_ref_list.write_text("\n".join(bench_refs) + "\n", encoding="utf-8")
+
+    invocations: list[list[str]] = []
+
+    def fake_run(cmd, cwd=None, **kwargs):
+        invocations.append(list(cmd))
+        if "--out-prefix" in cmd:
+            _write_minimal_mycosv_outputs(cmd)
+        class Dummy:
+            stdout = ""
+            stderr = ""
+        return Dummy()
+
+    monkeypatch.setattr(rrfb, "run_mycosv_command", fake_run)
+    run_mycosv(
+        prepared,
+        tmp_path / "bench",
+        tmp_path / "fake.exe",
+        "assembly",
+        ["--no-flat-ref-fallback", "--no-gfa"],
+        ref_list_override=bench_ref_list,
+    )
+
+    call_cmd = invocations[-1]
+    assert str(bench_ref_list.resolve()) in call_cmd
+    assert "--no-flat-ref-fallback" in call_cmd
+    assert "--threads" in call_cmd
+    assert "--no-gfa" in call_cmd
+
+
+def test_run_mycosv_benchmark_sized_ref_override_can_force_flat_fallback(tmp_path: Path, monkeypatch):
+    prepared = tmp_path / "prepared"
+    prepared.mkdir()
+    full_ref = prepared / "full_ref.fa"
+    full_ref.write_text(">chr1\nACGTACGTACGT\n", encoding="utf-8")
+    query = prepared / "query.fa"
+    query.write_text(">chr1\nACGTACGTACGT\n", encoding="utf-8")
+    (prepared / "ref_list.txt").write_text(str(full_ref) + "\n", encoding="utf-8")
+    (prepared / "query_list.txt").write_text(str(query) + "\n", encoding="utf-8")
+    (prepared / "query_manifest.tsv").write_text(
+        "query_asm\tbenchmark_ref_fasta\nq1\t" + str(full_ref) + "\n",
+        encoding="utf-8",
+    )
+    (prepared / "hierarchy_manifest.tsv").write_text(
+        "asm_name\tphylum\tclass\torder\tfamily\tgenus\tclade_name\tclade_rank\tfasta_path\n"
+        f"ref1\t.\t.\t.\t.\t.\t.\tspecies\t{full_ref}\n",
+        encoding="utf-8",
+    )
+    bench_ref_list = tmp_path / "bench_ref_list.txt"
+    bench_refs = []
+    for i in range(256):
+        ref = tmp_path / f"bench_ref_{i}.fa"
+        ref.write_text(">chr1\nACGTACGTACGT\n", encoding="utf-8")
+        bench_refs.append(str(ref))
+    bench_ref_list.write_text("\n".join(bench_refs) + "\n", encoding="utf-8")
+
+    invocations: list[list[str]] = []
+
+    def fake_run(cmd, cwd=None, **kwargs):
+        invocations.append(list(cmd))
+        if "--out-prefix" in cmd:
+            _write_minimal_mycosv_outputs(cmd)
+        class Dummy:
+            stdout = ""
+            stderr = ""
+        return Dummy()
+
+    monkeypatch.setenv("MYCOSV_FORCE_FLAT_REF_FALLBACK", "1")
+    monkeypatch.setattr(rrfb, "run_mycosv_command", fake_run)
+    run_mycosv(
+        prepared,
+        tmp_path / "bench",
+        tmp_path / "fake.exe",
+        "assembly",
+        ["--no-flat-ref-fallback", "--no-gfa"],
+        ref_list_override=bench_ref_list,
+    )
+
+    call_cmd = invocations[-1]
+    assert str(bench_ref_list.resolve()) in call_cmd
+    assert "--no-flat-ref-fallback" not in call_cmd
+    assert "--threads" in call_cmd
+    assert "--no-gfa" in call_cmd
+
+
+def test_run_mycosv_oversized_ref_override_keeps_flat_fallback_disabled(tmp_path: Path, monkeypatch):
+    prepared = tmp_path / "prepared"
+    prepared.mkdir()
+    full_ref = prepared / "full_ref.fa"
+    full_ref.write_text(">chr1\nACGTACGTACGT\n", encoding="utf-8")
+    query = prepared / "query.fa"
+    query.write_text(">chr1\nACGTACGTACGT\n", encoding="utf-8")
+    (prepared / "ref_list.txt").write_text(str(full_ref) + "\n", encoding="utf-8")
+    (prepared / "query_list.txt").write_text(str(query) + "\n", encoding="utf-8")
+    (prepared / "query_manifest.tsv").write_text(
+        "query_asm\tbenchmark_ref_fasta\nq1\t" + str(full_ref) + "\n",
+        encoding="utf-8",
+    )
+    (prepared / "hierarchy_manifest.tsv").write_text(
+        "asm_name\tphylum\tclass\torder\tfamily\tgenus\tclade_name\tclade_rank\tfasta_path\n"
+        f"ref1\t.\t.\t.\t.\t.\t.\tspecies\t{full_ref}\n",
+        encoding="utf-8",
+    )
+    bench_ref_list = tmp_path / "bench_ref_list.txt"
+    bench_refs = []
+    for i in range(513):
+        ref = tmp_path / f"bench_ref_{i}.fa"
+        ref.write_text(">chr1\nACGTACGTACGT\n", encoding="utf-8")
+        bench_refs.append(str(ref))
+    bench_ref_list.write_text("\n".join(bench_refs) + "\n", encoding="utf-8")
+
+    invocations: list[list[str]] = []
+
+    def fake_run(cmd, cwd=None, **kwargs):
+        invocations.append(list(cmd))
+        if "--out-prefix" in cmd:
+            _write_minimal_mycosv_outputs(cmd)
+        class Dummy:
+            stdout = ""
+            stderr = ""
+        return Dummy()
+
+    monkeypatch.setattr(rrfb, "run_mycosv_command", fake_run)
+    run_mycosv(
+        prepared,
+        tmp_path / "bench",
+        tmp_path / "fake.exe",
+        "assembly",
+        ["--no-flat-ref-fallback", "--no-gfa"],
+        ref_list_override=bench_ref_list,
+    )
+
+    call_cmd = invocations[-1]
+    assert str(bench_ref_list.resolve()) in call_cmd
+    assert "--no-flat-ref-fallback" in call_cmd
+    assert "--threads" in call_cmd
+    assert "--no-gfa" in call_cmd
+
+
+def test_run_mycosv_rejects_empty_vcf_output(tmp_path: Path, monkeypatch):
+    prepared = tmp_path / "prepared"
+    prepared.mkdir()
+    ref = prepared / "ref.fa"
+    ref.write_text(">chr1\nACGTACGT\n", encoding="utf-8")
+    (prepared / "ref_list.txt").write_text(str(ref) + "\n", encoding="utf-8")
+    (prepared / "query_list.txt").write_text(str(ref) + "\n", encoding="utf-8")
+
+    def fake_run(cmd, cwd=None, **kwargs):
+        out_prefix = Path(cmd[cmd.index("--out-prefix") + 1])
+        out_prefix.parent.mkdir(parents=True, exist_ok=True)
+        out_prefix.with_suffix(".vcf").write_text("", encoding="utf-8")
+        out_prefix.with_suffix(".hits.tsv").write_text("", encoding="utf-8")
+        class Dummy:
+            stdout = ""
+            stderr = ""
+        return Dummy()
+
+    monkeypatch.setattr(rrfb, "run_mycosv_command", fake_run)
+    import pytest
+    with pytest.raises(rrfb.subprocess.CalledProcessError):
+        run_mycosv(prepared, tmp_path / "bench", tmp_path / "fake.exe", "assembly", [])
+
+
+def test_run_mycosv_rejects_header_only_vcf_after_query_failures(tmp_path: Path, monkeypatch):
+    prepared = tmp_path / "prepared"
+    prepared.mkdir()
+    ref = prepared / "ref.fa"
+    ref.write_text(">chr1\nACGTACGT\n", encoding="utf-8")
+    (prepared / "ref_list.txt").write_text(str(ref) + "\n", encoding="utf-8")
+    (prepared / "query_list.txt").write_text(str(ref) + "\n", encoding="utf-8")
+
+    def fake_run(cmd, cwd=None):
+        out_prefix = Path(cmd[cmd.index("--out-prefix") + 1])
+        out_prefix.parent.mkdir(parents=True, exist_ok=True)
+        out_prefix.with_suffix(".vcf").write_text(
+            "##fileformat=VCFv4.3\n"
+            "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tSAMPLE\n",
+            encoding="utf-8",
+        )
+        out_prefix.with_suffix(".hits.tsv").write_text(
+            "query_asm\tquery_contig\ttype\tref_asm\tref_contig\tref_pos\tref_end"
+            "\tpos\tend\tsvlen\tblock_score\tanchors\tgenotype\tgq\tannotation"
+            "\talignment_mode\tquery_mode\tfused_posterior_alt\tfused_logodds_alt"
+            "\tfused_effective_depth\tfused_layers\tread_support\n",
+            encoding="utf-8",
+        )
+
+        class Dummy:
+            stdout = ""
+            stderr = "[warn] skipping q.fa: std::bad_alloc while processing query\n"
+
+        return Dummy()
+
+    monkeypatch.setattr(rrfb, "run_mycosv_command", fake_run)
+    import pytest
+    with pytest.raises(rrfb.subprocess.CalledProcessError) as excinfo:
+        run_mycosv(prepared, tmp_path / "bench", tmp_path / "fake.exe", "assembly", [])
+    assert excinfo.value.returncode == 91
+
+
+def test_preflight_benchmark_inputs_rejects_corrupt_gzip_before_benchmark(tmp_path: Path):
+    query = tmp_path / "query.fna.gz"
+    query.write_bytes(b"\x1f\x8bcorrupt")
+    ref = tmp_path / "ref.fa"
+    ref.write_text(">chr1\nACGT\n", encoding="utf-8")
+    rows = [{
+        "query_asm": "q1",
+        "query_mode": "assembly",
+        "path": str(query),
+        "benchmark_ref_fasta": str(ref),
+    }]
+
+    import pytest
+    with pytest.raises(ValueError):
+        rrfb.preflight_benchmark_inputs(rows, tmp_path / "bench", "assembly")
+
+    report = tmp_path / "bench" / "INPUT_PREFLIGHT.tsv"
+    assert report.exists()
+    text = report.read_text(encoding="utf-8")
+    assert "fail" in text
+    assert "read_failed" in text
+
+
+def test_preflight_benchmark_inputs_accepts_fastq_reads(tmp_path: Path):
+    reads = tmp_path / "reads.fastq"
+    reads.write_text("@r1\nACGT\n+\n!!!!\n", encoding="utf-8")
+    ref = tmp_path / "ref.fa"
+    ref.write_text(">chr1\nACGT\n", encoding="utf-8")
+    rows = [{
+        "query_asm": "q1",
+        "query_mode": "short-reads",
+        "path": str(reads),
+        "benchmark_ref_fasta": str(ref),
+    }]
+
+    report_rows = rrfb.preflight_benchmark_inputs(rows, tmp_path / "bench", "short-reads")
+
+    assert {row["status"] for row in report_rows} == {"ok"}
+    assert (tmp_path / "bench" / "INPUT_PREFLIGHT.tsv").exists()
+
+
+def test_preflight_benchmark_inputs_accepts_fasta_reads_modes(tmp_path: Path):
+    reads = tmp_path / "reads.fa"
+    reads.write_text(">r1\nACGTACGT\n>r2\nACGTTCGT\n", encoding="utf-8")
+    ref = tmp_path / "ref.fa"
+    ref.write_text(">chr1\nACGTACGT\n", encoding="utf-8")
+    rows = [{
+        "query_asm": "q1",
+        "query_mode": "long-reads",
+        "path": str(reads),
+        "benchmark_ref_fasta": str(ref),
+    }]
+
+    for mode in ("long-reads", "short-reads"):
+        report_rows = rrfb.preflight_benchmark_inputs(rows, tmp_path / f"bench_{mode}", mode)
+        assert {row["status"] for row in report_rows} == {"ok"}
+
+
+def test_preflight_benchmark_inputs_auto_accepts_fastq(tmp_path: Path):
+    reads = tmp_path / "reads.fastq"
+    reads.write_text("@r1\nACGTACGT\n+\n!!!!!!!!\n", encoding="utf-8")
+    ref = tmp_path / "ref.fa"
+    ref.write_text(">chr1\nACGTACGT\n", encoding="utf-8")
+    rows = [{
+        "query_asm": "q1",
+        "query_mode": "short-reads",
+        "path": str(reads),
+        "benchmark_ref_fasta": str(ref),
+    }]
+
+    report_rows = rrfb.preflight_benchmark_inputs(rows, tmp_path / "bench_auto", "auto")
+    assert {row["status"] for row in report_rows} == {"ok"}
+
+
+def test_write_pangenome_call_layers_separates_raw_dedup_and_single_ref(tmp_path: Path):
+    calls = [
+        NormalizedCall("q1", "ctg", 100, 200, "DEL", 100, "mycosv", read_support=3),
+        NormalizedCall("q1", "ctg", 105, 205, "DEL", 100, "mycosv", read_support=3),
+        NormalizedCall("q1", "ctg", 110, 210, "DEL", 100, "mycosv", read_support=3),
+        NormalizedCall("q1", "ctg", 5000, 5100, "INS", 100, "mycosv"),
+        NormalizedCall("q1", "ctg", 5005, 5105, "INS", 100, "mycosv"),
+    ]
+    rows = rrfb.write_pangenome_call_layers(
+        tmp_path / "layers.tsv",
+        [{"query_asm": "q1", "query_mode": "assembly"}],
+        {"q1": {"query": calls}},
+        {"q1": 2},
+        {"q1": {rrfb.call_key(calls[0]), rrfb.call_key(calls[1])}},
+        {rrfb.call_key(calls[0]): ["minigraph"]},
+        {"q1": {rrfb.call_key(calls[3]), rrfb.call_key(calls[4])}},
+    )
+
+    row = rows[0]
+    assert row["raw_pairwise_pangenome_observations"] == 5
+    assert row["deduplicated_pangenome_loci"] == 2
+    assert row["single_reference_equivalent_calls"] == 2
+    assert row["pangenome_only_calls"] == 1
+    assert row["pangenome_only_read_supported"] == 1
+
+
+def test_write_sv_volume_audit_flags_off_ref_only_against_truth(tmp_path: Path):
+    query = tmp_path / "query.fa"
+    ref = tmp_path / "ref.fa"
+    query.write_text(">ctg\n" + ("ACGT" * 100) + "\n", encoding="utf-8")
+    ref.write_text(">chr1\n" + ("ACGT" * 100) + "\n", encoding="utf-8")
+    vcf = tmp_path / "calls.vcf"
+    vcf.write_text(
+        "##fileformat=VCFv4.3\n"
+        "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tSAMPLE\n"
+        "ctg\t1\tsv1\tN\t<OFF_REF>\t20\tPASS\t"
+        "SVTYPE=OFF_REF;SVLEN=400;END=400;QASM=q1;QMODE=assembly\tGT:GQ\t0/1:20\n",
+        encoding="utf-8",
+    )
+    off_ref_call = NormalizedCall("q1", "ctg", 1, 400, "OFF_REF", 400, "mycosv")
+    truth_call = NormalizedCall(
+        "q1", "chr1", 100, 200, "DEL", 100, "minigraph",
+        coord_space="reference", ref_contig="chr1",
+    )
+
+    rows = rrfb.write_sv_volume_audit(
+        tmp_path / "audit.tsv",
+        [{
+            "query_asm": "q1",
+            "query_mode": "assembly",
+            "path": str(query),
+            "benchmark_ref_fasta": str(ref),
+            "scenario": "unit",
+            "species": "Test species",
+        }],
+        {"q1": {"query": [off_ref_call]}},
+        {"q1": {("reference", "minigraph"): [truth_call]}},
+        vcf,
+        mode="assembly",
+        mycosv_failed=False,
+    )
+
+    assert rows[0]["status"] == "fail"
+    assert rows[0]["diagnosis"] == "off_ref_only_against_anchored_truth"
+
+
+def test_pangenome_locus_key_keeps_distinct_translocation_mates():
+    left = NormalizedCall(
+        "q1", "ctgA", 1000, 1000, "TRA", 0, "mycosv",
+        mate_contig="ctgB", mate_pos=5000, mate_end=5000,
+    )
+    right = NormalizedCall(
+        "q1", "ctgA", 1000, 1000, "TRA", 0, "mycosv",
+        mate_contig="ctgC", mate_pos=5000, mate_end=5000,
+    )
+
+    assert rrfb.pangenome_locus_key(left) != rrfb.pangenome_locus_key(right)
+
+
+def test_write_mycosv_novel_biology_enrichment_reports_te_and_gene_signal(tmp_path: Path):
+    calls = [
+        NormalizedCall("q1", "ctg", 100, 200, "INS", 100, "mycosv", element_class="TE_LTR"),
+        NormalizedCall("q1", "ctg", 1000, 1100, "DEL", 100, "mycosv", element_class="NONE"),
+        NormalizedCall("q1", "ctg", 5000, 5100, "DEL", 100, "mycosv", element_class="NONE"),
+    ]
+    gene_tsv = tmp_path / "genes.tsv"
+    gene_tsv.write_text(
+        "query_asm\tquery_contig\tgene_id\tgene_name\tstart\tend\tstrand\tbiotype\tproduct\n"
+        "q1\tctg\tg1\tg1\t150\t250\t+\tgene\t.\n",
+        encoding="utf-8",
+    )
+
+    rows = rrfb.write_mycosv_novel_biology_enrichment(
+        tmp_path / "enrich.tsv",
+        calls,
+        {rrfb.call_key(calls[2]): ["minigraph"]},
+        {},
+        {},
+        {"q1": {rrfb.call_key(calls[0])}},
+        gene_tsv,
+        gene_window_bp=100,
+    )
+
+    by_feature = {row["feature"]: row for row in rows}
+    assert by_feature["te_or_mge_like"]["a_feature"] == 1
+    assert by_feature["te_or_mge_like"]["b_feature"] == 0
+    assert by_feature["gene_proximal_100bp"]["a_feature"] == 1
+    assert by_feature["gene_proximal_100bp"]["unique_read_supported_feature"] == 1
+
+
+def test_mycosv_novel_biology_enrichment_uses_generic_gene_annotations(tmp_path: Path):
+    calls = [
+        NormalizedCall("q1", "ctg", 100, 200, "INS", 100, "mycosv"),
+    ]
+    gene_tsv = tmp_path / "genes.tsv"
+    gene_tsv.write_text(
+        "query_asm\tquery_contig\tgene_id\tgene_name\tstart\tend\tstrand\tbiotype\tproduct\n"
+        ".\tctg\tg1\tg1\t150\t250\t+\tgene\t.\n",
+        encoding="utf-8",
+    )
+
+    rows = rrfb.write_mycosv_novel_biology_enrichment(
+        tmp_path / "enrich.tsv",
+        calls,
+        {},
+        {},
+        {},
+        {},
+        gene_tsv,
+        gene_window_bp=100,
+    )
+
+    by_feature = {row["feature"]: row for row in rows}
+    assert by_feature["gene_proximal_100bp"]["a_feature"] == 1
 
 
 def test_run_mycosv_rejects_invalid_reuse_index(tmp_path: Path, monkeypatch):
@@ -947,6 +1632,89 @@ def test_prepare_million_real_holds_out_queries_and_strips_them_from_index(
     for q_path in ql_lines:
         if q_path.strip():
             assert Path(q_path).name not in rl_paths, (q_path, rl_paths)
+
+
+def test_prepare_million_real_honors_multiple_read_runs_per_query(tmp_path: Path, monkeypatch):
+    import argparse
+    fake_summary = "#assembly_accession\ttaxid\torganism_name\tassembly_level\tversion_status\tftp_path\n"
+    rows = [
+        f"GCA_{i:09d}.1\t100{i}\tFakespecies sp{i}\tComplete Genome\tlatest\t"
+        f"https://ftp.ncbi.nlm.nih.gov/genomes/all/GCA/000/{i:03d}/GCA_{i:09d}.1\n"
+        for i in range(4)
+    ]
+    monkeypatch.setattr(rrfb, "http_get_text", lambda url: fake_summary + "".join(rows))
+    monkeypatch.setattr(
+        rrfb,
+        "fetch_taxonomy_lineages",
+        lambda taxids, cache_path=None: {
+            t: {
+                "phylum": "Ascomycota", "class": ".", "order": ".",
+                "family": ".", "genus": f"Genus{i}", "species": f"Fakespecies sp{i}",
+            }
+            for i, t in enumerate(taxids)
+        },
+    )
+
+    def fake_materialize(url, dest, keep_gz=True):
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(b">chr\nACGT\n")
+        return dest
+
+    def fake_merge(urls, dest_prefix):
+        path = Path(str(dest_prefix) + ".fastq")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("@r\nACGT\n+\n!!!!\n", encoding="utf-8")
+        return path
+
+    monkeypatch.setattr(rrfb, "materialize_entry", fake_materialize)
+    monkeypatch.setattr(rrfb, "compile_binary_if_needed", lambda *a, **k: None)
+    monkeypatch.setattr(rrfb, "run_mycosv_command", lambda cmd, cwd=None: None)
+    monkeypatch.setattr(rrfb, "augment_routing_store", lambda *a, **k: {})
+    monkeypatch.setattr(rrfb, "merge_sequence_sources", fake_merge)
+    monkeypatch.setattr(
+        rrfb,
+        "fetch_ena_read_runs_by_species",
+        lambda species, max_rows=200: [
+            {
+                "run_accession": f"SRR{i}",
+                "scientific_name": species,
+                "instrument_platform": "OXFORD_NANOPORE",
+                "library_layout": "SINGLE",
+                "fastq_ftp": f"ftp.sra.ebi.ac.uk/vol1/fastq/SRR{i}.fastq.gz",
+                "read_count": "100000",
+                "submitted_ftp": "",
+            }
+            for i in range(3)
+        ],
+    )
+
+    out_dir = tmp_path / "million_real"
+    args = argparse.Namespace(
+        out_dir=out_dir,
+        source="ncbi-genbank",
+        max_assemblies=4,
+        min_assembly_level="contig",
+        latest_only=False,
+        target_centroids=0,
+        seed=42,
+        threads=1,
+        max_clade_genomes=2,
+        binary_path=tmp_path / "fake_bin",
+        force_rebuild=False,
+        data_cache_dir=tmp_path / "cache",
+        million_real_queries=1,
+        million_real_include_reads=True,
+        million_real_read_modes="long-reads",
+        million_real_read_runs_per_query=2,
+    )
+
+    assert rrfb.prepare_million_real(args) == 0
+    with (out_dir / "query_manifest.tsv").open(encoding="utf-8") as fh:
+        manifest = list(csv.DictReader(fh, delimiter="\t"))
+
+    read_rows = [row for row in manifest if row["query_mode"] == "long-reads"]
+    assert len(read_rows) == 2
+    assert {row["run_accession"] for row in read_rows} == {"SRR0", "SRR1"}
 
 
 def test_benchmark_real_data_mycosv_only_skips_comparators(tmp_path: Path, monkeypatch):
@@ -1087,7 +1855,8 @@ def test_benchmark_mycosv_only_validates_mycosv_reference_calls(tmp_path: Path, 
     )
     monkeypatch.setattr(rrfb, "maybe_run_candidate_analysis", lambda *a, **k: (None, None))
 
-    def fake_validate(calls, query_row, work_dir, *, threads, min_support, flank_bp):
+    def fake_validate(calls, query_row, work_dir, *, threads, min_support,
+                      flank_bp, force_external=False):
         assert len(calls) == 1
         return list(calls), [{
             "query_asm": query_row["query_asm"],
@@ -1132,7 +1901,9 @@ def test_benchmark_mycosv_only_validates_mycosv_reference_calls(tmp_path: Path, 
     assert readval.exists()
     assert "mycosv" in readval.read_text(encoding="utf-8")
     assert (vcf.with_suffix(".multisample.vcf")).exists()
-    assert (vcf.with_name("alls.multisample.vcf")).exists()
+    # Older versions also wrote a typo-named duplicate "alls.multisample.vcf";
+    # that copy has been removed — the canonical artefact is calls.multisample.vcf.
+    assert not (vcf.with_name("alls.multisample.vcf")).exists()
     assert (args.out_dir / "biology_findings.tsv").exists()
     summary = json.loads((args.out_dir / "benchmark_summary.json").read_text(encoding="utf-8"))
     assert summary["queries"]["q1"]["read_validation"]["mycosv_reference"]["read_validated"] == 1

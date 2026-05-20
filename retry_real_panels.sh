@@ -61,6 +61,26 @@ DATA_CACHE_DIR="${DATA_CACHE_DIR:-${WORK_DIR}/data_cache}"
 
 cd "${WORK_DIR}"
 
+ensure_python_deps() {
+  local missing=() pkg
+  for pkg in pandas numpy scipy matplotlib; do
+    if ! python3 - "$pkg" <<'PY' >/dev/null 2>&1; then
+import importlib.util
+import sys
+raise SystemExit(0 if importlib.util.find_spec(sys.argv[1]) else 1)
+PY
+      missing+=("$pkg")
+    fi
+  done
+  if [[ ${#missing[@]} -eq 0 ]]; then
+    return 0
+  fi
+  echo "[retry] missing Python packages: ${missing[*]}; installing with python3 -m pip" >&2
+  python3 -m pip install "${missing[@]}"
+}
+
+ensure_python_deps
+
 retry_one_panel() {
   local panel="$1"
   local panel_dir="${RUN_DIR}/${panel}"
@@ -106,7 +126,17 @@ retry_one_panel() {
     fi
   done
 
-  for mode in assembly short-reads long-reads; do
+  IFS=',' read -r -a retry_modes <<< "${RETRY_BENCHMARK_MODES:-assembly,long-reads}"
+  for mode in "${retry_modes[@]}"; do
+    mode="${mode//[[:space:]]/}"
+    case "${mode}" in
+      assembly|short-reads|long-reads) ;;
+      "" ) continue ;;
+      * )
+        echo "[retry][skip] invalid RETRY_BENCHMARK_MODES entry: ${mode}" >&2
+        continue
+        ;;
+    esac
     local out="${panel_dir}/benchmark_${mode}_retry"
     local read_validation_min_support
     if [[ "${mode}" == "assembly" ]]; then

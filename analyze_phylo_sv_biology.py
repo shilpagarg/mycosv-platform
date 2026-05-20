@@ -250,10 +250,11 @@ def analyze_hgt_propagation(
     asm_meta: dict[str, dict[str, str]],
     taxonomy: dict[str, dict[str, str]],
 ) -> list[dict[str, Any]]:
-    """TRA and OFF_REF events as proxies for HGT between clades.
+    """TRA and OFF_REF events as candidate proxies for HGT between clades.
 
     A TRA call where chr (source contig) and chr2 (mate contig) are in different
-    species/orders is treated as evidence for inter-clade HGT propagation.
+    species/orders is treated as screening evidence for possible inter-clade HGT
+    propagation, not as proof without phylogenetic/contamination follow-up.
     """
     species_to_lineage: dict[str, dict[str, str]] = {}
     for lineage in taxonomy.values():

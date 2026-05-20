@@ -45,15 +45,21 @@ if [[ -z "${MILLION_REAL_MAX_ASSEMBLIES:-}" ]]; then
   fi
 fi
 MILLION_REAL_TARGET_CENTROIDS="${MILLION_REAL_TARGET_CENTROIDS:-1000000}"
-# How many of the downloaded assemblies to hold out as MycoSV-only benchmark
-# queries (excluded from the index, then run end-to-end through indexing,
-# alignment, SV calling, TE classification, biology candidates, and
-# visualization in step 2b). 5 keeps wall time bounded on large indexes;
-# raise on long-walltime nodes.
+# How many of the downloaded assemblies to hold out as benchmark queries
+# (excluded from the index, then run end-to-end through routing, SV calling,
+# comparator truth, read validation, TE classification, and visualization in
+# step 2b). 5 keeps wall time bounded on large indexes; raise on long-walltime
+# nodes.
 MILLION_REAL_QUERIES="${MILLION_REAL_QUERIES:-5}"
-# Per-clade RAM cap on the MycoSV binary's hierarchical graph build; the
-# default fits a 12 GiB cgroup but can be raised on bigger nodes.
-MILLION_REAL_MAX_CLADE_GENOMES="${MILLION_REAL_MAX_CLADE_GENOMES:-8}"
+# Per-clade RAM cap on the MycoSV binary's hierarchical graph build. 8 was
+# the old conservative default sized for a 12 GiB cgroup, but it collapses
+# ~99 % of intra-clade SV diversity for densely-sampled fungal families
+# (Saccharomycetaceae alone contributes ~1100 refs in the million-real
+# corpus). 32 fits comfortably inside the 128 GiB SLURM job — the
+# per-clade graph + suffix arrays at 32 refs land at ~6 GiB total —
+# and recovers genus-level SV recall that the 8-cap silently dropped.
+# Lower to 8 on the 12 GiB cgroup or via env override on tight nodes.
+MILLION_REAL_MAX_CLADE_GENOMES="${MILLION_REAL_MAX_CLADE_GENOMES:-32}"
 
 # Per-query memory caps for the MycoSV binary in the million-real bench.
 # Without a per-thread cache cap, the SingleRefMemCache (suffix arrays for
@@ -64,7 +70,18 @@ MILLION_REAL_MAX_CLADE_GENOMES="${MILLION_REAL_MAX_CLADE_GENOMES:-8}"
 # total cache budget); shrink on tight cgroups or raise on bigger nodes.
 MILLION_REAL_SA_MAX_CONTIG_MB="${MILLION_REAL_SA_MAX_CONTIG_MB:-25}"
 MILLION_REAL_SINGLE_REF_CACHE_MB="${MILLION_REAL_SINGLE_REF_CACHE_MB:-4096}"
-MILLION_REAL_MAX_REF_MEMORY_MB="${MILLION_REAL_MAX_REF_MEMORY_MB:-1024}"
+MILLION_REAL_MAX_REF_MEMORY_MB="${MILLION_REAL_MAX_REF_MEMORY_MB:-4096}"
+MILLION_REAL_BENCH_REF_CAP="${MILLION_REAL_BENCH_REF_CAP:-256}"
+MILLION_REAL_TOL_CACHE_GB="${MILLION_REAL_TOL_CACHE_GB:-4}"
+MILLION_REAL_TOL_CACHE_ENTRIES="${MILLION_REAL_TOL_CACHE_ENTRIES:-32}"
+MILLION_REAL_MAX_CALLS_PER_CONTIG="${MILLION_REAL_MAX_CALLS_PER_CONTIG:-5000}"
+# Per-chain block-score floor for MycoSV. Default in main.cpp is 6.0, but
+# cross-species fungal pairs (~75-85% identity) routinely produce real chains
+# scoring 3-5 that get silently dropped at the floor; on the million-real
+# bench that translated to a 20-40% recall hit on diverged sister-clade refs.
+# 4.0 keeps the FP rate flat (the same-locus dedup + 4x dominance gate still
+# fire) while admitting cross-clade signal. Override per run for tighter FP.
+MILLION_REAL_MIN_BLOCK_SCORE="${MILLION_REAL_MIN_BLOCK_SCORE:-4.0}"
 MILLION_REAL_MAX_ASSEMBLY_QUERY_CONTIGS="${MILLION_REAL_MAX_ASSEMBLY_QUERY_CONTIGS:-5000}"
 MILLION_REAL_MAX_ASSEMBLY_QUERY_BP="${MILLION_REAL_MAX_ASSEMBLY_QUERY_BP:-350000000}"
 
@@ -129,7 +146,15 @@ REAL_HEAVY_MAX_ASSEMBLY_QUERY_BP_AMF="${REAL_HEAVY_MAX_ASSEMBLY_QUERY_BP_AMF:-15
 # Timeout used inside run_real_fungal_benchmark.py for individual external
 # tool calls. Keep it at least as large as the assembly benchmark cap so AMF
 # MycoSV runs are governed by the stage timeout, not an older 2h hard stop.
-export MYCOSV_TOOL_TIMEOUT="${MYCOSV_TOOL_TIMEOUT:-14400}"
+export MYCOSV_TOOL_TIMEOUT="${MYCOSV_TOOL_TIMEOUT:-39600}"
+# Per-comparator soft cap (minigraph / svim_asm / svim / sniffles / cuteSV /
+# delly / manta / pggb / cactus / anchorwave + their shared minimap2 align
+# helper). When comparators are scheduled in parallel across queries the
+# binding constraint becomes the slowest single (tool, query) run; cap at
+# 45 min so one hung pair can't burn the whole BENCHMARK_TIMEOUT_ASSEMBLY
+# / BENCHMARK_TIMEOUT_READS window. Override with MYCOSV_COMPARATOR_TIMEOUT
+# for long-walltime nodes (cactus + AMF Gigaspora pairs need 60-90 min).
+export MYCOSV_COMPARATOR_TIMEOUT="${MYCOSV_COMPARATOR_TIMEOUT:-2700}"
 
 # Stage-level wall-clock budgets. These are fail-forward guards: a stage that
 # exceeds its cap is marked failed/timeout, then the matrix moves on to the
@@ -144,21 +169,29 @@ REPORT_TIMEOUT="${REPORT_TIMEOUT:-30m}"
 # ~1 Gbp Rhizophagus genomes) consumes the SLURM time budget and starves
 # every subsequent panel in the matrix. Override via env var when running
 # on long-walltime partitions. Set to 0 to disable the cap.
-BENCHMARK_TIMEOUT_ASSEMBLY="${BENCHMARK_TIMEOUT_ASSEMBLY:-3h}"
-BENCHMARK_TIMEOUT_READS="${BENCHMARK_TIMEOUT_READS:-2h}"
+BENCHMARK_TIMEOUT_ASSEMBLY="${BENCHMARK_TIMEOUT_ASSEMBLY:-6h}"
+BENCHMARK_TIMEOUT_READS="${BENCHMARK_TIMEOUT_READS:-3h}"
 
 # Per-panel overrides. Puccinia genomes in te_rich_pathogen are ~80 Mbp and
 # ~85% TE content; even with cactus/pggb/anchorwave skipped, the surviving
-# minigraph + svim_asm + MycoSV combination consistently spills past 3h on a
-# single thread. Five hours empirically clears the matrix without reaching
-# the SLURM walltime.
-BENCHMARK_TIMEOUT_TE_RICH_PATHOGEN_ASSEMBLY="${BENCHMARK_TIMEOUT_TE_RICH_PATHOGEN_ASSEMBLY:-5h}"
+# minigraph + svim_asm + MycoSV combination consistently spills past 5h on a
+# single thread (real run 20260512 hit the 5h cap and the panel was abandoned).
+# Ten hours empirically clears the matrix.
+BENCHMARK_TIMEOUT_TE_RICH_PATHOGEN_ASSEMBLY="${BENCHMARK_TIMEOUT_TE_RICH_PATHOGEN_ASSEMBLY:-10h}"
+# AMF assembly mode aligns ~1 Gbp Rhizophagus / Gigaspora genomes; even with
+# cactus/pggb/anchorwave skipped, minigraph + svim_asm + MycoSV needs ≥8h.
+BENCHMARK_TIMEOUT_AMF_LARGE_ASSEMBLY="${BENCHMARK_TIMEOUT_AMF_LARGE_ASSEMBLY:-8h}"
 
 # Bound public-read comparator inputs. MycoSV caps read consumption internally,
 # but tools such as SVIM/Sniffles/cuteSV/Delly/Manta align the FASTQ path they
 # are given. These caps keep public ENA runs from dominating wall time.
-MAX_COMPARATOR_SHORT_READS="${MAX_COMPARATOR_SHORT_READS:-150000}"
-MAX_COMPARATOR_LONG_READS="${MAX_COMPARATOR_LONG_READS:-20000}"
+# 20 000 long reads on a ~80 Mbp Puccinia / ~700 Mbp Gigaspora genome is
+# 0.02–2× coverage — svim / sniffles / cuteSV produce 0 SV calls at that depth
+# and mycosv reading the same capped FASTQ collapses to OFF_REF-only output.
+# Bumped to 200 000 (≥25× on ~60–80 Mbp pathogens; ~3× on Gigaspora) so the
+# comparators have signal to call. Override via env for tighter wall-time budgets.
+MAX_COMPARATOR_SHORT_READS="${MAX_COMPARATOR_SHORT_READS:-500000}"
+MAX_COMPARATOR_LONG_READS="${MAX_COMPARATOR_LONG_READS:-200000}"
 
 # Comma-separated list of panel names whose assembly-mode benchmark should
 # skip cactus / pggb / anchorwave. These three are the heaviest comparators
@@ -195,6 +228,23 @@ MILLION_REAL_DIR="${WORK_DIR}/experiments/million_real/${TIMESTAMP}"
 mkdir -p "${SIM_DIR}" "${REAL_DIR}" "${MILLION_REAL_DIR}"
 
 cd "${WORK_DIR}"
+
+# Run a command through tee but return the command's exit status, not tee's.
+# On shared filesystems a transient "Stale file handle" from tee should not
+# turn a completed compute step into a failed benchmark stage.
+run_logged() {
+  local log_path="$1"
+  shift
+  mkdir -p "$(dirname "${log_path}")"
+  "$@" 2>&1 | tee "${log_path}"
+  local statuses=("${PIPESTATUS[@]}")
+  local cmd_rc=${statuses[0]:-1}
+  local tee_rc=${statuses[1]:-0}
+  if [[ "${tee_rc}" -ne 0 ]]; then
+    echo "      [warn] tee failed while writing ${log_path} (rc=${tee_rc}); command rc=${cmd_rc}" >&2
+  fi
+  return "${cmd_rc}"
+}
 
 # Color codes for output
 GREEN='\033[0;32m'
@@ -263,11 +313,11 @@ if [[ "$EXPERIMENT_TYPE" == "all" || "$EXPERIMENT_TYPE" == "simulated" ]]; then
   if [[ -n "${SIM_BENCHMARK_TIMEOUT}" && "${SIM_BENCHMARK_TIMEOUT}" != "0" ]] && command -v timeout >/dev/null; then
     sim_cmd=(timeout --signal=TERM --kill-after=60 "${SIM_BENCHMARK_TIMEOUT}" "${sim_cmd[@]}")
   fi
-  if "${sim_cmd[@]}" 2>&1 | tee "${SIM_DIR}/benchmarks/benchmark.log"; then
+  if run_logged "${SIM_DIR}/benchmarks/benchmark.log" "${sim_cmd[@]}"; then
     mark_success "simulated.pr_metrics_benchmark"
     echo -e "${GREEN}✓ Simulated benchmark complete${NC}"
   else
-    rc=${PIPESTATUS[0]}
+    rc=$?
     if [[ "${rc}" == "124" || "${rc}" == "137" ]]; then
       mark_failure "simulated.pr_metrics_benchmark.timeout(${SIM_BENCHMARK_TIMEOUT})"
     else
@@ -292,19 +342,25 @@ if [[ "$EXPERIMENT_TYPE" == "all" || "$EXPERIMENT_TYPE" == "million-real" ]]; th
   # binary cannot starve the rest of the matrix.  Override / disable with
   # MILLION_REAL_PREPARE_TIMEOUT=0 / MILLION_REAL_BENCH_TIMEOUT=0.
   MILLION_REAL_PREPARE_TIMEOUT="${MILLION_REAL_PREPARE_TIMEOUT:-${MILLION_REAL_TIMEOUT:-8h}}"
-  MILLION_REAL_BENCH_TIMEOUT="${MILLION_REAL_BENCH_TIMEOUT:-4h}"
+  # Million-real benchmark modes need enough wall time for MycoSV, comparator
+  # truth, and read validation. A 12h cap was routinely killing the Python
+  # benchmark after MycoSV had opened/truncated output files but before
+  # comparators populated exact_benchmark_summary.tsv, leaving
+  # interrupted_no_comparator rows and header-only read_validated_truth.tsv.
+  MILLION_REAL_BENCH_TIMEOUT="${MILLION_REAL_BENCH_TIMEOUT:-36h}"
 
   prepare_million_succeeded=0
   # Reads-mode coverage in the million-real bench. When 1, prepare-million-real
-  # also resolves public ENA reads for each held-out query species so 2b can
-  # exercise short-reads (Illumina) and long-reads (PacBio HiFi / ONT R10.4)
-  # in addition to assembly mode.  Default ON so benchmark_short-reads/ and
-  # benchmark_long-reads/ get populated; set MILLION_REAL_INCLUDE_READS=0 to
-  # skip the ENA hops on time-constrained runs.
+  # resolves public ENA reads for each held-out query species. Short-reads are
+  # deliberately off by default for now: they dominated wall time and previously
+  # prevented long-reads from starting. Set MILLION_REAL_READ_MODES=both and
+  # MILLION_REAL_BENCHMARK_MODES=assembly,short-reads,long-reads to re-enable.
   MILLION_REAL_INCLUDE_READS="${MILLION_REAL_INCLUDE_READS:-1}"
-  MILLION_REAL_READ_MODES="${MILLION_REAL_READ_MODES:-both}"
+  MILLION_REAL_READ_MODES="${MILLION_REAL_READ_MODES:-long-reads}"
+  MILLION_REAL_BENCHMARK_MODES="${MILLION_REAL_BENCHMARK_MODES:-assembly,long-reads}"
   MILLION_REAL_READ_RUNS_PER_QUERY="${MILLION_REAL_READ_RUNS_PER_QUERY:-1}"
   MILLION_REAL_NCBI_SOURCE="${MILLION_REAL_NCBI_SOURCE:-ncbi-best}"
+  MILLION_REAL_MYCOSV_USE_FULL_READS="${MILLION_REAL_MYCOSV_USE_FULL_READS:-0}"
 
   # ── 2a) prepare: download assemblies, build the routing index, hold out
   # ────── MILLION_REAL_QUERIES assemblies for the MycoSV-only benchmark.
@@ -328,12 +384,12 @@ if [[ "$EXPERIMENT_TYPE" == "all" || "$EXPERIMENT_TYPE" == "million-real" ]]; th
   if [[ -n "${MILLION_REAL_PREPARE_TIMEOUT}" && "${MILLION_REAL_PREPARE_TIMEOUT}" != "0" ]] && command -v timeout >/dev/null; then
     prepare_cmd=(timeout --signal=TERM --kill-after=60 "${MILLION_REAL_PREPARE_TIMEOUT}" "${prepare_cmd[@]}")
   fi
-  if "${prepare_cmd[@]}" 2>&1 | tee "${MILLION_REAL_DIR}/prepare_million_real.log"; then
+  if run_logged "${MILLION_REAL_DIR}/prepare_million_real.log" "${prepare_cmd[@]}"; then
     mark_success "million_real.index_build"
     echo -e "${GREEN}✓ Real million-scale index ready${NC}"
     prepare_million_succeeded=1
   else
-    rc=${PIPESTATUS[0]}
+    rc=$?
     if [[ "${rc}" == "124" || "${rc}" == "137" ]]; then
       mark_failure "million_real.index_build.timeout(${MILLION_REAL_PREPARE_TIMEOUT})"
       echo -e "${RED}✗ million-real prepare exceeded ${MILLION_REAL_PREPARE_TIMEOUT} — skipping 2b${NC}"
@@ -382,7 +438,19 @@ if [[ "$EXPERIMENT_TYPE" == "all" || "$EXPERIMENT_TYPE" == "million-real" ]]; th
       esac
     done < <(tail -n +2 "${MILLION_REAL_DIR}/query_manifest.tsv")
 
-    for million_real_mode in assembly short-reads long-reads; do
+    IFS=',' read -r -a million_real_modes_requested <<< "${MILLION_REAL_BENCHMARK_MODES}"
+    for million_real_mode in "${million_real_modes_requested[@]}"; do
+      million_real_mode="${million_real_mode//[[:space:]]/}"
+      if [[ -z "${million_real_mode}" ]]; then
+        continue
+      fi
+      case "${million_real_mode}" in
+        assembly|short-reads|long-reads) ;;
+        *)
+          echo "      [skip] mode=${million_real_mode}: invalid MILLION_REAL_BENCHMARK_MODES entry"
+          continue
+          ;;
+      esac
       if [[ "${million_real_modes_present[${million_real_mode}]}" -eq 0 ]]; then
         if [[ "${million_real_mode}" != "assembly" ]]; then
           echo "      [skip] mode=${million_real_mode}: no query rows in manifest"
@@ -393,14 +461,14 @@ if [[ "$EXPERIMENT_TYPE" == "all" || "$EXPERIMENT_TYPE" == "million-real" ]]; th
       echo -e "${YELLOW}[2b/4] Running MycoSV-only benchmark mode=${million_real_mode}...${NC}"
       bench_dir="${MILLION_REAL_DIR}/benchmark_${million_real_mode}"
       mkdir -p "${bench_dir}"
-      # Per-mode read-level validation support: assembly truth is
-      # high-confidence so 1 supporting read is enough; reads-mode truth
-      # is read-derived already so we want a stricter ≥3 to reject
-      # alignment artefacts.  Match the per-panel real-data defaults.
+      # Per-mode read-level validation support. Reads-mode MycoSV clusters
+      # are allowed at SUPPORT=2 in the C++ caller, so defaulting validation
+      # to 3 unfairly deletes valid MycoSV-supported events and suppresses
+      # read_level_union / F1 rows.
       if [[ "${million_real_mode}" == "assembly" ]]; then
         million_real_readval_support="${MILLION_REAL_READ_VALIDATION_MIN_SUPPORT:-1}"
       else
-        million_real_readval_support="${MILLION_REAL_READ_VALIDATION_MIN_SUPPORT_READS:-3}"
+        million_real_readval_support="${MILLION_REAL_READ_VALIDATION_MIN_SUPPORT_READS:-2}"
       fi
       # Per-mode comparator selection: keep wall time bounded by skipping
       # the heaviest tool in each mode while still producing real F1 numbers
@@ -411,9 +479,26 @@ if [[ "$EXPERIMENT_TYPE" == "all" || "$EXPERIMENT_TYPE" == "million-real" ]]; th
         million_real_comparator_flags=(--mycosv-only)
       else
         case "${million_real_mode}" in
-          assembly)    million_real_comparator_flags=(--run-minigraph --run-svim-asm) ;;
-          long-reads)  million_real_comparator_flags=(--run-sniffles --run-cutesv) ;;
-          short-reads) million_real_comparator_flags=(--run-delly) ;;
+          assembly)
+            # Default truth set: minigraph + svim_asm + anchorwave. The
+            # third comparator (anchorwave) is whole-genome-alignment-based,
+            # algorithmically independent from minigraph/svim_asm, and lets
+            # the leave-one-out comparator-variance benchmark fire (it
+            # needs K >= 3 — see score_loo_consensus in run_real_fungal_benchmark.py).
+            # Cactus is opt-in via MILLION_REAL_RUN_CACTUS=1 (slowest
+            # comparator, often > 24 h on the AMF panel). Disable
+            # anchorwave with MILLION_REAL_RUN_ANCHORWAVE=0 if it stalls
+            # on a particular panel.
+            million_real_comparator_flags=(--run-minigraph --run-svim-asm)
+            if [[ "${MILLION_REAL_RUN_ANCHORWAVE:-1}" == "1" ]]; then
+              million_real_comparator_flags+=(--run-anchorwave)
+            fi
+            if [[ "${MILLION_REAL_RUN_CACTUS:-0}" == "1" ]]; then
+              million_real_comparator_flags+=(--run-cactus)
+            fi
+            ;;
+          long-reads)  million_real_comparator_flags=(--run-svim --run-sniffles --run-cutesv) ;;
+          short-reads) million_real_comparator_flags=(--run-delly --run-manta) ;;
         esac
       fi
       bench_cmd=(python3 -u run_real_fungal_benchmark.py benchmark
@@ -425,18 +510,29 @@ if [[ "$EXPERIMENT_TYPE" == "all" || "$EXPERIMENT_TYPE" == "million-real" ]]; th
           "${million_real_comparator_flags[@]}"
           --reuse-index-dir "${MILLION_REAL_DIR}/index"
           --reuse-registry-dir "${MILLION_REAL_DIR}/registry"
+          --benchmark-ref-cap "${MILLION_REAL_BENCH_REF_CAP}"
           --read-validation-min-support "${million_real_readval_support}"
+          --mycosv-arg=--max-calls-per-contig
+          --mycosv-arg="${MILLION_REAL_MAX_CALLS_PER_CONTIG}"
           --mycosv-arg=--sa-max-contig-mb
           --mycosv-arg="${MILLION_REAL_SA_MAX_CONTIG_MB}"
           --mycosv-arg=--single-ref-cache-mb
           --mycosv-arg="${MILLION_REAL_SINGLE_REF_CACHE_MB}"
           --mycosv-arg=--max-ref-memory-mb
           --mycosv-arg="${MILLION_REAL_MAX_REF_MEMORY_MB}"
-          --mycosv-arg=--no-flat-ref-fallback
+          --mycosv-arg=--tol-cache-gb
+          --mycosv-arg="${MILLION_REAL_TOL_CACHE_GB}"
+          --mycosv-arg=--tol-cache-entries
+          --mycosv-arg="${MILLION_REAL_TOL_CACHE_ENTRIES}"
           --mycosv-arg=--no-gfa
           --mycosv-arg=--tol-min-chain-anchors
           --mycosv-arg=2
+          --mycosv-arg=--min-block-score
+          --mycosv-arg="${MILLION_REAL_MIN_BLOCK_SCORE}"
           "${val_flag}")
+      if [[ "${MILLION_REAL_MYCOSV_USE_FULL_READS}" == "1" ]]; then
+        bench_cmd+=(--mycosv-use-full-reads)
+      fi
       if [[ "${million_real_mode}" == "assembly" ]]; then
         bench_cmd+=(
           --max-assembly-query-contigs "${MILLION_REAL_MAX_ASSEMBLY_QUERY_CONTIGS}"
@@ -446,11 +542,11 @@ if [[ "$EXPERIMENT_TYPE" == "all" || "$EXPERIMENT_TYPE" == "million-real" ]]; th
       if [[ -n "${MILLION_REAL_BENCH_TIMEOUT}" && "${MILLION_REAL_BENCH_TIMEOUT}" != "0" ]] && command -v timeout >/dev/null; then
         bench_cmd=(timeout --signal=TERM --kill-after=60 "${MILLION_REAL_BENCH_TIMEOUT}" "${bench_cmd[@]}")
       fi
-      if "${bench_cmd[@]}" 2>&1 | tee "${bench_dir}/benchmark.log"; then
+      if run_logged "${bench_dir}/benchmark.log" "${bench_cmd[@]}"; then
         mark_success "million_real.mycosv_benchmark.${million_real_mode}"
         echo -e "${GREEN}✓ MycoSV-only million-real benchmark complete (mode=${million_real_mode})${NC}"
       else
-        rc=${PIPESTATUS[0]}
+        rc=$?
         if [[ "${rc}" == "124" || "${rc}" == "137" ]]; then
           mark_failure "million_real.mycosv_benchmark.${million_real_mode}.timeout(${MILLION_REAL_BENCH_TIMEOUT})"
         else
@@ -520,10 +616,10 @@ if [[ "$EXPERIMENT_TYPE" == "all" || "$EXPERIMENT_TYPE" == "real" ]]; then
     if [[ -n "${REAL_PREPARE_TIMEOUT}" && "${REAL_PREPARE_TIMEOUT}" != "0" ]] && command -v timeout >/dev/null; then
       prepare_panel_cmd=(timeout --signal=TERM --kill-after=60 "${REAL_PREPARE_TIMEOUT}" "${prepare_panel_cmd[@]}")
     fi
-    if "${prepare_panel_cmd[@]}" 2>&1 | tee "${PANEL_DIR}/prepare.log"; then
+    if run_logged "${PANEL_DIR}/prepare.log" "${prepare_panel_cmd[@]}"; then
       mark_success "real.${panel}.prepare"
     else
-      rc=${PIPESTATUS[0]}
+      rc=$?
       if [[ "${rc}" == "124" || "${rc}" == "137" ]]; then
         mark_failure "real.${panel}.prepare.timeout(${REAL_PREPARE_TIMEOUT})"
       else
@@ -646,10 +742,10 @@ if [[ "$EXPERIMENT_TYPE" == "all" || "$EXPERIMENT_TYPE" == "real" ]]; then
       if [[ -n "${bench_timeout}" && "${bench_timeout}" != "0" ]] && command -v timeout >/dev/null; then
         bench_cmd=(timeout --signal=TERM --kill-after=60 "${bench_timeout}" "${bench_cmd[@]}")
       fi
-      if "${bench_cmd[@]}" 2>&1 | tee "${PANEL_DIR}/benchmark_${mode}.log"; then
+      if run_logged "${PANEL_DIR}/benchmark_${mode}.log" "${bench_cmd[@]}"; then
         mark_success "real.${panel}.${mode}"
       else
-        rc=${PIPESTATUS[0]}
+        rc=$?
         # GNU `timeout` exits 124 on TERM and 137 on KILL — surface that as
         # a structured failure tag so the summary makes the bottleneck
         # obvious instead of just printing "stage failed".
@@ -680,7 +776,7 @@ fi
 REPORT_DIR="${WORK_DIR}/experiments/reports/${TIMESTAMP}"
 mkdir -p "${REPORT_DIR}"
 
-if [[ "$EXPERIMENT_TYPE" == "all" || "$EXPERIMENT_TYPE" == "simulated" || "$EXPERIMENT_TYPE" == "real" ]]; then
+if [[ "$EXPERIMENT_TYPE" == "all" || "$EXPERIMENT_TYPE" == "simulated" || "$EXPERIMENT_TYPE" == "real" || "$EXPERIMENT_TYPE" == "million-real" ]]; then
   echo -e "${YELLOW}[4/4] Generating visualization report...${NC}"
   echo "      Output: ${REPORT_DIR}"
 
@@ -694,13 +790,16 @@ if [[ "$EXPERIMENT_TYPE" == "all" || "$EXPERIMENT_TYPE" == "simulated" || "$EXPE
   REAL_RESULTS="${REPORT_DIR}/real_merged.tsv"
   BIO_RESULTS="${REPORT_DIR}/biology_merged.tsv"
   NOVEL_RESULTS="${REPORT_DIR}/novel_merged.tsv"
+  TIERS_RESULTS="${REPORT_DIR}/mycosv_evidence_tiers_merged.tsv"
   : > "${REAL_RESULTS}"
   : > "${BIO_RESULTS}"
   : > "${NOVEL_RESULTS}"
+  : > "${TIERS_RESULTS}"
 
   # Schema-aware merge: input TSVs may have different (but overlapping) headers.
   # We union all columns, then emit one merged TSV with empty fills for columns
-  # missing in any source file. Falls back to a no-op when no inputs are given.
+  # missing in any source file. The implementation streams rows after the
+  # header discovery pass so a giant input cannot balloon Python RAM.
   merge_tsv_group() {
     local out_file="$1"
     shift
@@ -709,7 +808,6 @@ if [[ "$EXPERIMENT_TYPE" == "all" || "$EXPERIMENT_TYPE" == "simulated" || "$EXPE
 import csv, sys
 out_path = sys.argv[1]
 inputs = sys.argv[2:]
-rows = []
 columns = []
 seen = set()
 for path in inputs:
@@ -722,8 +820,6 @@ for path in inputs:
                 if col not in seen:
                     seen.add(col)
                     columns.append(col)
-            for row in reader:
-                rows.append(row)
     except OSError:
         continue
 if not columns:
@@ -733,32 +829,99 @@ with open(out_path, "w", newline="") as fh:
     writer = csv.DictWriter(fh, fieldnames=columns, delimiter="\t",
                             extrasaction="ignore")
     writer.writeheader()
-    for row in rows:
-        writer.writerow({c: row.get(c, "") for c in columns})
+    for path in inputs:
+        try:
+            with open(path, newline="") as in_fh:
+                reader = csv.DictReader(in_fh, delimiter="\t")
+                if not reader.fieldnames:
+                    continue
+                for row in reader:
+                    writer.writerow({c: row.get(c, "") for c in columns})
+        except OSError:
+            continue
 PY
     return 0
   }
 
-  # Scan REAL_DIR (per-panel benchmarks) AND MILLION_REAL_DIR (the
-  # MycoSV-only million-scale benchmark from step 2b). Without the latter,
-  # the held-out queries' SV calls / TE classifications / biology candidates
-  # never reach the report and the million-real flow looks empty.
-  mapfile -t REAL_TSVS < <(find "${REAL_DIR}" "${MILLION_REAL_DIR}" -type f \( \
-      -name "*summary*.tsv" -o \
-      -name "*pr_metrics*.tsv" -o \
-      -name "*normalized_calls*.tsv" -o \
-      -name "*score*.tsv" \
-    \) 2>/dev/null | sort)
+  discover_report_inputs() {
+    local root="$1"
+    local kind="$2"
+    python3 - "$root" "$kind" <<'PY'
+import csv, json, sys
+from pathlib import Path
 
-  mapfile -t BIO_TSVS < <(find "${REAL_DIR}" "${MILLION_REAL_DIR}" -type f \( \
-      -name "*biology*.tsv" -o \
-      -name "*candidate*.tsv" -o \
-      -name "*annotation*.tsv" -o \
-      -name "*pathway*.tsv" \
-    \) 2>/dev/null | sort)
+root = Path(sys.argv[1])
+kind = sys.argv[2]
 
-  mapfile -t NOVEL_TSVS < <(find "${REAL_DIR}" "${MILLION_REAL_DIR}" -type f \
-      -name "novel_mycosv_calls.tsv" 2>/dev/null | sort)
+def complete_benchmark_dir(d: Path) -> bool:
+    if not d.is_dir() or not d.name.startswith("benchmark_"):
+        return False
+    summary_json = d / "benchmark_summary.json"
+    exact = d / "exact_benchmark_summary.tsv"
+    readval = d / "read_validated_truth.tsv"
+    if not summary_json.exists() or summary_json.stat().st_size == 0:
+        return False
+    if not exact.exists() or exact.stat().st_size == 0:
+        return False
+    try:
+        with exact.open(newline="") as fh:
+            rows = list(csv.DictReader(fh, delimiter="\t"))
+    except Exception:
+        return False
+    if not rows:
+        return False
+    statuses = {r.get("status", "") for r in rows}
+    labels = {r.get("truth_label", "") for r in rows}
+    if any(s.startswith("interrupted") for s in statuses):
+        return False
+    if labels and labels <= {"no_comparator", "interrupted_no_comparator"}:
+        return False
+    if not readval.exists() or readval.stat().st_size <= 128:
+        # Missing/header-only read validation means the run did not reach the
+        # evidence rows needed for the report's read-supported F1 panels.
+        return False
+    try:
+        json.loads(summary_json.read_text(encoding="utf-8"))
+    except Exception:
+        return False
+    return True
+
+paths: list[Path] = []
+for d in sorted(root.rglob("benchmark_*")):
+    if not complete_benchmark_dir(d):
+        continue
+    if kind == "real":
+        paths.append(d / "exact_benchmark_summary.tsv")
+    elif kind == "biology":
+        # Final, joined biology output only. Do not ingest gene_annotations.tsv
+        # or biology_candidates.tsv here; those can be multi-GB raw inputs and
+        # are not report-ready per-call findings.
+        p = d / "biology_findings.tsv"
+        if p.exists() and p.stat().st_size > 0:
+            paths.append(p)
+    elif kind == "novel":
+        p = d / "novel_mycosv_calls.tsv"
+        if p.exists() and p.stat().st_size > 0:
+            paths.append(p)
+    elif kind == "evidence_tiers":
+        p = d / "mycosv_evidence_tiers.tsv"
+        if p.exists() and p.stat().st_size > 0:
+            paths.append(p)
+
+for p in paths:
+    print(p)
+PY
+  }
+
+  mapfile -t REAL_TSVS < <({ discover_report_inputs "${REAL_DIR}" real; discover_report_inputs "${MILLION_REAL_DIR}" real; } | sort)
+  mapfile -t BIO_TSVS < <({ discover_report_inputs "${REAL_DIR}" biology; discover_report_inputs "${MILLION_REAL_DIR}" biology; } | sort)
+  mapfile -t NOVEL_TSVS < <({ discover_report_inputs "${REAL_DIR}" novel; discover_report_inputs "${MILLION_REAL_DIR}" novel; } | sort)
+  mapfile -t TIER_TSVS < <({ discover_report_inputs "${REAL_DIR}" evidence_tiers; discover_report_inputs "${MILLION_REAL_DIR}" evidence_tiers; } | sort)
+
+  printf "real_inputs\t%s\n" "${#REAL_TSVS[@]}" > "${REPORT_DIR}/report_inputs.tsv"
+  printf "biology_inputs\t%s\n" "${#BIO_TSVS[@]}" >> "${REPORT_DIR}/report_inputs.tsv"
+  printf "novel_inputs\t%s\n" "${#NOVEL_TSVS[@]}" >> "${REPORT_DIR}/report_inputs.tsv"
+  printf "evidence_tier_inputs\t%s\n" "${#TIER_TSVS[@]}" >> "${REPORT_DIR}/report_inputs.tsv"
 
   if [[ ${#REAL_TSVS[@]} -gt 0 ]]; then
     merge_tsv_group "${REAL_RESULTS}" "${REAL_TSVS[@]}"
@@ -769,18 +932,27 @@ PY
   if [[ ${#NOVEL_TSVS[@]} -gt 0 ]]; then
     merge_tsv_group "${NOVEL_RESULTS}" "${NOVEL_TSVS[@]}"
   fi
-
-  report_cmd=(python3 sv_visualization_report.py --outdir "${REPORT_DIR}" --title "MycoSV comprehensive report (${TIMESTAMP})")
-  [[ -n "${SIM_RESULTS}" ]] && report_cmd+=(--simulated "${SIM_RESULTS}")
-  [[ -s "${REAL_RESULTS}" ]] && report_cmd+=(--real "${REAL_RESULTS}")
-  [[ -s "${BIO_RESULTS}" ]] && report_cmd+=(--biology "${BIO_RESULTS}")
-  [[ -s "${NOVEL_RESULTS}" ]] && report_cmd+=(--novel "${NOVEL_RESULTS}")
-  if [[ -n "${REPORT_TIMEOUT}" && "${REPORT_TIMEOUT}" != "0" ]] && command -v timeout >/dev/null; then
-    report_cmd=(timeout --signal=TERM --kill-after=60 "${REPORT_TIMEOUT}" "${report_cmd[@]}")
+  if [[ ${#TIER_TSVS[@]} -gt 0 ]]; then
+    merge_tsv_group "${TIERS_RESULTS}" "${TIER_TSVS[@]}"
   fi
 
-  if [[ -f "${WORK_DIR}/sv_visualization_report.py" ]]; then
-    if "${report_cmd[@]}" 2>&1 | tee "${REPORT_DIR}/report.log"; then
+  if [[ -z "${SIM_RESULTS}" && ! -s "${REAL_RESULTS}" && ! -s "${BIO_RESULTS}" && ! -s "${NOVEL_RESULTS}" ]]; then
+    {
+      echo "No completed benchmark inputs were available for the report."
+      echo "Incomplete benchmark dirs are intentionally excluded unless they contain benchmark_summary.json, populated exact_benchmark_summary.tsv, and read-validation rows."
+    } | tee "${REPORT_DIR}/report.log"
+    mark_failure "report.no_completed_inputs"
+  elif [[ -f "${WORK_DIR}/sv_visualization_report.py" ]]; then
+    report_cmd=(python3 sv_visualization_report.py --outdir "${REPORT_DIR}" --title "MycoSV comprehensive report (${TIMESTAMP})")
+    [[ -n "${SIM_RESULTS}" ]] && report_cmd+=(--simulated "${SIM_RESULTS}")
+    [[ -s "${REAL_RESULTS}" ]] && report_cmd+=(--real "${REAL_RESULTS}")
+    [[ -s "${BIO_RESULTS}" ]] && report_cmd+=(--biology "${BIO_RESULTS}")
+    [[ -s "${NOVEL_RESULTS}" ]] && report_cmd+=(--novel "${NOVEL_RESULTS}")
+    [[ -s "${TIERS_RESULTS}" ]] && report_cmd+=(--evidence-tiers "${TIERS_RESULTS}")
+    if [[ -n "${REPORT_TIMEOUT}" && "${REPORT_TIMEOUT}" != "0" ]] && command -v timeout >/dev/null; then
+      report_cmd=(timeout --signal=TERM --kill-after=60 "${REPORT_TIMEOUT}" "${report_cmd[@]}")
+    fi
+    if run_logged "${REPORT_DIR}/report.log" "${report_cmd[@]}"; then
       if [[ -f "${REPORT_DIR}/sv_visualization_report.html" ]]; then
         mark_success "report.visualization"
         echo -e "${GREEN}✓ Visualization report generated${NC}"
@@ -788,7 +960,7 @@ PY
         mark_failure "report.visualization_missing_output"
       fi
     else
-      rc=${PIPESTATUS[0]}
+      rc=$?
       if [[ "${rc}" == "124" || "${rc}" == "137" ]]; then
         mark_failure "report.visualization.timeout(${REPORT_TIMEOUT})"
       else

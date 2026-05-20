@@ -1,177 +1,113 @@
-# Real-data SV benchmarking: ground-truth strategy
+# Real-data SV benchmarking for fungi
 
-This document explains why "minigraph as truth" gives misleading numbers,
-how the current pipeline avoids that with multi-comparator consensus, and
-which bias-free alternatives are available for raw-data validation.
+This benchmark separates two different questions:
 
----
+1. **Comparator comparison**: how MycoSV behaves relative to existing SV
+   tools on the same fungal inputs.
+2. **Independent validation**: whether MycoSV calls are supported by raw
+   FASTQ/read evidence from the same sample.
 
-## 1 — Why minigraph alone is not a clean ground truth
-
-`minigraph -cxggs` builds a pangenome graph and `gfatools bubble` extracts
-"bubbles" (regions of structural divergence). On the
-[20260428_182921 compact_yeast assembly](experiments/real_data/20260428_182921/compact_yeast/benchmark_assembly/exact_benchmark_summary.tsv)
-benchmark this caller emits **8 SVs** on `GCA_030569935_1` while
-cactus/svim_asm/anchorwave emit 110–170. The reasons are well-known:
-
-1. **Bubble extraction is conservative.** `gfatools bubble` only emits
-   isolated bubbles — long divergent stretches collapse into a single
-   bubble or are skipped entirely. Truth callers that work on pairwise
-   alignments (`svim_asm`, `anchorwave`) recover those events as
-   individual INS/DEL/INV.
-2. **Default `minigraph -xggs` uses asm5 chains** (≤5% divergence). For
-   intra-genus comparisons (e.g. *Nakaseomyces glabratus* haplotypes,
-   *Saccharomyces* hybrids) regions exceeding that drop out of the graph
-   entirely.
-3. **No nested-event recovery.** If a 50 kb inversion contains a 3 kb
-   deletion, minigraph reports one bubble; a per-base aligner reports
-   both.
-4. **Bias against small SVs near assembly contig ends.** The bubble
-   extraction trims terminal bubbles; svim_asm doesn't.
-
-The empirical signal: across all four assembly truth labels in the
-20260428 run, minigraph consistently emits 5–20 % of the SV count of the
-other three callers. Treating its output as the single ground truth makes
-mycosv (or any tool) look like it has 0 % recall against minigraph even
-when 7–10 % of mycosv's predictions match the consensus of the other
-three callers. Use minigraph as **one signal**, not as the truth.
+For fungi, comparator outputs are not treated as ground truth. Generic SV
+callers can miss or misrepresent repeat-rich, accessory-chromosome,
+heterokaryotic/dikaryotic, TE-rich, AMF-scale, and highly fragmented fungal
+genomes. They are useful baselines, but their shared blind spots should not
+define biological truth.
 
 ---
 
-## 2 — What the pipeline now reports (after the fixes)
+## 1. Comparator Outputs Are Baselines
 
-[exact_benchmark_summary.tsv](experiments/real_data/20260428_182921/compact_yeast/benchmark_assembly/exact_benchmark_summary.tsv) now carries three views per `(query, mode)`:
+Tools such as minigraph, SVIM-asm, AnchorWave, pggb, cactus, Sniffles, cuteSV,
+Delly, and Manta are reported as comparator baselines. They answer:
 
-| `coordinate_space`        | what it scores |
-|----------------------------|----------------|
-| `reference`                | mycosv ref-coord calls *filtered* to `benchmark_ref_fasta` contigs vs each truth caller |
-| `reference_any_clade`      | **same truth, but mycosv predictions NOT filtered** — exposes how many mycosv calls were correctly anchored but on a sibling clade |
-| `reference` w/ `truth_label=consensus_2of_N` | mycosv vs the high-confidence consensus (an SV is in the consensus iff it's compatible across position + length + type tolerance with calls from at least 2 of the N comparators) |
+- Does MycoSV recover calls also found by other methods?
+- Where does MycoSV disagree with each comparator?
+- Which SV types or fungal architectures drive disagreement?
 
-The consensus row is the **primary number**; the per-tool rows let you
-see which comparator drives the consensus and how badly any single tool
-disagrees. `benchmark_summary.json` additionally reports
-`mycosv_calls.off_ref_dropped` (calls with no REFPOS, un-matchable in
-ref space) and `mycosv_calls.misrouted_to_sibling_clade` (calls whose
-REFCONTIG did not pass the `benchmark_ref_fasta` filter), so the
-prediction count is no longer opaque.
+`exact_benchmark_summary.tsv` keeps the historical `truth_label` column for
+compatibility, but now also writes `validation_basis`:
 
-Implementation: see
-[run_real_fungal_benchmark.py:build_consensus_truth](run_real_fungal_benchmark.py)
-and the per-query metric loop just below it.
+| `validation_basis` | Meaning |
+|--------------------|---------|
+| `raw_read_validated` | Tool-agnostic candidate union validated directly against raw reads/FASTQ. This is the preferred independent validation basis. |
+| `comparator_agreement_read_supported` | Comparator consensus or comparator candidate set after a raw-read support filter. Useful, but still comparator-seeded. |
+| `comparator_agreement` | Calls supported by multiple comparator tools. Use as baseline agreement, not ground truth. |
+| `comparator_baseline` | MycoSV scored against one comparator output. Diagnostic only. |
+| `no_independent_validation` | MycoSV ran, but no comparator/read validation basis was available. Metrics are undefined. |
 
 ---
 
-## 3 — Truly bias-free truth, ranked by how much it costs
+## 2. Primary Fungal Validation
 
-For each option below, "raw data" means going back to the FASTQ and not
-trusting any single caller's annotation. They compose: you can apply 3
-on top of 1+2.
+The primary real-data validation target is `truth_label=read_level_union` with
+`validation_basis=raw_read_validated`.
 
-### 3.1 — Multi-comparator consensus *(implemented, free, recommended primary)*
+This path pools candidate loci from MycoSV and available comparators, then
+keeps only loci supported by raw reads. When `force_external=True`, MycoSV's
+own internal support cannot self-validate a call. This makes the row a direct
+read-evidence question:
 
-Truth = SVs supported by ≥ 2 of {cactus, svim_asm, anchorwave, pggb}.
+> Given all proposed loci, which ones are independently supported by raw
+> FASTQ/read alignments, and how well does each method recover them?
 
-- Pros: zero new infrastructure, removes single-tool bias, runs on the
-  comparator outputs already produced by `benchmark_<mode>/comparators/`.
-- Cons: still bounded by what **all** assembly comparators can find
-  (e.g. complex recombination is undercalled by every tool).
-- Knob: `min_support` in `build_consensus_truth()`. 2-of-4 is sensitive,
-  3-of-4 is highest-confidence.
-- **What the existing TSV now uses.** Treat `truth_label=consensus_2of_4`
-  as the headline metric; treat per-tool rows as diagnostic.
-
-### 3.2 — Read-level support filter *(implemented as a post-filter)*
-
-For every SV in any truth set, require ≥ K split-read alignments from raw
-long reads of the same sample. SVs with no read support are removed from
-both truth and predictions before scoring. This anchors the metric in the
-raw FASTQ instead of in any caller.
-
-- Pros: filters caller artefacts (paftools INS at MNV sites, cactus
-  duplications from heterozygosity collapses) without re-implementing
-  variant calling.
-- Cons: needs raw long reads for the same sample as the assembly; for
-  NCBI assembly queries the matching SRA run usually exists but not
-  always.
-- See [validate_truth_with_reads.py](validate_truth_with_reads.py)
-  (added by these fixes).
-
-### 3.3 — De-novo HiFi assembly as truth *(workflow, not yet wired in)*
-
-If raw HiFi reads exist for the sample:
-
-```
-hifiasm -o asm -t 32 reads.hifi.fa.gz
-# asm.bp.p_ctg.fa is the diploid primary assembly, ≥ Q40 per base
-svim-asm haploid out_dir asm.bp.p_ctg.fa ref.fa > truth.vcf
-```
-
-That `truth.vcf` is the cleanest single-sample truth available because
-the assembly itself was reconstructed from the raw reads, and the SV
-caller only sees the resulting consensus contigs (no graph collapse).
-For fungi this typically gives Q50+ contigs and resolves nested events.
-Plug the resulting VCF into the pipeline via `--other-vcf
-hifi_truth=truth.vcf` and the per-query loop already picks it up.
-
-### 3.4 — Synthetic spike-in *(implemented as standalone benchmark)*
-
-For a given reference, programmatically inject N known SVs (INS/DEL/DUP/
-INV at random positions of random length sampled from a realistic
-distribution), regenerate the "query" FASTA, and run the full pipeline.
-Truth is exact by construction.
-
-- Pros: 100 % perfect ground truth; tests positional accuracy directly.
-- Cons: misses real-data effects (heterozygosity, transposons,
-  centromeric satellite regions) — pair with §3.1–3.3 for a complete
-  picture.
-- See [synthetic_sv_benchmark.py](synthetic_sv_benchmark.py)
-  (added by these fixes).
-
-### 3.5 — Trio / family validation *(workflow, not implemented)*
-
-For trios (parent×parent→F1) call SVs in all three samples. Mendelian
-inconsistency is a strong "false positive" signal. For fungi this works
-on dikaryotic crosses and on lab progeny (e.g. *Saccharomyces*
-crosses, *Zymoseptoria tritici* mating populations). Not in scope here —
-flagged for the read-mode work.
+For long reads, validation uses split/clipped alignment evidence around
+breakpoints. For short reads, it uses paired/split/clipped/depth-style support
+where available. For assembly-mode queries, matching raw reads are still the
+best validation source; without them, assembly-only evidence is reported but
+should not be presented as independently validated biology.
 
 ---
 
-## 4 — Recommended report layout
+## 3. Comparator Agreement
 
-When generating the visualization report and biological findings:
+Comparator consensus rows such as `consensus_2of_N` remain useful, but only as
+baseline agreement. They are not the headline biological truth for fungi.
 
-1. **Headline P/R/F1**: use the `consensus_2of_N` row from
-   `exact_benchmark_summary.tsv`. Drop minigraph from the headline.
-2. **Per-tool rows**: keep, but render as a small-multiples panel under
-   the headline so the user sees disagreement.
-3. **Routing diagnostics**: render `mycosv_calls.off_ref_dropped`
-   (un-matchable novel-sequence events) and
-   `mycosv_calls.misrouted_to_sibling_clade` so a 70 / 111 / 233 split
-   is visible at a glance.
-4. **Synthetic-spike-in scorecard**: include as a "calibration" panel —
-   the pipeline ought to clear ≥ 90 % recall on synthetic data; if it
-   doesn't, real-data numbers below that ceiling reflect real-data
-   difficulty rather than caller bias.
-5. **Biological findings**: only include SV candidates that pass
-   *both* the consensus filter and the read-level support filter
-   (§3.2). Anything below `consensus_2of_2` and read-support ≥ 3 should
-   be marked as "low-confidence" rather than featured.
+Use them to answer:
+
+- Does MycoSV agree with multiple existing tools?
+- Are disagreements concentrated in INS/DEL/DUP/INV/TRA/OFF_REF?
+- Is a result sensitive to one comparator? Check `loo_consensus_summary.tsv`
+  and `loo_consensus_variance.json`.
+
+Do not describe `consensus_2of_N` as ground truth in reports. Prefer
+phrases such as “comparator agreement,” “baseline agreement,” or
+“multi-tool support.”
 
 ---
 
-## 5 — Concrete next steps
+## 4. Reporting Rules
 
-- [x] Multi-comparator consensus, any-clade row, OFF_REF /
-      misrouted diagnostics (this commit).
-- [x] [retry_real_panels.sh](retry_real_panels.sh) to rerun under
-      `srun --mem=32G` and bypass the 12 GiB cap.
-- [x] [validate_truth_with_reads.py](validate_truth_with_reads.py) for
-      §3.2.
-- [x] [synthetic_sv_benchmark.py](synthetic_sv_benchmark.py) for §3.4.
-- [ ] Wire the consensus row into
-      [sv_visualization_report.py](sv_visualization_report.py) as the
-      headline metric.
-- [ ] Add HiFi-assembly truth ingestion when the source FASTQ is
-      identified for a query (§3.3).
+Recommended ordering for real fungal reports:
+
+1. **Independent validation**: use `read_level_union` rows when present.
+2. **Read-filtered comparator agreement**: use `*_read_supported` consensus
+   rows when `read_level_union` is unavailable.
+3. **Comparator agreement**: use `consensus_2of_N` as baseline comparison
+   only.
+4. **Single-comparator rows**: show as diagnostics, not as truth.
+5. **MycoSV-only runs**: report call burden, evidence tiers, TE/biology
+   annotations, and raw-read support if available; do not report P/R/F1 as
+   accuracy metrics when validation is absent.
+
+Biology tables should feature calls with independent read support first:
+
+- `strong`: comparator-supported and raw-read supported
+- `moderate`: comparator-supported or raw-read supported
+- `intrinsic_only`: supported only by MycoSV internal evidence
+- `weak`: exploratory
+
+For fungal novelty, `mycosv_only_read_supported` is a meaningful category:
+the call is not found by current comparators but is supported by raw reads.
+
+---
+
+## 5. Remaining Gaps
+
+- Add explicit matching of assembly queries to same-sample FASTQ/SRA accessions
+  wherever possible.
+- Add HiFi reassembly-derived validation when suitable reads exist.
+- Keep synthetic spike-in benchmarks as calibration, because they provide exact
+  truth by construction but do not replace real fungal raw-read validation.
+- Make every visualization label use “validation basis” or “baseline
+  agreement” instead of “ground truth” for real-data comparator rows.

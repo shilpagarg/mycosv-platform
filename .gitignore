@@ -6,6 +6,8 @@ results/
 outputs/
 experiments/
 logs/
+.slurm*
+*bin*
 
 # 🔹 Large files
 slurm*

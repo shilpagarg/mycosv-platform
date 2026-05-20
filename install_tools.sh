@@ -17,6 +17,7 @@
 # Usage:
 #   bash install_tools.sh              # install comparator closure
 #   bash install_tools.sh --check      # report tool availability only
+#   bash install_tools.sh python-deps  # install Python reporting/test deps
 #   bash install_tools.sh all          # install broad SV benchmark stack
 #   bash install_tools.sh syri pggb    # install selected tools
 #
@@ -157,10 +158,40 @@ install_syri() {
     if ! need syri; then ok "syri already on PATH"; return 0; fi
     require_cmd git || return 1
     install_minimap2 || return 1
-    pip_install Cython numpy psutil pandas pysam scipy 2>&1 | tail -5 || return 1
+    install_python-deps || return 1
     clone_fresh https://github.com/schneebergerlab/syri.git "$SRC_DIR/syri-src" || return 1
     (cd "$SRC_DIR/syri-src" && pip_install --no-build-isolation .) 2>&1 | tail -20 || return 1
     have syri
+}
+
+install_python-deps() {
+    local missing=() pkg
+    for pkg in Cython numpy psutil pandas pysam scipy pytest matplotlib; do
+        python - "$pkg" <<'PY' >/dev/null 2>&1 || missing+=("$pkg")
+import importlib.util
+import sys
+pkg = sys.argv[1]
+module = {"Cython": "Cython"}.get(pkg, pkg)
+raise SystemExit(0 if importlib.util.find_spec(module) else 1)
+PY
+    done
+    if [[ ${#missing[@]} -eq 0 && "$FORCE" != "1" ]]; then
+        ok "Python deps already installed"
+        return 0
+    fi
+    info "Installing Python deps: ${missing[*]:-Cython numpy psutil pandas pysam scipy pytest matplotlib}"
+    pip_install -U pip setuptools wheel 2>&1 | tail -5 || true
+    if [[ "$FORCE" == "1" ]]; then
+        pip_install -U Cython numpy psutil pandas pysam scipy pytest matplotlib 2>&1 | tail -20 || return 1
+    else
+        pip_install "${missing[@]}" 2>&1 | tail -20 || return 1
+    fi
+    python - <<'PY'
+import importlib
+for pkg in ["Cython", "numpy", "psutil", "pandas", "pysam", "scipy", "pytest", "matplotlib"]:
+    importlib.import_module(pkg)
+print("Python deps OK")
+PY
 }
 
 install_svim() {
@@ -307,13 +338,14 @@ install_cactus-pangenome() {
     have cactus-pangenome
 }
 
-readonly COMPARATOR_TOOLS=(minimap2 paftools_js syri minigraph gfatools samtools bcftools svim-asm anchorwave pggb cactus-pangenome)
-readonly ALL_TOOLS=(minimap2 k8 paftools_js minigraph gfatools htslib samtools bcftools syri svim-asm anchorwave pggb cactus-pangenome svim sniffles cuteSV delly manta)
+readonly COMPARATOR_TOOLS=(python-deps minimap2 paftools_js syri minigraph gfatools samtools bcftools svim-asm anchorwave pggb cactus-pangenome)
+readonly ALL_TOOLS=(python-deps minimap2 k8 paftools_js minigraph gfatools htslib samtools bcftools syri svim-asm anchorwave pggb cactus-pangenome svim sniffles cuteSV delly manta)
 readonly CHECK_TOOLS=(minimap2 paftools.js syri minigraph gfatools pggb cactus-pangenome svim-asm samtools bcftools anchorwave svim sniffles cuteSV delly configManta.py)
 
 normalize_tool() {
     case "$1" in
         cactus) echo cactus-pangenome ;;
+        python|python_deps|python-deps|deps|pythondeps) echo python-deps ;;
         paftools|paftools.js|paftools_js) echo paftools_js ;;
         sniffles2) echo sniffles ;;
         cutesv) echo cuteSV ;;
@@ -333,6 +365,23 @@ check_tools() {
             ok "$(printf '%-18s %s' "$tool" "$path")"
         else
             fail "$(printf '%-18s missing' "$tool")"
+            missing=$((missing + 1))
+        fi
+    done
+    echo
+    hdr "Python package availability"
+    local pkg module
+    for pkg in Cython numpy psutil pandas pysam scipy pytest matplotlib; do
+        module="$pkg"
+        python - "$module" <<'PY' >/dev/null 2>&1
+import importlib.util
+import sys
+raise SystemExit(0 if importlib.util.find_spec(sys.argv[1]) else 1)
+PY
+        if [[ "$?" == "0" ]]; then
+            ok "$(printf '%-18s present' "$pkg")"
+        else
+            fail "$(printf '%-18s missing' "$pkg")"
             missing=$((missing + 1))
         fi
     done

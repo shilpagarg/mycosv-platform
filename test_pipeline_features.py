@@ -1373,6 +1373,46 @@ extern "C" int registry_lru_ok() {
     lib.registry_lru_ok.restype = ctypes.c_int
     assert lib.registry_lru_ok() == 1
 
+
+def test_layer2_manifest_parser_handles_fasta_paths_schema(tmp_path: Path):
+    """Layer-2 manifest parser keeps fasta_paths/CRC/hash columns aligned."""
+    RUN_EXE_CACHE.mkdir(exist_ok=True)
+    manifest = tmp_path / 'clade_manifest.tsv'
+    manifest.write_text(
+        '#clade_name\tclade_rank\tphylum\tgraph_path\tgenome_count\t'
+        'sv_bubbles\tcompressed_bytes\tfasta_paths\tcrc32\tcentroid_hashes\n'
+        'cladeA\tspecies\tAscomycota\tgraphA.bin\t1\t2\t3\trel.fa\t123\t11,22\n'
+        'cladeB\tgenus\tAscomycota\tgraphB.bin\t4\t5\t6\t\t456\t33\n',
+        encoding='utf-8',
+    )
+    manifest_path = str(manifest).replace('\\', '\\\\')
+    harness = tmp_path / 'manifest_harness.cpp'
+    harness.write_text(r'''
+#include "layer2_registry.hpp"
+
+extern "C" int manifest_schema_ok() {
+    auto rows = tol::load_manifest("MANIFEST_PATH");
+    if (rows.size() != 2) return 0;
+    if (rows[0].fastaPaths.size() != 1 || rows[0].fastaPaths[0] != "rel.fa") return 0;
+    if (rows[0].crc32 != 123) return 0;
+    if (rows[0].centroidSyncmers.size() != 2 || rows[0].centroidSyncmers[0] != 11 ||
+        rows[0].centroidSyncmers[1] != 22) return 0;
+    if (!rows[1].fastaPaths.empty()) return 0;
+    if (rows[1].crc32 != 456) return 0;
+    if (rows[1].centroidSyncmers.size() != 1 || rows[1].centroidSyncmers[0] != 33) return 0;
+    return 1;
+}
+'''.replace('MANIFEST_PATH', manifest_path))
+    dll = RUN_EXE_CACHE / f'manifest_harness_{hashlib.sha1(str(tmp_path).encode("utf-8")).hexdigest()[:12]}.so'
+    run([
+        'g++', '-shared', '-fPIC', '-O2', '-std=c++17',
+        '-pthread', '-I', str(ROOT), str(harness), '-o', str(dll)
+    ])
+    lib = _load_test_dll(dll)
+    lib.manifest_schema_ok.restype = ctypes.c_int
+    assert lib.manifest_schema_ok() == 1
+
+
 def test_ds13_suffix_array_build_and_mems(tmp_path: Path):
     """DS-13: SuffixArray builds correctly and finds MEMs."""
     harness = tmp_path / 'sa_harness.cpp'
@@ -1697,7 +1737,7 @@ int main() {
 
 
 def test_repeat_hgt_rip_detectors_follow_benchmark_rules(tmp_path: Path):
-    """Detector thresholds match the benchmark rules for tandem/HGT/RIP."""
+    """Detector thresholds match the biology-aware tandem/HGT/RIP/Starship rules."""
     harness = tmp_path / 'rule_harness.cpp'
     harness.write_text(r'''
 #include <iostream>
@@ -1710,16 +1750,28 @@ int main() {
 
     std::string hgt_hi(500, 'G');
     std::string hgt_lo(500, 'C');
-    std::string rip_yes(500, 'C');
-    for (int i = 400; i < 500; ++i) rip_yes[static_cast<size_t>(i)] = 'G'; // C/G = 4.0
+    std::string rip_yes;
+    for (int i = 0; i < 220; ++i) rip_yes += "TA"; // TpA-rich RIP product
+    for (int i = 0; i < 60; ++i) rip_yes += "TG";  // complementary RIP product
     std::string rip_no(500, 'C');
     for (int i = 200; i < 500; ++i) rip_no[static_cast<size_t>(i)] = 'G'; // C/G ~= 0.67
+    std::string starship(6000, 'A');
+    for (int i = 2500; i < 3500; i += 2) {
+        starship[static_cast<size_t>(i)] = 'G';
+        starship[static_cast<size_t>(i + 1)] = 'C';
+    }
 
     std::cout << "tandem\t" << (tol::detect_tandem_repeat(tandem) ? "yes" : "no") << "\n";
     std::cout << "hgt_hi\t" << (tol::detect_hgt_island(hgt_hi, 0.50, 0.12, 500) ? "yes" : "no") << "\n";
     std::cout << "hgt_lo\t" << (tol::detect_hgt_island(hgt_lo, 0.50, 0.12, 500) ? "yes" : "no") << "\n";
     std::cout << "rip_yes\t" << (tol::detect_rip_window(rip_yes, 2.5, 500) ? "yes" : "no") << "\n";
     std::cout << "rip_no\t" << (tol::detect_rip_window(rip_no, 2.5, 500) ? "yes" : "no") << "\n";
+    std::cout << "starship_asco\t"
+              << (tol::classify_repeat_element(starship, 0.45, "Ascomycota") == tol::ElementClass::STARSHIP ? "yes" : "no")
+              << "\n";
+    std::cout << "starship_amf_blocked\t"
+              << (tol::classify_repeat_element(starship, 0.45, "Glomeromycota") == tol::ElementClass::STARSHIP ? "no" : "yes")
+              << "\n";
 }
 ''')
     exe = tmp_path / 'rule_harness'
@@ -1730,6 +1782,8 @@ int main() {
     assert rows['hgt_lo'] == 'yes'
     assert rows['rip_yes'] == 'yes'
     assert rows['rip_no'] == 'no'
+    assert rows['starship_asco'] == 'yes'
+    assert rows['starship_amf_blocked'] == 'yes'
 
 
 def test_graph_native_offref_windows_and_router_windowing(tmp_path: Path):
@@ -1940,7 +1994,11 @@ def test_multi_rank_partitioned_build_compacts_oversized_clades(tmp_path: Path):
 
     clade_manifest = (reg / 'clade_manifest.tsv').read_text().strip().splitlines()
     assert clade_manifest[0].startswith('#clade_name\tclade_rank\tphylum\tgraph_path\t')
+    assert '\tfasta_paths\t' in clade_manifest[0]
     assert len(clade_manifest) == len(rows) + 1
+    clade_header = clade_manifest[0].lstrip('#').split('\t')
+    fasta_idx = clade_header.index('fasta_paths')
+    assert all(str(ref) in line.split('\t')[fasta_idx] for line in clade_manifest[1:])
 
 
 def test_hierarchical_query_works_with_external_only_routing_store(tmp_path: Path):
@@ -2130,7 +2188,10 @@ int main() {
     RefSearchCache cache(refIdx);
     auto chosen = select_best_call_per_contig(contigs, candidates, refIdx, cache, o,
                     query_input::QueryMode::ASSEMBLY, "assembly");
-    if (chosen.size() != 1) return 2;
+    // Algorithm now emits all candidates above the minBlockScore floor; we
+    // verify that the priority-scoring winner is the FIRST (highest-scored)
+    // record rather than the only one.
+    if (chosen.empty()) return 2;
     std::cout << chosen[0].type << "\t" << chosen[0].alignmentMode << "\n";
     return 0;
 }
@@ -2182,7 +2243,8 @@ static int run_mode(query_input::QueryMode mode) {
     RefSearchCache cache(refIdx);
     auto chosen = select_best_call_per_contig(contigs, candidates, refIdx, cache, o, mode,
                     mode == query_input::QueryMode::LONG_READS ? "long-reads" : "short-reads");
-    if (chosen.size() != 1) return 2;
+    // Top-scored winner is chosen[0]; other valid candidates may follow.
+    if (chosen.empty()) return 2;
     std::cout << chosen[0].type << "\t" << chosen[0].alignmentMode << "\n";
     return 0;
 }
@@ -2243,7 +2305,8 @@ int main() {
     RefSearchCache cache(refIdx);
     auto chosen = select_best_call_per_contig(contigs, candidates, refIdx, cache, o,
                     query_input::QueryMode::SHORT_READS, "short-reads");
-    if (chosen.size() != 1) return 2;
+    // Top-scored winner is chosen[0]; other valid candidates may follow.
+    if (chosen.empty()) return 2;
     std::cout << chosen[0].type << "\t" << chosen[0].alignmentMode << "\n";
     return 0;
 }

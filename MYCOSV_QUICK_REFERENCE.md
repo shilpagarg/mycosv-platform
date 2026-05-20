@@ -339,12 +339,24 @@ Layer 3 index (1M refs):            ~1–2 GB
 
 ## Output Files
 
+For `--out-prefix PREFIX`, one unified call set is written:
+
 ```
-callset.vcf             # VCF4.3 truth calls (breakpoints)
-callset.truth.vcf       # Truth with annotations
-callset.sv.tsv          # Precision/recall metrics per SV
-callset.log             # Execution log
+PREFIX.hits.tsv         # All SV calls (one per row); alignment_mode column tags origin
+PREFIX.vcf              # Same calls in VCF 4.3 (CLADE, CLADE_RANK, OFFREF, OFF_REF_TIER)
+PREFIX.gfa              # Pangenome graph fragment (graph-native mode only)
+PREFIX.ancestral.tsv    # ToL ancestral-state annotations (optional)
+PREFIX.te_predictions.tsv  # TE classifier output
 ```
+
+**Pangenome- vs single-reference calls share the same files.** Split via the `alignment_mode` column:
+
+| Origin | `alignment_mode` values |
+|---|---|
+| Pangenome (multi-ref / graph-native) | `mem_chain_cached_single_ref_multi`, `..._multi;secondary_seed_rescue`, `graph_native_offref_window` |
+| Single-reference (pairwise) | `mem_chain_cached_single_ref`, `...;secondary_seed_rescue`, `simple_length_fallback`, `simple_offref_fallback`, `reads_mode_kmer_fallback` |
+
+Pangenome rows are additionally identifiable by a non-species `CLADE_RANK` (phylum/class/order/family/genus) emitted by `hierarchical_call_assembly_multirank`.
 
 ---
 

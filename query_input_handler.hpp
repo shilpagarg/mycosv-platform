@@ -95,6 +95,22 @@ inline QueryMode parse_mode(const std::string& s) {
         "Unknown --query-mode '" + s + "'. Valid: assembly, long-reads, short-reads");
 }
 
+inline std::string sample_name_from_path(const std::string& path) {
+    std::string name = fs::path(path).stem().string();
+    const size_t dot = name.rfind('.');
+    if (dot != std::string::npos && dot + 1 < name.size()) {
+        bool numericSuffix = true;
+        for (size_t i = dot + 1; i < name.size(); ++i) {
+            if (!std::isdigit(static_cast<unsigned char>(name[i]))) {
+                numericSuffix = false;
+                break;
+            }
+        }
+        if (numericSuffix) name.resize(dot);
+    }
+    return name;
+}
+
 // ----------------------------------------------------------------
 // InputConfig  (filled from CLI Options by the caller)
 // ----------------------------------------------------------------
@@ -109,7 +125,7 @@ struct InputConfig {
     int      srK               = 21;
     uint32_t srMinKmerFreq     = 0;      // 0 = auto from median frequency
     size_t   srMinUnitigLen    = 200;
-    size_t   srMinReadLen      = 50;
+    size_t   srMinReadLen      = 35;
     size_t   srMaxReadLen      = 600;
 
     // Coverage
@@ -821,7 +837,15 @@ long_reads_to_pseudocontigs(const std::vector<RawRead>& reads,
     const size_t N = reads.size();
     if (N == 0) return {};
     const size_t maxAnchorsPerRead = 96;
-    const size_t maxClusterReadsForConsensus = 128;
+    const bool largeBatch = N > 20000;
+    const size_t maxClusterReadsForConsensus = largeBatch ? 32 : 128;
+    const size_t maxPseudoContigs = largeBatch ? 5000 : std::numeric_limits<size_t>::max();
+    struct Candidate {
+        std::string name;
+        std::string seq;
+        size_t support = 1;
+    };
+    std::vector<Candidate> candidates;
 
     // Step 1: anchor -> read-index multimap
     std::unordered_map<uint64_t, std::vector<uint32_t>> anchorMap;
@@ -859,29 +883,18 @@ long_reads_to_pseudocontigs(const std::vector<RawRead>& reads,
         a = find(a); b = find(b);
         if (a != b) parent[b] = a;
     };
-    auto pair_key = [](uint32_t a, uint32_t b) -> uint64_t {
-        if (a > b) std::swap(a, b);
-        return (static_cast<uint64_t>(a) << 32) | static_cast<uint64_t>(b);
-    };
-    std::unordered_map<uint64_t, uint16_t> sharedAnchorPairs;
-    sharedAnchorPairs.reserve(N * 12);
+    // Directly union reads that share an informative anchor. The previous
+    // pair-count map materialised every read pair for every anchor
+    // (O(sum anchor_degree^2)); public ONT yeast runs spent minutes here
+    // before a single SV was called. Repetitive anchors are still skipped by
+    // the degree cap, so a star-union per anchor preserves the useful
+    // clustering signal without the quadratic pair table.
     for (const auto& kv : anchorMap) {
         const auto& vec = kv.second;
         if (vec.size() < 2 || vec.size() > 200) continue;
-        for (size_t i = 0; i < vec.size(); ++i) {
-            for (size_t j = i + 1; j < vec.size(); ++j) {
-                const uint64_t key = pair_key(vec[i], vec[j]);
-                uint16_t& count = sharedAnchorPairs[key];
-                if (count != std::numeric_limits<uint16_t>::max()) ++count;
-            }
-        }
-    }
-    const uint16_t minSharedAnchors = (anchorK <= 10) ? 2u : 3u;
-    for (const auto& kv : sharedAnchorPairs) {
-        if (kv.second < minSharedAnchors) continue;
-        const uint32_t a = static_cast<uint32_t>(kv.first >> 32);
-        const uint32_t b = static_cast<uint32_t>(kv.first & 0xffffffffu);
-        unite(a, b);
+        const uint32_t root = vec.front();
+        for (size_t i = 1; i < vec.size(); ++i)
+            unite(root, vec[i]);
     }
 
     // Step 3: group by cluster root
@@ -891,13 +904,17 @@ long_reads_to_pseudocontigs(const std::vector<RawRead>& reads,
 
     // Step 4: majority-vote consensus
     static constexpr char BASES[5] = {'A','C','G','T','N'};
-    std::unordered_map<std::string, std::string> out;
     size_t idx = 0;
 
     for (auto& [root, members] : clusters) {
         if (members.size() < minCluster) {
-            if (members.size() == 1 && reads[members[0]].seq.size() >= 100)
-                out["lr_pc" + std::to_string(idx++)] = reads[members[0]].seq;
+            if (members.size() == 1 && reads[members[0]].seq.size() >= 100) {
+                candidates.push_back({
+                    "lr_pc" + std::to_string(idx++),
+                    reads[members[0]].seq,
+                    1,
+                });
+            }
             continue;
         }
 
@@ -923,16 +940,23 @@ long_reads_to_pseudocontigs(const std::vector<RawRead>& reads,
         }
         const size_t overlapMin = std::max<size_t>(
             static_cast<size_t>(std::max(16, anchorK * 3)), 40);
-        auto assembled = greedy_overlap_assemble(
-            memberSeqs, overlapMin, 100, 256, 0.08);
+        // The greedy overlap rescue is intentionally small-batch only. Its
+        // pairwise overlap search is useful for tiny synthetic tests, but on
+        // public 100k-200k long-read subsets it can spend the whole benchmark
+        // timeout before the caller emits any VCF/checkpoint records.
+        auto assembled = largeBatch ? std::vector<std::string>{} :
+            greedy_overlap_assemble(memberSeqs, overlapMin, 100, 256, 0.08);
         size_t longestAssembly = 0;
         for (const auto& seq : assembled)
             longestAssembly = std::max(longestAssembly, seq.size());
         if (!assembled.empty() &&
             (assembled.size() < members.size() || longestAssembly > longestRead)) {
             for (auto& seq : assembled) {
-                out["lr_pc" + std::to_string(idx++) + "_n" + std::to_string(members.size())]
-                    = std::move(seq);
+                candidates.push_back({
+                    "lr_pc" + std::to_string(idx++) + "_n" + std::to_string(members.size()),
+                    std::move(seq),
+                    members.size(),
+                });
             }
             continue;
         }
@@ -974,14 +998,41 @@ long_reads_to_pseudocontigs(const std::vector<RawRead>& reads,
         }
 
         if (consensus.size() >= 100)
-            out["lr_pc" + std::to_string(idx++) + "_n" + std::to_string(members.size())]
-                = std::move(consensus);
+            candidates.push_back({
+                "lr_pc" + std::to_string(idx++) + "_n" + std::to_string(members.size()),
+                std::move(consensus),
+                members.size(),
+            });
     }
 
-    if (!quiet)
+    const size_t beforeCap = candidates.size();
+    if (candidates.size() > maxPseudoContigs) {
+        std::partial_sort(
+            candidates.begin(),
+            candidates.begin() + static_cast<ptrdiff_t>(maxPseudoContigs),
+            candidates.end(),
+            [](const Candidate& a, const Candidate& b) {
+                if (a.support != b.support) return a.support > b.support;
+                if (a.seq.size() != b.seq.size()) return a.seq.size() > b.seq.size();
+                return a.name < b.name;
+            });
+        candidates.resize(maxPseudoContigs);
+    }
+
+    std::unordered_map<std::string, std::string> out;
+    out.reserve(candidates.size());
+    for (auto& c : candidates)
+        out.emplace(std::move(c.name), std::move(c.seq));
+
+    if (!quiet) {
         std::cerr << "[query-input][long-reads] "
                   << N << " reads -> " << clusters.size()
                   << " clusters -> " << out.size() << " pseudo-contigs\n";
+        if (beforeCap > out.size())
+            std::cerr << "[query-input][long-reads] capped pseudo-contigs "
+                      << beforeCap << " -> " << out.size()
+                      << " for large read batch\n";
+    }
     return out;
 }
 
@@ -1000,6 +1051,7 @@ short_reads_to_pseudocontigs(const std::vector<RawRead>& reads,
                               int K,
                               uint32_t minFreq,
                               size_t minUnitigLen,
+                              size_t genomeSizeHint,
                               bool quiet) {
     if (reads.empty()) return {};
     const size_t kSZ = static_cast<size_t>(K);
@@ -1007,7 +1059,7 @@ short_reads_to_pseudocontigs(const std::vector<RawRead>& reads,
     // Step 1: count k-mers using an in-place sliding window to avoid O(k) per-k-mer
     // string allocation.  The canonical form (lex min of fwd/rc) is computed in-place.
     std::unordered_map<std::string, uint32_t> kmerCount;
-    const size_t sampleCap = std::min(reads.size(), static_cast<size_t>(120000));
+    const size_t sampleCap = reads.size();
 
     // Pre-allocate two string buffers reused across all k-mers
     std::string fwdBuf(kSZ, 'A'), rcBuf(kSZ, 'A');
@@ -1050,8 +1102,15 @@ short_reads_to_pseudocontigs(const std::vector<RawRead>& reads,
                       << " -> minFreq=" << minFreq << '\n';
     }
 
-    // Step 3: filter solid k-mers; cap at 3M to avoid O(N^2)
-    const size_t kMaxSolid = 800000;
+    // Step 3: filter solid k-mers. This cap must scale with the genome: a
+    // fixed 800k ceiling is smaller than the unique k-mer space of even a
+    // compact 12 Mb yeast genome and collapses the assembly graph before SV
+    // calling. Bound it by genome size when known, while retaining a finite
+    // memory safety net for very large read sets.
+    const size_t kMaxSolid = std::min<size_t>(
+        static_cast<size_t>(12000000),
+        std::max<size_t>(static_cast<size_t>(800000),
+                         genomeSizeHint > 0 ? genomeSizeHint / 3 : reads.size() * 40));
     std::unordered_map<std::string, uint32_t> solid;
     solid.reserve(kmerCount.size() / 2 + 1);
     for (auto& kv : kmerCount)
@@ -1151,7 +1210,7 @@ prepare_query(const std::string& path,
               bool autoDetect = true,
               bool quiet = false) {
     PreparedQuery result;
-    result.sampleName = fs::path(path).stem().string();
+    result.sampleName = sample_name_from_path(path);
 
     const size_t maxLoad = cfg.maxReadsPerFile > 0
                          ? cfg.maxReadsPerFile
@@ -1255,7 +1314,8 @@ prepare_query(const std::string& path,
             filtered = detail::coverage_downsample_reads(
                 std::move(filtered), modeHint, tuned.cfg.genomeSizeHint, quiet, dropped);
             result.contigs = detail::short_reads_to_pseudocontigs(
-                filtered, tuned.cfg.srK, tuned.cfg.srMinKmerFreq, tuned.cfg.srMinUnitigLen, quiet);
+                filtered, tuned.cfg.srK, tuned.cfg.srMinKmerFreq,
+                tuned.cfg.srMinUnitigLen, tuned.cfg.genomeSizeHint, quiet);
             // Filter unitigs by minimum k-mer frequency support (_mf<N> in name)
             if (!result.contigs.empty()) {
                 const uint32_t minMf = (tuned.preReport.coverageTier == CoverageTier::LOW) ? 2u : 3u;

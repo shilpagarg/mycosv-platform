@@ -289,7 +289,7 @@ inline CladeCentroid make_query_centroid_for_routing(std::string_view seq,
         static_cast<uint64_t>(densityThresh * std::ldexp(1.0, 64) - 1.0);
     CladeCentroid qc;
     qc.cladeName = "query";
-    auto smers = BaseBlockSegmenter::syncmers(seq, sp.k, sp.s);
+    auto smers = BaseBlockSegmenter::syncmers(seq, sp.k, sp.s, sp.t);
     for (const auto& [pos, h] : smers)
         if (h && h <= thresh) qc.centroidHashes.push_back(h);
     std::sort(qc.centroidHashes.begin(), qc.centroidHashes.end());

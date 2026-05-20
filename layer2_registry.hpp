@@ -83,6 +83,7 @@ struct CladeDescriptor {
     size_t              genomeCount    = 0;
     size_t              svBubbles      = 0;
     size_t              compressedBytes= 0;
+    std::vector<std::string> fastaPaths;
     uint32_t            crc32          = 0;
     std::vector<uint64_t> centroidSyncmers;
 };
@@ -96,11 +97,16 @@ inline void save_manifest(const std::vector<CladeDescriptor>& clades,
         std::ofstream out(tmp);
         if (!out) throw std::runtime_error("Cannot write manifest: " + tmp);
         out << "#clade_name\tclade_rank\tphylum\tgraph_path\tgenome_count"
-               "\tsv_bubbles\tcompressed_bytes\tcrc32\tcentroid_hashes\n";
+               "\tsv_bubbles\tcompressed_bytes\tfasta_paths\tcrc32\tcentroid_hashes\n";
         for (const auto& c : clades) {
             out << c.cladeName << '\t' << c.cladeRank << '\t' << c.phylum << '\t'
                 << c.graphPath << '\t' << c.genomeCount << '\t' << c.svBubbles << '\t'
-                << c.compressedBytes << '\t' << c.crc32 << '\t';
+                << c.compressedBytes << '\t';
+            for (size_t i = 0; i < c.fastaPaths.size(); ++i) {
+                if (i) out << ',';
+                out << c.fastaPaths[i];
+            }
+            out << '\t' << c.crc32 << '\t';
             for (size_t i = 0; i < c.centroidSyncmers.size(); ++i) {
                 if (i) out << ',';
                 out << c.centroidSyncmers[i];
@@ -116,24 +122,74 @@ inline std::vector<CladeDescriptor> load_manifest(const std::string& path) {
     if (!in) throw std::runtime_error("Cannot read manifest: " + path);
     std::vector<CladeDescriptor> out;
     std::string line;
+    std::unordered_map<std::string, size_t> col;
     while (std::getline(in, line)) {
-        if (line.empty() || line[0] == '#') continue;
-        std::istringstream ss(line);
+        if (line.empty()) continue;
+        if (line[0] == '#') {
+            std::string header = line.substr(1);
+            std::istringstream hs(header);
+            std::string name;
+            size_t idx = 0;
+            while (std::getline(hs, name, '\t')) col[name] = idx++;
+            continue;
+        }
+        std::vector<std::string> cols;
+        std::istringstream ls(line);
+        std::string cell;
+        while (std::getline(ls, cell, '\t')) {
+            // Bug 5 fix: strip CR from CRLF-encoded manifests so the last cell
+            // (typically the fasta_paths or centroid_hashes column on the very
+            // last line of a CRLF manifest) doesn't keep a trailing '\r' that
+            // breaks fs::exists() downstream.
+            if (!cell.empty() && cell.back() == '\r') cell.pop_back();
+            cols.push_back(std::move(cell));
+        }
+        if (cols.size() < 7) continue;
+        auto get = [&](const std::string& name, size_t fallback) -> std::string {
+            auto it = col.find(name);
+            const size_t idx = (it == col.end()) ? fallback : it->second;
+            return idx < cols.size() ? cols[idx] : std::string();
+        };
         CladeDescriptor c;
-        std::string hashes;
-        std::getline(ss, c.cladeName,       '\t');
-        std::getline(ss, c.cladeRank,       '\t');
-        std::getline(ss, c.phylum,          '\t');
-        std::getline(ss, c.graphPath,       '\t');
-        ss >> c.genomeCount;     ss.ignore();
-        ss >> c.svBubbles;       ss.ignore();
-        ss >> c.compressedBytes; ss.ignore();
-        ss >> c.crc32;           ss.ignore();
-        std::getline(ss, hashes, '\n');
+        c.cladeName = get("clade_name", 0);
+        c.cladeRank = get("clade_rank", 1);
+        c.phylum = get("phylum", 2);
+        c.graphPath = get("graph_path", 3);
+        try { c.genomeCount = static_cast<size_t>(std::stoull(get("genome_count", 4))); }
+        catch (...) { c.genomeCount = 0; }
+        try { c.svBubbles = static_cast<size_t>(std::stoull(get("sv_bubbles", 5))); }
+        catch (...) { c.svBubbles = 0; }
+        try { c.compressedBytes = static_cast<size_t>(std::stoull(get("compressed_bytes", 6))); }
+        catch (...) { c.compressedBytes = 0; }
+
+        const std::string fastaCol = get("fasta_paths", SIZE_MAX);
+        if (!fastaCol.empty()) {
+            std::istringstream fp(fastaCol);
+            std::string path;
+            while (std::getline(fp, path, ',')) {
+                // Bug 5 fix: defensive CR strip in case the cell-level strip
+                // above somehow missed it (e.g., embedded CR mid-list).
+                if (!path.empty() && path.back() == '\r') path.pop_back();
+                if (!path.empty()) c.fastaPaths.push_back(std::move(path));
+            }
+            try { c.crc32 = static_cast<uint32_t>(std::stoul(get("crc32", 8))); }
+            catch (...) { c.crc32 = 0; }
+        } else {
+            // Backward compatibility with manifests written before the
+            // fasta_paths column existed: column 7 was crc32. Also avoid
+            // treating the short-lived broken schema's CRC field as a FASTA
+            // path; callers recover paths from hierarchy_manifest.tsv.
+            try { c.crc32 = static_cast<uint32_t>(std::stoul(get("crc32", 7))); }
+            catch (...) { c.crc32 = 0; }
+        }
+        std::string hashes = get("centroid_hashes", col.find("fasta_paths") == col.end() ? 8 : 9);
         std::istringstream hs(hashes);
         std::string tok;
         while (std::getline(hs, tok, ','))
-            if (!tok.empty()) c.centroidSyncmers.push_back(std::stoull(tok));
+            if (!tok.empty()) {
+                try { c.centroidSyncmers.push_back(std::stoull(tok)); }
+                catch (...) {}
+            }
         out.push_back(std::move(c));
     }
     return out;

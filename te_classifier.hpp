@@ -107,7 +107,11 @@ inline std::string centroid_key(const TELabel& lbl) {
 
 // =========================================================================
 // K-mer hashing (FNV-1a 64-bit, canonical k-mer)
-// Used because BaseBlockSegmenter::syncmers() is a compile-time stub.
+// TE classification uses FracMin sketching rather than syncmer seeding:
+// FracMin keeps all k-mer hashes ≤ p·2^64 which gives a denser, density-
+// controlled sketch suited to short TE elements (~500 bp), whereas the
+// Hong-Buhler syncmer in BaseBlockSegmenter::syncmers is optimised for
+// long-genome routing centroids.
 // =========================================================================
 inline uint64_t fnv1a_64(const char* data, size_t len) {
     uint64_t h = 14695981039346656037ULL;

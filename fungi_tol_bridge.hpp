@@ -43,6 +43,7 @@
 #include <ext/stdio_filebuf.h>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <iomanip>
 #include <iostream>
 #include <limits>
@@ -53,6 +54,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
@@ -261,11 +263,20 @@ inline std::string sanitize_filename(const std::string& s) {
 }
 
 // ── split_tab / split_csv ─────────────────────────────────────────────────
+// Bug 5 fix: registry manifests written with CRLF line endings (clade_manifest.tsv
+// in the million_real prepared dir is one such file) put a stray '\r' on the
+// last cell of every line. fs::exists() on those paths returns false because
+// the OS looks for "...fna.gz\r" which doesn't exist — every hierarchical-call
+// reference ref was silently dropped, leaving only OFF_REF whole-contig calls.
+// Strip the trailing CR here so every downstream caller sees clean cells.
 inline std::vector<std::string> split_tab(const std::string& line) {
     std::vector<std::string> out;
     std::string cur;
     std::istringstream ss(line);
-    while (std::getline(ss, cur, '\t')) out.push_back(cur);
+    while (std::getline(ss, cur, '\t')) {
+        if (!cur.empty() && cur.back() == '\r') cur.pop_back();
+        out.push_back(std::move(cur));
+    }
     return out;
 }
 
@@ -273,8 +284,10 @@ inline std::vector<std::string> split_csv(const std::string& s) {
     std::vector<std::string> out;
     std::string cur;
     std::istringstream ss(s);
-    while (std::getline(ss, cur, ','))
-        if (!cur.empty()) out.push_back(cur);
+    while (std::getline(ss, cur, ',')) {
+        if (!cur.empty() && cur.back() == '\r') cur.pop_back();
+        if (!cur.empty()) out.push_back(std::move(cur));
+    }
     return out;
 }
 
@@ -318,7 +331,7 @@ inline uint64_t fnv1a_kmer(const char* p, int k) {
 }
 } // namespace detail
 
-inline std::unordered_set<uint64_t> kmer_hashes(const std::string& seq, int k) {
+inline std::unordered_set<uint64_t> kmer_hashes(std::string_view seq, int k) {
     std::unordered_set<uint64_t> out;
     if (k <= 0 || static_cast<int>(seq.size()) < k) return out;
     const size_t nKmers = seq.size() - static_cast<size_t>(k) + 1;
@@ -335,6 +348,10 @@ inline std::unordered_set<uint64_t> kmer_hashes(const std::string& seq, int k) {
         out.insert(detail::fnv1a_kmer(seq.data() + last, k));
     }
     return out;
+}
+
+inline std::unordered_set<uint64_t> kmer_hashes(const std::string& seq, int k) {
+    return kmer_hashes(std::string_view(seq.data(), seq.size()), k);
 }
 
 // k-mer Jaccard similarity: |A ∩ B| / |A ∪ B|.
@@ -362,6 +379,21 @@ inline double kmer_overlap_fraction(const std::string& a, const std::string& b, 
     return uni == 0 ? 0.0 : static_cast<double>(inter) / static_cast<double>(uni);
 }
 
+inline double kmer_best_containment_fraction(const std::string& a, const std::string& b, int k) {
+    auto ha = kmer_hashes(a, k);
+    auto hb = kmer_hashes(b, k);
+    if (ha.empty() || hb.empty()) return 0.0;
+    const auto* small = &ha;
+    const auto* big   = &hb;
+    if (small->size() > big->size()) std::swap(small, big);
+    size_t inter = 0;
+    for (uint64_t h : *small)
+        if (big->count(h)) ++inter;
+    const double aContain = static_cast<double>(inter) / static_cast<double>(ha.size());
+    const double bContain = static_cast<double>(inter) / static_cast<double>(hb.size());
+    return std::max(aContain, bContain);
+}
+
 // Retained for ABI compat; delegates to the hash-based version.
 inline std::unordered_set<std::string> kmers(const std::string& seq, int k) {
     std::unordered_set<std::string> out;
@@ -372,7 +404,7 @@ inline std::unordered_set<std::string> kmers(const std::string& seq, int k) {
     return out;
 }
 
-inline bool is_low_complexity_sequence(const std::string& seq) {
+inline bool is_low_complexity_sequence(std::string_view seq) {
     if (seq.size() < 5u) return true;
     std::unordered_set<char> alphabet;
     for (char ch : seq)
@@ -380,9 +412,20 @@ inline bool is_low_complexity_sequence(const std::string& seq) {
             alphabet.insert(static_cast<char>(
                 std::toupper(static_cast<unsigned char>(ch))));
     if (alphabet.size() <= 1) return true;
-    // Fast path: use hash-based 5-mer set
+    // Algorithmic fix: was `ks.size() <= 1` (rejects only pure homopolymer
+    // but conflates with 2-base alternations). Tightened to reject pure
+    // homopolymer and very-low-diversity 5-mer profiles, but kept low
+    // enough that AT-rich STARSHIP hulls (typically 6–30 distinct 5-mers
+    // per 500 bp window) and TE termini pass. The previous test (≤ 1)
+    // missed clean homopolymer blends like 'AAAA…TTTT…'; the new floor
+    // (< 4) catches those without flagging real low-diversity-but-
+    // informative sequence.
     auto ks = kmer_hashes(seq, 5);
-    return ks.size() <= 1;
+    return ks.size() < 4;
+}
+
+inline bool is_low_complexity_sequence(const std::string& seq) {
+    return is_low_complexity_sequence(std::string_view(seq.data(), seq.size()));
 }
 
 inline std::string infer_novelty_tier(double overlapFraction) {
@@ -401,19 +444,39 @@ public:
         if (!fs::exists(manifest)) return;
         std::ifstream in(manifest);
         std::string line;
+        std::unordered_map<std::string, size_t> col;
         while (std::getline(in, line)) {
-            if (line.empty() || line[0] == '#') continue;
+            if (line.empty()) continue;
+            if (line[0] == '#') {
+                auto header = split_tab(line.substr(1));
+                for (size_t i = 0; i < header.size(); ++i) col[header[i]] = i;
+                continue;
+            }
             auto cols = split_tab(line);
             if (cols.size() < 7) continue;
             CladeGraphDescriptor d;
-            d.cladeName      = cols[0];
-            d.cladeRank      = cols[1];
-            d.phylum         = cols[2];
-            d.graphPath      = cols[3];
-            d.genomeCount    = static_cast<size_t>(std::stoull(cols[4]));
-            d.svBubbles      = static_cast<size_t>(std::stoull(cols[5]));
-            d.compressedBytes= static_cast<size_t>(std::stoull(cols[6]));
-            if (cols.size() >= 8) d.fastaPaths = split_csv(cols[7]);
+            auto get = [&](const std::string& name, size_t fallback) -> std::string {
+                auto it = col.find(name);
+                const size_t idx = (it == col.end()) ? fallback : it->second;
+                return idx < cols.size() ? cols[idx] : std::string();
+            };
+            d.cladeName       = get("clade_name", 0);
+            d.cladeRank       = get("clade_rank", 1);
+            d.phylum          = get("phylum", 2);
+            d.graphPath       = get("graph_path", 3);
+            d.genomeCount     = static_cast<size_t>(std::stoull(get("genome_count", 4)));
+            d.svBubbles       = static_cast<size_t>(std::stoull(get("sv_bubbles", 5)));
+            d.compressedBytes = static_cast<size_t>(std::stoull(get("compressed_bytes", 6)));
+            const std::string fastaCol = get("fasta_paths", SIZE_MAX);
+            if (!fastaCol.empty()) d.fastaPaths = split_csv(fastaCol);
+            // Compatibility with a short-lived broken schema: older manifests
+            // had no fasta_paths column, so cols[7] was crc32. Treat that as
+            // metadata rather than a path; otherwise TolGlobal tried to open
+            // the CRC as a FASTA filename and loaded zero reference sequence.
+            if (d.fastaPaths.empty() && cols.size() >= 8 && col.find("fasta_paths") == col.end()
+                && cols[7].find('/') != std::string::npos) {
+                d.fastaPaths = split_csv(cols[7]);
+            }
             descs_.push_back(std::move(d));
         }
     }
@@ -746,6 +809,47 @@ inline std::string resolve_manifest_row_asm_name(const ManifestRow& r) {
     if (!r.asmName.empty()) return r.asmName;
     if (!r.fastaPath.empty()) return fs::path(r.fastaPath).stem().string();
     return "unknown";
+}
+
+inline std::vector<std::string> collect_unique_fasta_paths_from_shard(const std::string& shardPath) {
+    std::vector<std::string> paths;
+    std::unordered_set<std::string> seen;
+    for_each_manifest_row(shardPath, [&](const ManifestRow& r) {
+        if (r.fastaPath.empty()) return;
+        if (seen.insert(r.fastaPath).second) paths.push_back(r.fastaPath);
+    });
+    return paths;
+}
+
+inline void recover_descriptor_fasta_paths_from_hierarchy_manifest(
+        std::vector<CladeGraphDescriptor>& descs,
+        const fs::path& hierarchyManifest) {
+    if (descs.empty() || !fs::exists(hierarchyManifest)) return;
+    bool needsRecovery = false;
+    for (const auto& d : descs) {
+        if (d.fastaPaths.empty()) {
+            needsRecovery = true;
+            break;
+        }
+    }
+    if (!needsRecovery) return;
+
+    std::unordered_map<std::string, std::vector<std::string>> byRankClade;
+    std::unordered_map<std::string, std::unordered_set<std::string>> seen;
+    for_each_manifest_row(hierarchyManifest.string(), [&](const ManifestRow& r) {
+        for (const auto& target : build_targets_for_manifest_row(r, true)) {
+            if (r.fastaPath.empty()) continue;
+            const std::string key = target.cladeRank + "||" + target.cladeName;
+            if (seen[key].insert(r.fastaPath).second)
+                byRankClade[key].push_back(r.fastaPath);
+        }
+    });
+    for (auto& d : descs) {
+        if (!d.fastaPaths.empty()) continue;
+        const std::string key = d.cladeRank + "||" + d.cladeName;
+        auto it = byRankClade.find(key);
+        if (it != byRankClade.end()) d.fastaPaths = it->second;
+    }
 }
 
 inline std::string cached_seed_sequence_for_build(
@@ -1143,6 +1247,7 @@ inline BuiltShardArtifacts build_single_manifest_shard(
     built.desc.genomeCount = d.genomeCount;
     built.desc.svBubbles = d.svBubbles;
     built.desc.compressedBytes = d.compressedBytes;
+    built.desc.fastaPaths = collect_unique_fasta_paths_from_shard(shard.shardPath);
     built.desc.crc32 = crc32_file(d.graphPath);
     built.desc.centroidSyncmers = centroid;
 
@@ -1353,12 +1458,17 @@ public:
     void init(const std::string& indexDir,
               const std::string& registryDir,
               size_t /*cacheBytes*/,
-              size_t /*cacheEntries*/) {
+              size_t /*cacheEntries*/,
+              const std::unordered_set<std::string>* allowedFastaPaths = nullptr) {
         std::lock_guard<std::mutex> lk(mu_);
         indexDir_    = indexDir;
         registryDir_ = registryDir;
         registry_    = ManifestRegistry(registryDir_);
         registry_.load_from_disk();
+        auto registryDescriptors = registry_.descriptors();
+        recover_descriptor_fasta_paths_from_hierarchy_manifest(
+            registryDescriptors,
+            fs::path(registryDir_).parent_path() / "hierarchy_manifest.tsv");
         refsByContig_.clear();
         allRefs_.clear();
         seenFasta_.clear();
@@ -1439,9 +1549,25 @@ public:
         // seen key = fasta + "||" + contig + "||" + cladeName
         std::unordered_set<std::string> seenFastaContigClade;
 
-        for (const auto& d : registry_.descriptors()) {
+        const bool debugTolInit = std::getenv("MYCOSV_DEBUG_HIER") != nullptr;
+        size_t dbg_descs = 0, dbg_fastas_seen = 0, dbg_skipped_missing = 0,
+               dbg_skipped_allowlist = 0, dbg_loaded = 0, dbg_load_threw = 0;
+        if (debugTolInit) {
+            std::cerr << "[tol-init-dbg] descriptors=" << registryDescriptors.size()
+                      << " allowed=" << (allowedFastaPaths ? allowedFastaPaths->size() : 0)
+                      << "\n";
+        }
+
+        for (const auto& d : registryDescriptors) {
+            ++dbg_descs;
             for (const auto& fasta : d.fastaPaths) {
-                if (fasta.empty() || !fs::exists(fasta)) continue;
+                ++dbg_fastas_seen;
+                if (fasta.empty() || !fs::exists(fasta)) { ++dbg_skipped_missing; continue; }
+                if (allowedFastaPaths != nullptr &&
+                    allowedFastaPaths->find(fasta) == allowedFastaPaths->end()) {
+                    ++dbg_skipped_allowlist;
+                    continue;
+                }
                 try {
                     // Load sequences for this FASTA once; reuse on subsequent calls.
                     if (fastaContigSeq.find(fasta) == fastaContigSeq.end()) {
@@ -1449,6 +1575,7 @@ public:
                         auto& pool = fastaContigSeq[fasta];
                         for (auto& kv : contigs)
                             pool[kv.first] = std::make_shared<std::string>(std::move(kv.second));
+                        ++dbg_loaded;
                     }
                     const auto& pool    = fastaContigSeq.at(fasta);
                     const std::string asmName = fs::path(fasta).stem().string();
@@ -1468,7 +1595,37 @@ public:
                         refsByContig_[kv.first].push_back(r);
                         allRefs_.push_back(std::move(r));
                     }
-                } catch (...) {}
+                } catch (...) { ++dbg_load_threw; }
+            }
+        }
+        if (debugTolInit) {
+            std::cerr << "[tol-init-dbg] descs_visited=" << dbg_descs
+                      << " fastas_seen=" << dbg_fastas_seen
+                      << " skipped_missing=" << dbg_skipped_missing
+                      << " skipped_allowlist=" << dbg_skipped_allowlist
+                      << " fastas_loaded=" << dbg_loaded
+                      << " load_threw=" << dbg_load_threw
+                      << " allRefs_=" << allRefs_.size()
+                      << " refsByContig_=" << refsByContig_.size()
+                      << "\n";
+            // Show first 5 descriptors with at least 1 fastaPath and the path itself
+            size_t shown = 0;
+            for (const auto& d : registryDescriptors) {
+                if (shown >= 5) break;
+                if (d.fastaPaths.empty()) continue;
+                std::cerr << "[tol-init-dbg]   desc clade=" << d.cladeName
+                          << " rank=" << d.cladeRank
+                          << " nFastas=" << d.fastaPaths.size()
+                          << " first=" << d.fastaPaths.front() << "\n";
+                ++shown;
+            }
+            if (allowedFastaPaths && !allowedFastaPaths->empty()) {
+                size_t shown2 = 0;
+                for (const auto& p : *allowedFastaPaths) {
+                    if (shown2 >= 3) break;
+                    std::cerr << "[tol-init-dbg]   allowed[" << shown2 << "]=" << p << "\n";
+                    ++shown2;
+                }
             }
         }
         initialized_ = true;
@@ -1480,6 +1637,20 @@ public:
     const ManifestRegistry&    registry()                                           const { return registry_;    }
     bool has_routing_index() const { return routingCladeCount_ > 0; }
 
+    // Synthetic decoy centroids written by augment_routing_store() in the
+    // million-real flow carry these prefixes. They have random 64-bit hashes
+    // and no backing FASTA — if a decoy wins a routing top-K slot by a
+    // coincidental hash collision (small Jaccard denominator inflates ratio),
+    // that slot is wasted and effective real-clade coverage shrinks. We strip
+    // them here AND request extra slots upstream so the post-filter still
+    // returns topK real candidates when decoys polluted the raw top-K.
+    static bool is_decoy_clade_name(const std::string& n) {
+        return n.rfind("decoy_clade_", 0) == 0;
+    }
+    static bool is_decoy_phylum_name(const std::string& p) {
+        return p.rfind("DecoyPhylum_", 0) == 0;
+    }
+
     std::vector<std::string> route_query_to_clades(std::string_view seq,
                                                    const SyncmerParams& sp,
                                                    const SyncmerParams& fbSp,
@@ -1487,20 +1658,47 @@ public:
                                                    size_t topK) const {
         std::vector<std::string> out;
         if (routingCladeCount_ == 0 || seq.empty()) return out;
+        auto bounded_route_view = [](std::string_view s) -> std::string {
+            constexpr size_t kMaxRouteBp = 1500000;
+            constexpr size_t kRouteWindowBp = 500000;
+            if (s.size() <= kMaxRouteBp) return std::string(s);
+            std::string bounded;
+            bounded.reserve(kMaxRouteBp);
+            bounded.append(s.substr(0, kRouteWindowBp));
+            const size_t mid = s.size() / 2;
+            const size_t midStart = mid > kRouteWindowBp / 2 ? mid - kRouteWindowBp / 2 : 0;
+            bounded.append(s.substr(midStart, std::min(kRouteWindowBp, s.size() - midStart)));
+            const size_t tailStart = s.size() > kRouteWindowBp ? s.size() - kRouteWindowBp : 0;
+            bounded.append(s.substr(tailStart));
+            return bounded;
+        };
+        const std::string routeSeq = bounded_route_view(seq);
+        const std::string_view routeView(routeSeq.data(), routeSeq.size());
+
+        // Over-fetch when the external store is in play so the real-clade
+        // floor still meets topK after decoys are filtered. 4× headroom
+        // matches the worst-case decoy contamination we've seen in routing
+        // probes on the 1M-centroid store.
+        const size_t fetchK = (externalCentroidStore_ != nullptr) ? topK * 4 : topK;
 
         std::vector<RouteResult> results;
         if (!preferExternalRouting_)
-            results = router_.route(seq, sp, fbSp, density, topK);
+            results = router_.route(routeView, sp, fbSp, density, fetchK);
         if ((results.empty() || preferExternalRouting_) && externalCentroidStore_ != nullptr) {
-            auto qc = make_query_centroid_for_routing(seq, sp, density);
-            auto ext = externalCentroidStore_->query_topk_streaming(qc, topK);
+            auto qc = make_query_centroid_for_routing(routeView, sp, density);
+            auto ext = externalCentroidStore_->query_topk_streaming(qc, fetchK);
             results.reserve(ext.size());
             for (auto& r : ext)
                 results.push_back({r.cladeName, r.phylum, r.jaccard});
         }
-        out.reserve(results.size());
-        for (const auto& r : results)
-            if (!r.cladeName.empty()) out.push_back(r.cladeName);
+        out.reserve(std::min(topK, results.size()));
+        for (const auto& r : results) {
+            if (out.size() >= topK) break;
+            if (r.cladeName.empty()) continue;
+            if (is_decoy_clade_name(r.cladeName)) continue;
+            if (is_decoy_phylum_name(r.phylum)) continue;
+            out.push_back(r.cladeName);
+        }
         return out;
     }
 
@@ -1531,8 +1729,10 @@ public:
         return inst;
     }
     void init(const std::string& indexDir, const std::string& registryDir,
-              size_t cacheBytes, size_t cacheEntries) {
-        TolGlobal::instance().init(indexDir, registryDir, cacheBytes, cacheEntries);
+              size_t cacheBytes, size_t cacheEntries,
+              const std::unordered_set<std::string>* allowedFastaPaths = nullptr) {
+        TolGlobal::instance().init(indexDir, registryDir, cacheBytes, cacheEntries,
+                                   allowedFastaPaths);
         initialized_ = true;
     }
     bool is_initialized() const { return initialized_; }
@@ -1556,6 +1756,191 @@ inline int parse_pseudocontig_support(const std::string& name) {
         }
     }
     return -1;
+}
+
+inline bool is_reads_pseudocontig_name(const std::string& name) {
+    return name.find("_mf") != std::string::npos ||
+           name.find("_n")  != std::string::npos ||
+           name.rfind("sr_unitig", 0) == 0 ||
+           name.rfind("lr_pc", 0) == 0;
+}
+
+inline std::string refseq_sequence_cache_key(const TolGlobal::RefSeq* r,
+                                             int k,
+                                             size_t sampleLimit) {
+    if (r == nullptr) return {};
+    std::string key;
+    key.reserve(r->asmName.size() + r->contig.size() + 48);
+    key += r->asmName;
+    key.push_back('\x1f');
+    key += r->contig;
+    key.push_back('\x1f');
+    key += std::to_string(k);
+    key.push_back('\x1f');
+    key += std::to_string(sampleLimit);
+    return key;
+}
+
+inline std::shared_ptr<const std::vector<uint64_t>>
+sampled_ref_hashes_cached(const TolGlobal::RefSeq* r,
+                          int k,
+                          size_t sampleLimit) {
+    static const auto empty = std::make_shared<const std::vector<uint64_t>>();
+    if (r == nullptr || !r->has_seq() || k <= 0 || sampleLimit == 0) return empty;
+    const std::string key = refseq_sequence_cache_key(r, k, sampleLimit);
+    static std::mutex mu;
+    static std::unordered_map<std::string, std::shared_ptr<const std::vector<uint64_t>>> cache;
+    static std::deque<std::string> insertionOrder;
+    constexpr size_t kMaxCachedRefSketches = 8192;
+    {
+        std::lock_guard<std::mutex> lk(mu);
+        auto it = cache.find(key);
+        if (it != cache.end()) return it->second;
+    }
+
+    std::vector<uint64_t> hashes;
+    const std::string& refSeq = r->seq();
+    if (refSeq.size() >= static_cast<size_t>(k)) {
+        const size_t nKmers = refSeq.size() - static_cast<size_t>(k) + 1;
+        const size_t step = std::max<size_t>(1, (nKmers + sampleLimit - 1) / sampleLimit);
+        hashes.reserve(std::min(nKmers, sampleLimit + 1));
+        for (size_t i = 0; i + static_cast<size_t>(k) <= refSeq.size(); i += step)
+            hashes.push_back(detail::fnv1a_kmer(refSeq.data() + i, k));
+        if (step > 1 && nKmers > 1) {
+            const size_t last = nKmers - 1;
+            hashes.push_back(detail::fnv1a_kmer(refSeq.data() + last, k));
+        }
+        std::sort(hashes.begin(), hashes.end());
+        hashes.erase(std::unique(hashes.begin(), hashes.end()), hashes.end());
+    }
+
+    std::lock_guard<std::mutex> lk(mu);
+    auto it = cache.find(key);
+    if (it != cache.end()) return it->second;
+    auto ptr = std::make_shared<const std::vector<uint64_t>>(std::move(hashes));
+    cache.emplace(key, ptr);
+    insertionOrder.push_back(key);
+    while (cache.size() > kMaxCachedRefSketches && !insertionOrder.empty()) {
+        cache.erase(insertionOrder.front());
+        insertionOrder.pop_front();
+    }
+    return ptr;
+}
+
+inline std::vector<const TolGlobal::RefSeq*>
+top_ref_candidates_for_chaining(const std::string& qSeq,
+                                const std::vector<const TolGlobal::RefSeq*>& refs,
+                                const FederatedOptions& fo) {
+    struct ScoredRef {
+        const TolGlobal::RefSeq* ref = nullptr;
+        double score = 0.0;
+        size_t ordinal = 0;
+    };
+    auto ref_dedupe_key = [](const TolGlobal::RefSeq* r) {
+        std::string key;
+        if (r == nullptr) return key;
+        key.reserve(r->asmName.size() + r->contig.size() + 2);
+        key += r->asmName;
+        key.push_back('\x1f');
+        key += r->contig;
+        return key;
+    };
+    std::vector<const TolGlobal::RefSeq*> uniqueRefs;
+    uniqueRefs.reserve(refs.size());
+    std::unordered_set<std::string> seenRefs;
+    seenRefs.reserve(refs.size());
+    for (const auto* r : refs) {
+        if (r == nullptr || !r->has_seq()) continue;
+        const std::string key = ref_dedupe_key(r);
+        if (seenRefs.insert(key).second) uniqueRefs.push_back(r);
+    }
+
+    std::vector<ScoredRef> scored;
+    scored.reserve(uniqueRefs.size());
+    const int k = std::max(5, std::min(fo.fallbackSketchParams.k > 0
+                                       ? fo.fallbackSketchParams.k : 7, 13));
+    const auto qHashes = kmer_hashes(qSeq, k);
+    if (qHashes.empty()) return {};
+    auto sparse_ref_score = [&](const TolGlobal::RefSeq* r) {
+        constexpr size_t kMaxSparseRefKmers = 2048;
+        const auto refHashesPtr = sampled_ref_hashes_cached(r, k, kMaxSparseRefKmers);
+        const auto& refHashes = *refHashesPtr;
+        if (refHashes.empty()) return 0.0;
+        size_t hits = 0;
+        for (uint64_t h : refHashes)
+            if (qHashes.find(h) != qHashes.end()) ++hits;
+        const double hitFrac = static_cast<double>(hits) / static_cast<double>(refHashes.size());
+        const double qLen = static_cast<double>(std::max<size_t>(1, qSeq.size()));
+        const double rLen = static_cast<double>(std::max<size_t>(1, r ? r->seq().size() : 0));
+        const double lenRatio = std::min(qLen, rLen) / std::max(qLen, rLen);
+        return hitFrac + 0.05 * lenRatio;
+    };
+    size_t ordinal = 0;
+    for (const auto* r : uniqueRefs) {
+        const double ov = sparse_ref_score(r);
+        scored.push_back({r, ov, ordinal++});
+    }
+    std::sort(scored.begin(), scored.end(),
+              [](const ScoredRef& a, const ScoredRef& b) {
+                  if (a.score != b.score) return a.score > b.score;
+                  return a.ordinal < b.ordinal;
+              });
+    const size_t keep = std::min(scored.size(),
+        std::max<size_t>(8, std::min<size_t>(32, fo.routingTopN * 4)));
+    std::vector<const TolGlobal::RefSeq*> out;
+    out.reserve(keep);
+    for (size_t i = 0; i < keep; ++i) out.push_back(scored[i].ref);
+    return out;
+}
+
+inline std::string stable_refseq_key(const TolGlobal::RefSeq* r) {
+    if (r == nullptr) return {};
+    std::string key;
+    key.reserve(r->asmName.size() + r->contig.size() + r->clade.size() +
+                r->cladeRank.size() + 8);
+    key += r->asmName;
+    key.push_back('\x1f');
+    key += r->contig;
+    key.push_back('\x1f');
+    key += r->clade;
+    key.push_back('\x1f');
+    key += r->cladeRank;
+    return key;
+}
+
+inline void refine_local_chain_breakpoint(SvTypeFromChain::Result& r,
+                                          const std::string& qSeq,
+                                          const std::string& refSeq) {
+    using T = SvTypeFromChain::Type;
+    if (qSeq.empty() || refSeq.empty()) return;
+    if (r.type != T::INS && r.type != T::DEL) return;
+    if (r.qBreakStart < 0 || r.rBreakStart < 0) return;
+
+    int q = std::min(r.qBreakStart, static_cast<int>(qSeq.size()));
+    int rp = std::min(r.rBreakStart, static_cast<int>(refSeq.size()));
+
+    // A deliberately small local left-normalization around exact-MEM chain gaps.
+    // It improves repeat-adjacent breakpoint consistency without paying for a
+    // full DP alignment for every candidate in large AMF panels.
+    int shifts = 0;
+    constexpr int kMaxRefineShift = 128;
+    while (q > 0 && rp > 0 && shifts < kMaxRefineShift &&
+           qSeq[static_cast<size_t>(q - 1)] == refSeq[static_cast<size_t>(rp - 1)]) {
+        --q;
+        --rp;
+        ++shifts;
+    }
+    if (shifts == 0) return;
+
+    r.qBreakStart = q;
+    r.rBreakStart = rp;
+    if (r.type == T::INS) {
+        r.qBreakEnd = std::max(r.qBreakStart, r.qBreakEnd - shifts);
+        r.rBreakEnd = r.rBreakStart;
+    } else {
+        r.qBreakEnd = r.qBreakStart;
+        r.rBreakEnd = std::max(r.rBreakStart, r.rBreakEnd - shifts);
+    }
 }
 
 // ── make_insdel_call ──────────────────────────────────────────────────────
@@ -1634,7 +2019,7 @@ inline VariantCallBridge make_offref_call(const std::string& qAsm,
     // Classify element type for GFA EC tag
     const ElementClass ec = seq.empty()
         ? ElementClass::NONE
-        : classify_repeat_element(std::string_view(seq.data(), seq.size()), cladeGc);
+        : classify_repeat_element(std::string_view(seq.data(), seq.size()), cladeGc, v.phylum);
     v.elementClass = element_class_name(ec);
     return v;
 }
@@ -1663,36 +2048,88 @@ discover_graph_native_offref_windows(const std::string& seq,
     const size_t n = seq.size();
     size_t win = minWindowBp;
     if (win == 0) {
+        // Off-ref window floor used to be hard-coded at max(minSvLen, 500), which
+        // masked sub-500 bp novelty events that minigraph/svim_asm easily detect.
+        // Allow windows down to max(minSvLen, 100) — still large enough that random
+        // k-mer overlap is informative but small enough to surface real microSVs.
         win = std::max<size_t>(
             fo.tolMinBlockBp > 0 ? fo.tolMinBlockBp : 0u,
-            static_cast<size_t>(std::max(fo.minSvLen, 500)));
-        win = std::min<size_t>(win, std::max<size_t>(500, std::min<size_t>(n, 5000)));
+            static_cast<size_t>(std::max(fo.minSvLen, 100)));
+        win = std::min<size_t>(win, std::max<size_t>(100, std::min<size_t>(n, 5000)));
     }
     if (n < win) return out;
-    const size_t step = std::max<size_t>(1, win / 2);
+    size_t step = std::max<size_t>(1, win / 2);
+    constexpr size_t kMaxOffRefWindows = 256;
+    if (n > win) {
+        const size_t rawWindows = ((n - win) / step) + 1;
+        if (rawWindows > kMaxOffRefWindows) {
+            step = std::max<size_t>(step, (n - win + kMaxOffRefWindows - 1) / kMaxOffRefWindows);
+        }
+    }
     const int k = std::max(5, std::min(fo.fallbackSketchParams.k > 0 ? fo.fallbackSketchParams.k : 7, 9));
 
+    std::vector<const TolGlobal::RefSeq*> scanRefs;
+    constexpr size_t kMaxOffRefScanRefs = 256;
+    if (refs.size() <= kMaxOffRefScanRefs) {
+        scanRefs.reserve(refs.size());
+        for (const auto& ref : refs)
+            if (ref.has_seq()) scanRefs.push_back(&ref);
+    } else {
+        scanRefs.reserve(kMaxOffRefScanRefs);
+        const size_t stride = std::max<size_t>(1, refs.size() / kMaxOffRefScanRefs);
+        for (size_t i = 0; i < refs.size() && scanRefs.size() < kMaxOffRefScanRefs; i += stride)
+            if (refs[i].has_seq()) scanRefs.push_back(&refs[i]);
+        if (scanRefs.empty()) {
+            for (const auto& ref : refs) {
+                if (!ref.has_seq()) continue;
+                scanRefs.push_back(&ref);
+                if (scanRefs.size() >= kMaxOffRefScanRefs) break;
+            }
+        }
+    }
+
+    auto sparse_window_ref_overlap = [&](const std::unordered_set<uint64_t>& windowHashes,
+                                         const TolGlobal::RefSeq* ref) {
+        if (windowHashes.empty() || ref == nullptr || !ref->has_seq()) return 0.0;
+        constexpr size_t kMaxSparseRefKmers = 1024;
+        const auto refHashesPtr = sampled_ref_hashes_cached(ref, k, kMaxSparseRefKmers);
+        const auto& refHashes = *refHashesPtr;
+        if (refHashes.empty()) return 0.0;
+        size_t hits = 0;
+        for (uint64_t h : refHashes)
+            if (windowHashes.find(h) != windowHashes.end()) ++hits;
+        return static_cast<double>(hits) / static_cast<double>(refHashes.size());
+    };
+
     for (size_t start = 0; start + win <= n; start += step) {
-        const std::string window = seq.substr(start, win);
+        const std::string_view window(seq.data() + start, win);
         if (is_low_complexity_sequence(window)) continue;
+        const auto windowHashes = kmer_hashes(window, k);
         double bestOverlap = 0.0;
         double bestCladeGc = 0.45;
         std::string bestAsm = "OFF_REFERENCE";
         std::string bestRank = ".";
         std::string bestPhylum = ".";
-        for (const auto& ref : refs) {
-            if (!ref.has_seq()) continue;
-            const double ov = kmer_overlap_fraction(window, ref.seq(), k);
+        for (const auto* ref : scanRefs) {
+            if (ref == nullptr || !ref->has_seq()) continue;
+            const double ov = sparse_window_ref_overlap(windowHashes, ref);
             if (ov > bestOverlap) {
                 bestOverlap = ov;
-                bestCladeGc = ref.cladeGc;
-                bestAsm = ref.clade.empty() ? ref.asmName : ref.clade;
-                bestRank = ref.cladeRank.empty() ? "." : ref.cladeRank;
-                bestPhylum = ref.phylum.empty() ? "." : ref.phylum;
+                bestCladeGc = ref->cladeGc;
+                bestAsm = ref->clade.empty() ? ref->asmName : ref->clade;
+                bestRank = ref->cladeRank.empty() ? "." : ref->cladeRank;
+                bestPhylum = ref->phylum.empty() ? "." : ref->phylum;
             }
         }
         const std::string tier = infer_novelty_tier(bestOverlap);
-        if (tier != "NOVEL" && tier != "NOVEL_WEAK" && tier != "DIVERGED") continue;
+        // Algorithmic fix: previously only NOVEL/NOVEL_WEAK/DIVERGED
+        // windows were emitted, but OFF_REF_KNOWN (overlap ≥ 0.20) windows
+        // are *also* SVs in the pangenome sense — they represent reference
+        // segments either missing from the query reference set or present
+        // in a divergent location. Emit them too; downstream tiering still
+        // labels them OFF_REF_KNOWN.
+        if (tier != "NOVEL" && tier != "NOVEL_WEAK" && tier != "DIVERGED" &&
+            tier != "OFF_REF_KNOWN") continue;
         OffRefWindowCall ow;
         ow.start = start;
         ow.end = start + win;
@@ -1702,13 +2139,33 @@ discover_graph_native_offref_windows(const std::string& seq,
         ow.cladeRank = bestRank;
         ow.phylum = bestPhylum;
         ow.tier = tier;
-        ow.elementClass = element_class_name(classify_repeat_element(std::string_view(window.data(), window.size()), bestCladeGc));
+        ow.elementClass = element_class_name(classify_repeat_element(
+            window, bestCladeGc, bestPhylum));
         if (!out.empty() && out.back().tier == ow.tier && out.back().bestAsm == ow.bestAsm && out.back().end >= ow.start) {
             out.back().end = ow.end;
             if (out.back().elementClass == "NONE") out.back().elementClass = ow.elementClass;
         } else {
             out.push_back(std::move(ow));
         }
+    }
+    // NOVEL_WEAK at sparse k-mer sampling (k≤9, ≤1024 ref hashes) is a noise
+    // band: ANY shared low-complexity / homopolymer / common-motif k-mer lands
+    // a random fungal window in 0 < overlap < 0.05. Drop *isolated*
+    // single-window NOVEL_WEAK tiles — they uniformly fill the per-contig
+    // kMaxOffRefWindows=256 cap with SUPPORT=0 BSCORE=8 stubs (3,584 phantom
+    // calls on the F. falciforme vs F. oxysporum benchmark). Genuine
+    // NOVEL_WEAK regions span >1 window and survive merging, so keep those.
+    // NOVEL/DIVERGED/OFF_REF_KNOWN single-window calls are still informative
+    // (overlap==0 or ≥0.05) and pass through unchanged.
+    if (!out.empty()) {
+        std::vector<OffRefWindowCall> kept;
+        kept.reserve(out.size());
+        for (auto& ow : out) {
+            const bool isSingleWindow = (ow.end - ow.start) <= win;
+            if (ow.tier == "NOVEL_WEAK" && isSingleWindow) continue;
+            kept.push_back(std::move(ow));
+        }
+        out.swap(kept);
     }
     return out;
 }
@@ -1746,11 +2203,12 @@ static bool try_mem_chain_call(
     SuffixArray sa;
     std::vector<std::pair<std::string, std::string>> refContigs;
     std::vector<const TolGlobal::RefSeq*> saRefs;
-    refContigs.reserve(refCandidates.size());
-    saRefs.reserve(refCandidates.size());
+    const auto chainRefs = top_ref_candidates_for_chaining(qSeq, refCandidates, fo);
+    refContigs.reserve(chainRefs.size());
+    saRefs.reserve(chainRefs.size());
     const size_t saTextCap = fo.saMaxTextMB > 0 ? fo.saMaxTextMB * 1024 * 1024 : SIZE_MAX;
     size_t saTextAccum = 0;
-    for (const auto* r : refCandidates) {
+    for (const auto* r : chainRefs) {
         if (!r->has_seq()) continue;
         if (saTextAccum + r->seq().size() > saTextCap) continue;
         saTextAccum += r->seq().size();
@@ -1784,6 +2242,11 @@ static bool try_mem_chain_call(
         for (auto& m : fwdMems) { allMems.push_back(m); isRev.push_back(false); }
         for (auto& m : revMems) { allMems.push_back(m); isRev.push_back(true);  }
         if (allMems.empty()) return out;
+        const bool readsPseudo = is_reads_pseudocontig_name(qContig);
+        const bool shortPseudo = readsPseudo && qSeq.size() <= 2000;
+        const double effectiveMinBlockScore = shortPseudo
+            ? std::min(fo.minBlockScore, qSeq.size() <= 300 ? 2.0 : 3.0)
+            : fo.minBlockScore;
 
         std::vector<int> order(allMems.size());
         std::iota(order.begin(), order.end(), 0);
@@ -1829,7 +2292,7 @@ static bool try_mem_chain_call(
         if (chain.empty()) return out;
 
         double bestScore = static_cast<double>(treap.best_chain_score());
-        if (chain.size() < 2 || bestScore < fo.minBlockScore)
+        if (chain.size() < 2 || bestScore < effectiveMinBlockScore)
             return out;
 
         auto res = SvTypeFromChain::classify(chain, chainRev, sa, fo.minSvLen);
@@ -2038,7 +2501,8 @@ static bool try_mem_chain_call(
                 const ElementClass ec = classify_repeat_element(
                     std::string_view(qSeq.data() + teS,
                                      static_cast<size_t>(teE - teS)),
-                    gcBg);
+                    gcBg,
+                    (primaryRef != nullptr) ? primaryRef->phylum : ".");
                 if (ec != ElementClass::NONE)
                     out.call.elementClass = element_class_name(ec);
             }
@@ -2055,7 +2519,8 @@ static bool try_mem_chain_call(
                 const ElementClass ec = classify_repeat_element(
                     std::string_view(refSeq.data() + safeS,
                                      static_cast<size_t>(safeE - safeS)),
-                    gcBg);
+                    gcBg,
+                    primaryRef->phylum);
                 if (ec != ElementClass::NONE)
                     out.call.elementClass = element_class_name(ec);
             }
@@ -2086,6 +2551,796 @@ static bool try_mem_chain_call(
     return true;
 }
 
+// ── multi-ref suffix-array cache ──────────────────────────────────────────
+// try_mem_chain_call_multi builds a SuffixArray over the concatenated top-K
+// reference contigs. The ref set is selected from the query contig's
+// k-mer-similar shortlist, so consecutive query contigs of the *same* genome
+// route to the same (or near-identical) ref set — yet the original code
+// rebuilt the SA from scratch on every call. SuffixArray::build is
+// O(N log^2 N); on chromosome-scale fungal query contigs (~150 contigs across
+// 5 genomes, multi-Mb concatenated ref text each) that per-contig rebuild was
+// the dominant cost after the ChainTreap fix and is why assembly-mode runs
+// blew past the 4 h wall clock.
+//
+// This LRU cache keys a built SA by the exact ordered set of RefSeq pointers
+// that went into it (pointers are stable for the program lifetime). It is a
+// single PROCESS-WIDE cache guarded by a mutex — NOT thread_local: with 8
+// worker threads a 1 GB per-thread cache would need 8 GB, which on top of the
+// SingleRefMemCache budget blows the 12 GiB cgroup cap and the process is
+// OOM-killed mid-write (0-byte VCF). The shared cache is bounded once for the
+// whole process. Returned values are shared_ptr, so a thread keeps its SA
+// alive even if another thread evicts that entry concurrently — only the
+// lookup/insert is serialised, the (expensive) SA *use* is lock-free.
+struct MultiRefSaCache {
+    struct Entry {
+        std::string                   key;
+        std::shared_ptr<SuffixArray>  sa;
+        size_t                        bytes = 0;
+    };
+    std::mutex         mu_;
+    std::vector<Entry> entries_;            // front = most-recently-used
+    size_t             totalBytes_ = 0;
+    // Process-wide budget. SA footprint is ~13 B/char of concatenated ref
+    // text; 2 GiB holds several distinct chromosome-scale ref sets, and the
+    // benchmark access pattern (consecutive query contigs of one genome route
+    // to the same ref set) means even a handful of entries gives a high hit
+    // rate.
+    static constexpr size_t kMaxBytes = static_cast<size_t>(2048) * 1024 * 1024;
+
+    static size_t footprint(const SuffixArray& sa) {
+        // text (1B) + sa/lcp/isa (4B each) per character.
+        return sa.text.size() * (1 + 4 + 4 + 4);
+    }
+
+    std::shared_ptr<SuffixArray>
+    get_or_build(const std::string& key,
+                 const std::vector<std::pair<std::string, std::string>>& refContigs) {
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            for (size_t i = 0; i < entries_.size(); ++i) {
+                if (entries_[i].key == key) {
+                    if (i != 0) std::rotate(entries_.begin(),
+                                            entries_.begin() + static_cast<ptrdiff_t>(i),
+                                            entries_.begin() + static_cast<ptrdiff_t>(i) + 1);
+                    return entries_.front().sa;
+                }
+            }
+        }
+        // Build outside the lock so concurrent threads building *different*
+        // ref sets do not serialise on each other. A duplicate concurrent
+        // build of the same key is harmless — last writer wins, both callers
+        // get a valid SA.
+        auto sa = std::make_shared<SuffixArray>();
+        sa->build(refContigs);
+        const size_t bytes = footprint(*sa);
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            for (size_t i = 0; i < entries_.size(); ++i) {
+                if (entries_[i].key == key) {  // another thread won the race
+                    if (i != 0) std::rotate(entries_.begin(),
+                                            entries_.begin() + static_cast<ptrdiff_t>(i),
+                                            entries_.begin() + static_cast<ptrdiff_t>(i) + 1);
+                    return entries_.front().sa;
+                }
+            }
+            while (!entries_.empty() && totalBytes_ + bytes > kMaxBytes) {
+                totalBytes_ -= entries_.back().bytes;
+                entries_.pop_back();
+            }
+            entries_.insert(entries_.begin(), Entry{key, sa, bytes});
+            totalBytes_ += bytes;
+        }
+        return sa;
+    }
+};
+
+// ── try_mem_chain_call_multi ──────────────────────────────────────────────
+// Multi-emit variant of try_mem_chain_call. Uses SvTypeFromChain::classify_all
+// to extract every per-pair INS/DEL gap inside a MEM chain instead of only the
+// dominant one. On diverged real fungal genomes this is the difference between
+// ~5% recall (single-emit) and capturing the 50–500 small SVs per chain that
+// minigraph/svim_asm/cactus surface from the alignment ops.
+static bool try_mem_chain_call_multi(
+        const std::string& qAsm,
+        const std::string& qContig,
+        const std::string& qSeq,
+        const std::vector<const TolGlobal::RefSeq*>& refCandidates,
+        const FederatedOptions& fo,
+        std::vector<VariantCallBridge>& outCalls) {
+    outCalls.clear();
+    if (refCandidates.empty() || qSeq.empty()) return false;
+
+    std::vector<const TolGlobal::RefSeq*> saRefs;
+    const auto chainRefs = top_ref_candidates_for_chaining(qSeq, refCandidates, fo);
+    saRefs.reserve(chainRefs.size());
+    const size_t saTextCap = fo.saMaxTextMB > 0 ? fo.saMaxTextMB * 1024 * 1024 : SIZE_MAX;
+    size_t saTextAccum = 0;
+    for (const auto* r : chainRefs) {
+        if (!r->has_seq()) continue;
+        if (saTextAccum + r->seq().size() > saTextCap) continue;
+        saTextAccum += r->seq().size();
+        saRefs.push_back(r);
+    }
+    if (saRefs.empty()) return false;
+    // Canonicalise the ref order before keying/concatenating the SA.  Use a
+    // stable biological identity, not RefSeq* addresses: multirank calling
+    // builds temporary rankRefs vectors, so pointer addresses can be reused
+    // for different references and would otherwise return a stale cached SA.
+    std::sort(saRefs.begin(), saRefs.end(),
+              [](const TolGlobal::RefSeq* a, const TolGlobal::RefSeq* b) {
+                  return stable_refseq_key(a) < stable_refseq_key(b);
+              });
+    std::vector<std::pair<std::string, std::string>> refContigs;
+    refContigs.reserve(saRefs.size());
+    std::string saKey;
+    for (const auto* r : saRefs) {
+        refContigs.push_back({ r->contig, r->seq() });
+        saKey += stable_refseq_key(r);
+        saKey += ':';
+    }
+    static MultiRefSaCache saCache;  // process-wide, mutex-guarded
+    std::shared_ptr<SuffixArray> saPtr = saCache.get_or_build(saKey, refContigs);
+    const SuffixArray& sa = *saPtr;
+    const std::string rcSeq = SuffixArray::revcomp(qSeq);
+
+    auto min_mem_from_k = [](int k) {
+        return std::max(15, k - 5);
+    };
+    struct MultiAttempt {
+        std::vector<VariantCallBridge> calls;
+        double score   = 0.0;
+        int    anchors = 0;
+        bool   valid   = false;
+    };
+
+    auto attempt_chain = [&](int minMem, bool secondaryPass) {
+        MultiAttempt out;
+        auto fwdMems = sa.find_mems(qSeq, minMem);
+        auto revMems = sa.find_mems(rcSeq, minMem);
+        for (auto& m : revMems)
+            m.qPos = static_cast<int>(qSeq.size()) - m.qPos - m.len;
+
+        std::vector<SuffixArray::Mem> allMems;
+        std::vector<bool> isRev;
+        allMems.reserve(fwdMems.size() + revMems.size());
+        isRev.reserve(fwdMems.size() + revMems.size());
+        for (auto& m : fwdMems) { allMems.push_back(m); isRev.push_back(false); }
+        for (auto& m : revMems) { allMems.push_back(m); isRev.push_back(true);  }
+        if (allMems.empty()) return out;
+        const bool readsPseudo = is_reads_pseudocontig_name(qContig);
+        const bool shortPseudo = readsPseudo && qSeq.size() <= 2000;
+        const double effectiveMinBlockScore = shortPseudo
+            ? std::min(fo.minBlockScore, qSeq.size() <= 300 ? 2.0 : 3.0)
+            : fo.minBlockScore;
+
+        std::vector<int> order(allMems.size());
+        std::iota(order.begin(), order.end(), 0);
+        std::sort(order.begin(), order.end(),
+                  [&](int a, int b) {
+                      return allMems[static_cast<size_t>(a)].qPos <
+                             allMems[static_cast<size_t>(b)].qPos;
+                  });
+
+        const int maxGap = fo.chainGapBand > 0 ? fo.chainGapBand : 5000;
+        std::unordered_map<uint64_t, size_t> posToMemIdx;
+        posToMemIdx.reserve(allMems.size());
+        for (size_t mi = 0; mi < allMems.size(); ++mi) {
+            uint64_t key = (static_cast<uint64_t>(allMems[mi].qPos) << 32) |
+                           static_cast<uint64_t>(static_cast<uint32_t>(allMems[mi].rPos));
+            posToMemIdx.emplace(key, mi);
+        }
+
+        // ALGORITHMIC FIX (recall): iterative primary-chain extraction.
+        // treap.best_chain_path() returns the highest-SCORING chain — a
+        // single long MEM (score = len) routinely outranks a multi-anchor
+        // chain of shorter MEMs. The previous code returned immediately when
+        // the first chain was a singleton (for non-shortPseudo queries),
+        // throwing away every multi-anchor chain hiding behind it. Now we
+        // skip singleton primaries by marking their MEMs consumed and
+        // rebuilding the treap, until we find a chain with >=2 anchors or
+        // exhaust the score floor.
+        std::vector<bool> primaryConsumed(allMems.size(), false);
+        std::vector<SuffixArray::Mem> chain;
+        std::vector<bool> chainRev;
+        double bestScore = 0.0;
+        bool primaryFound = false;
+        constexpr int kMaxPrimaryAttempts = 32;
+        for (int attempt = 0; attempt < kMaxPrimaryAttempts; ++attempt) {
+            ChainTreap treap;
+            int memsLeft = 0;
+            for (int i : order) {
+                if (primaryConsumed[static_cast<size_t>(i)]) continue;
+                ++memsLeft;
+                const auto& m = allMems[static_cast<size_t>(i)];
+                treap.insert_and_chain(m.qPos, m.rPos, m.len,
+                                       static_cast<float>(m.len), maxGap);
+            }
+            if (memsLeft == 0) break;
+
+            auto chainIdx = treap.best_chain_path();
+            if (chainIdx.empty()) break;
+
+            const double curScore = static_cast<double>(treap.best_chain_score());
+            if (curScore < effectiveMinBlockScore) break;
+
+            chain.clear();
+            chainRev.clear();
+            chain.reserve(chainIdx.size());
+            chainRev.reserve(chainIdx.size());
+            std::vector<size_t> chainMemIdx;
+            chainMemIdx.reserve(chainIdx.size());
+            for (int ni : chainIdx) {
+                const auto& nd = treap.nodes_[static_cast<size_t>(ni)];
+                uint64_t key = (static_cast<uint64_t>(nd.qPos) << 32) |
+                               static_cast<uint64_t>(static_cast<uint32_t>(nd.rPos));
+                auto it = posToMemIdx.find(key);
+                if (it != posToMemIdx.end()) {
+                    chain.push_back(allMems[it->second]);
+                    chainRev.push_back(isRev[it->second]);
+                    chainMemIdx.push_back(it->second);
+                }
+            }
+            if (chain.empty()) break;
+
+            // Found a multi-anchor chain (or any chain at all if shortPseudo
+            // accepts singletons). Take it.
+            if (chain.size() >= 2 || shortPseudo) {
+                bestScore = curScore;
+                primaryFound = true;
+                break;
+            }
+            // Singleton chain on a non-shortPseudo query: consume it and
+            // try the next-best chain.
+            for (size_t mi : chainMemIdx) primaryConsumed[mi] = true;
+        }
+        if (!primaryFound) return out;
+
+        std::vector<SvTypeFromChain::Result> events;
+        if (chain.size() < 2) {
+            if (!shortPseudo) return out;
+            const auto& m = chain.front();
+            const int leftFlank = m.qPos;
+            const int rightFlank = static_cast<int>(qSeq.size()) - (m.qPos + m.len);
+            const int flank = std::max(leftFlank, rightFlank);
+            if (flank < fo.minSvLen) return out;
+            auto contig_of_single = [&](int rPos) -> int {
+                for (int ci = 0; ci < static_cast<int>(sa.contigEnd.size()); ++ci)
+                    if (rPos < sa.contigEnd[static_cast<size_t>(ci)]) return ci;
+                return -1;
+            };
+            const int ci = contig_of_single(m.rPos);
+            const int ctgOff = (ci > 0) ? sa.contigEnd[static_cast<size_t>(ci) - 1] : 0;
+            SvTypeFromChain::Result ev;
+            ev.type = SvTypeFromChain::Type::INS;
+            ev.svLen = flank;
+            if (leftFlank >= rightFlank) {
+                ev.qBreakStart = 0;
+                ev.qBreakEnd = leftFlank - 1;
+                ev.rBreakStart = std::max(0, m.rPos - ctgOff);
+            } else {
+                ev.qBreakStart = m.qPos + m.len;
+                ev.qBreakEnd = static_cast<int>(qSeq.size()) - 1;
+                ev.rBreakStart = std::max(0, m.rPos + m.len - ctgOff);
+            }
+            ev.rBreakEnd = ev.rBreakStart;
+            if (ci >= 0) ev.rContig = sa.contigName[static_cast<size_t>(ci)];
+            events.push_back(std::move(ev));
+        } else {
+            events = SvTypeFromChain::classify_all(chain, chainRev, sa, fo.minSvLen);
+        }
+
+        // DUP fallback: ChainTreap silently drops backward-mapping MEMs that signal
+        // tandem dups; re-classify the forward MEMs to catch that pattern.
+        const bool needsDupRescue = events.empty() ||
+            (events.size() == 1 && events.front().type == SvTypeFromChain::Type::INS);
+        if (needsDupRescue) {
+            std::vector<SuffixArray::Mem> fwdSorted;
+            fwdSorted.reserve(fwdMems.size());
+            for (int i : order)
+                if (!isRev[static_cast<size_t>(i)])
+                    fwdSorted.push_back(allMems[static_cast<size_t>(i)]);
+            if (fwdSorted.size() >= 2) {
+                auto dupRes = SvTypeFromChain::classify(
+                    fwdSorted, std::vector<bool>(fwdSorted.size(), false),
+                    sa, fo.minSvLen);
+                if (dupRes.type == SvTypeFromChain::Type::DUP) {
+                    double dupScore = 0.0;
+                    for (const auto& m : fwdSorted) dupScore += static_cast<double>(m.len);
+                    if (dupScore >= effectiveMinBlockScore) {
+                        events.assign(1, dupRes);
+                        chain     = fwdSorted;
+                        chainRev.assign(fwdSorted.size(), false);
+                        bestScore = dupScore;
+                    }
+                }
+            }
+        }
+
+        // TRA fallback: cross-contig anchors whose qGap exceeds chainGapBand never
+        // make it into the treap chain; scan allMems directly.
+        if (events.empty()) {
+            auto ctg_of = [&](int rp) -> int {
+                for (int ci = 0; ci < static_cast<int>(sa.contigEnd.size()); ++ci)
+                    if (rp < sa.contigEnd[static_cast<size_t>(ci)]) return ci;
+                return -1;
+            };
+            const SuffixArray::Mem* srcMem = nullptr;
+            const SuffixArray::Mem* dstMem = nullptr;
+            int srcCtg = -1;
+            const int traGap = 500000;
+            for (int i : order) {
+                if (isRev[static_cast<size_t>(i)]) continue;
+                const auto& m = allMems[static_cast<size_t>(i)];
+                const int ci = ctg_of(m.rPos);
+                if (srcCtg < 0) {
+                    srcCtg = ci;
+                    srcMem = &m;
+                    continue;
+                }
+                if (ci >= 0 && ci != srcCtg) {
+                    const int qGap = m.qPos - (srcMem->qPos + srcMem->len);
+                    if (qGap >= 0 && qGap <= traGap &&
+                        (dstMem == nullptr || m.len > dstMem->len))
+                        dstMem = &m;
+                }
+            }
+            if (srcMem && dstMem) {
+                std::vector<SuffixArray::Mem> traChain = {*srcMem, *dstMem};
+                auto traRes = SvTypeFromChain::classify(
+                    traChain, {false, false}, sa, fo.minSvLen);
+                if (traRes.type == SvTypeFromChain::Type::TRA) {
+                    double traScore = static_cast<double>(srcMem->len + dstMem->len);
+                    if (traScore >= effectiveMinBlockScore) {
+                        events.assign(1, traRes);
+                        chain     = traChain;
+                        chainRev  = {false, false};
+                        bestScore = traScore;
+                    }
+                }
+            }
+        }
+
+        if (events.empty()) return out;
+
+        // Merge adjacent small INS/DEL events of the same type within mergeWindow bp
+        // to keep the call set comparable to comparator truth (svim_asm collapses
+        // microsatellite-adjacent indels into a single record).
+        // The window must not scale with minSvLen — at --min-svlen 200 the
+        // old formula folded every event within 400 bp into one record, which
+        // is exactly the TE-burst regime fungal pangenomes care about.
+        const int mergeWindow = 80;
+        std::sort(events.begin(), events.end(),
+                  [](const SvTypeFromChain::Result& a,
+                     const SvTypeFromChain::Result& b) {
+                      if (a.qBreakStart != b.qBreakStart) return a.qBreakStart < b.qBreakStart;
+                      return a.svLen > b.svLen;
+                  });
+        std::vector<SvTypeFromChain::Result> merged;
+        merged.reserve(events.size());
+        for (auto& ev : events) {
+            if (!merged.empty()) {
+                auto& last = merged.back();
+                if (last.type == ev.type &&
+                    last.rContig == ev.rContig &&
+                    std::abs(ev.qBreakStart - last.qBreakEnd) <= mergeWindow) {
+                    last.qBreakEnd = std::max(last.qBreakEnd, ev.qBreakEnd);
+                    last.rBreakEnd = std::max(last.rBreakEnd, ev.rBreakEnd);
+                    last.svLen     = std::max(last.svLen, ev.svLen);
+                    continue;
+                }
+            }
+            merged.push_back(std::move(ev));
+        }
+
+        // Iterative multi-chain extraction: after the primary chain has been
+        // converted to events, remove its query footprint and mine additional
+        // non-overlapping chains for the same (query contig, reference) pair.
+        // This rescues fragmented/read pseudo-contigs where one strong local
+        // path previously suppressed many weaker but valid SV-bearing paths.
+        std::vector<std::pair<int,int>> usedQ;
+        usedQ.reserve(chain.size());
+        for (const auto& m : chain)
+            usedQ.push_back({m.qPos, m.qPos + m.len});
+        auto overlaps_used_q = [&](const SuffixArray::Mem& m) {
+            const int s = m.qPos;
+            const int e = m.qPos + m.len;
+            for (const auto& iv : usedQ)
+                if (s < iv.second && e > iv.first) return true;
+            return false;
+        };
+        // Algorithmic fix: the previous 12-chain cap throttled recall on
+        // chromosome-sized fungal contigs where 50+ legitimate local chains
+        // (one per accessory locus / TE burst) are routinely required to
+        // reach the per-isolate SV burden documented in the literature
+        // (Toomajian 2024 Fg, Hartmann 2020 Zt). Scale the cap with query
+        // length at ~one chain per 50 kb of contig, capped at 512 to keep
+        // worst-case effort bounded.
+        const int kMaxExtraChains = std::max(
+            12,
+            std::min(512, static_cast<int>(qSeq.size() / 50000)));
+        for (int extra = 0; extra < kMaxExtraChains; ++extra) {
+            std::vector<int> extraOrder;
+            extraOrder.reserve(order.size());
+            for (int i : order)
+                if (!overlaps_used_q(allMems[static_cast<size_t>(i)]))
+                    extraOrder.push_back(i);
+            if (extraOrder.empty()) break;
+
+            ChainTreap extraTreap;
+            std::vector<int> inserted;
+            inserted.reserve(extraOrder.size());
+            for (int i : extraOrder) {
+                const auto& m = allMems[static_cast<size_t>(i)];
+                extraTreap.insert_and_chain(m.qPos, m.rPos, m.len,
+                                            static_cast<float>(m.len), maxGap);
+                inserted.push_back(i);
+            }
+            const double extraScore = static_cast<double>(extraTreap.best_chain_score());
+            if (extraScore < effectiveMinBlockScore) break;
+            const auto extraIdx = extraTreap.best_chain_path();
+            if (extraIdx.empty()) break;
+
+            std::vector<SuffixArray::Mem> extraChain;
+            std::vector<bool> extraRev;
+            extraChain.reserve(extraIdx.size());
+            extraRev.reserve(extraIdx.size());
+            for (int ni : extraIdx) {
+                if (ni < 0 || static_cast<size_t>(ni) >= inserted.size()) continue;
+                const int mi = inserted[static_cast<size_t>(ni)];
+                extraChain.push_back(allMems[static_cast<size_t>(mi)]);
+                extraRev.push_back(isRev[static_cast<size_t>(mi)]);
+            }
+            // ALGORITHMIC FIX (recall): treap.best_chain_path() returns the
+            // highest-SCORING chain — a single long MEM (score = len) often
+            // outranks a multi-anchor chain of shorter MEMs. The previous
+            // `break` on size<2 (or empty events) abandoned ALL further
+            // iterations, throwing away any genuine multi-anchor chains
+            // hiding behind the long singleton. Mark this chain's q-footprint
+            // consumed and `continue` so the next iteration's treap rebuild
+            // can surface the multi-anchor chains we actually want. The
+            // `extraOrder.empty()` and `extraScore < effectiveMinBlockScore`
+            // breaks above plus the loop bound still guarantee termination.
+            if (extraChain.size() < 2) {
+                for (const auto& m : extraChain)
+                    usedQ.push_back({m.qPos, m.qPos + m.len});
+                continue;
+            }
+            auto extraEvents = SvTypeFromChain::classify_all(
+                extraChain, extraRev, sa, fo.minSvLen);
+            if (extraEvents.empty()) {
+                for (const auto& m : extraChain)
+                    usedQ.push_back({m.qPos, m.qPos + m.len});
+                continue;
+            }
+            for (auto& ev : extraEvents)
+                if (ev.type != SvTypeFromChain::Type::NONE)
+                    merged.push_back(std::move(ev));
+            for (const auto& m : extraChain)
+                usedQ.push_back({m.qPos, m.qPos + m.len});
+        }
+
+        auto contig_of = [&](int rPos) -> int {
+            for (int ci = 0; ci < static_cast<int>(sa.contigEnd.size()); ++ci)
+                if (rPos < sa.contigEnd[static_cast<size_t>(ci)]) return ci;
+            return -1;
+        };
+
+        const int primaryContigIdx = !chain.empty() ? contig_of(chain.front().rPos) : -1;
+        const TolGlobal::RefSeq* primaryRef =
+            (primaryContigIdx >= 0 && static_cast<size_t>(primaryContigIdx) < saRefs.size())
+                ? saRefs[static_cast<size_t>(primaryContigIdx)]
+                : (saRefs.empty() ? nullptr : saRefs.front());
+
+        // ── TRA recall fix: cross-contig translocation as an ADDITIONAL event ──
+        //   A translocation-bearing query contig still produces a strong
+        //   primary chain (the bulk of the contig aligns cleanly), so the
+        //   `events.empty()` TRA fallback above never fires for real TRAs — it
+        //   only ever caught contigs with NO alignment at all (i.e. noise).
+        //   Here we scan the forward MEMs that landed on a reference contig
+        //   OTHER than the primary one: a coherent off-contig cluster spanning
+        //   >= minSvLen of the query, backed by MEMs over >= half that span,
+        //   is a translocated segment. We APPEND it to `merged` rather than
+        //   replacing the primary chain.
+        if (primaryContigIdx >= 0) {
+            struct OffCluster {
+                int qLo = std::numeric_limits<int>::max();
+                int qHi = std::numeric_limits<int>::min();
+                int rLo = std::numeric_limits<int>::max();
+                int rHi = std::numeric_limits<int>::min();
+                long long cov = 0;
+            };
+            std::unordered_map<int, OffCluster> offByContig;
+            for (int i : order) {
+                if (isRev[static_cast<size_t>(i)]) continue;
+                const auto& m = allMems[static_cast<size_t>(i)];
+                const int ci = contig_of(m.rPos);
+                if (ci < 0 || ci == primaryContigIdx) continue;
+                auto& oc = offByContig[ci];
+                oc.qLo = std::min(oc.qLo, m.qPos);
+                oc.qHi = std::max(oc.qHi, m.qPos + m.len);
+                oc.rLo = std::min(oc.rLo, m.rPos);
+                oc.rHi = std::max(oc.rHi, m.rPos + m.len);
+                oc.cov += m.len;
+            }
+            int bestCi = -1;
+            long long bestCov = 0;
+            for (const auto& kv : offByContig)
+                if (kv.second.cov > bestCov) { bestCov = kv.second.cov; bestCi = kv.first; }
+            if (bestCi >= 0) {
+                const OffCluster& oc = offByContig[bestCi];
+                const int qSpan = oc.qHi - oc.qLo;
+                if (qSpan >= fo.minSvLen &&
+                    bestCov * 2 >= static_cast<long long>(qSpan)) {
+                    const int ctgStart = (bestCi > 0)
+                        ? sa.contigEnd[static_cast<size_t>(bestCi) - 1] : 0;
+                    SvTypeFromChain::Result tra;
+                    tra.type        = SvTypeFromChain::Type::TRA;
+                    tra.qBreakStart = oc.qLo;
+                    tra.qBreakEnd   = oc.qHi;
+                    tra.rBreakStart = oc.rLo - ctgStart;
+                    tra.rBreakEnd   = oc.rHi - ctgStart;
+                    tra.svLen       = qSpan;
+                    tra.rContig     = sa.contigName[static_cast<size_t>(bestCi)];
+                    bool dup = false;
+                    for (const auto& ev : merged)
+                        if (ev.type == SvTypeFromChain::Type::TRA &&
+                            ev.rContig == tra.rContig) { dup = true; break; }
+                    if (!dup) merged.push_back(tra);
+                }
+            }
+        }
+
+        auto fill_common = [&](VariantCallBridge& v) {
+            v.qAsm        = qAsm;
+            v.qContig     = qContig;
+            v.readSupport = parse_pseudocontig_support(qContig);
+            v.refAsm  = (primaryRef != nullptr && !primaryRef->asmName.empty())
+                ? primaryRef->asmName
+                : ((primaryRef != nullptr && !primaryRef->clade.empty()) ? primaryRef->clade : "unknown");
+            v.refContig = (primaryRef != nullptr && !primaryRef->contig.empty())
+                ? primaryRef->contig : ".";
+            v.refPos = 0;
+            v.refEnd = 0;
+            v.genotype = "0/1";
+            v.gq = std::min(99.0,
+                10.0 * std::log10(1.0 + static_cast<double>(chain.size()))
+                + 0.5 * bestScore);
+            v.blockScore = bestScore;
+            v.anchors    = static_cast<int>(chain.size());
+            v.alignmentMode = secondaryPass
+                ? "mem_chain_ds13_ds18_multi;secondary_seed_rescue"
+                : "mem_chain_ds13_ds18_multi";
+            v.mapq = 50.0;
+            v.annotation = "NONE";
+            v.triallelicTopology = ".";
+            v.isNonRefVariant = false;
+            if (primaryRef != nullptr) {
+                v.cladeRank = primaryRef->cladeRank.empty() ? "." : primaryRef->cladeRank;
+                v.phylum    = primaryRef->phylum.empty() ? "." : primaryRef->phylum;
+            }
+        };
+
+        using T = SvTypeFromChain::Type;
+        for (auto res : merged) {
+            if (res.type == T::NONE) continue;
+            const TolGlobal::RefSeq* eventRef = primaryRef;
+            if (!res.rContig.empty()) {
+                for (const auto* cand : saRefs) {
+                    if (cand != nullptr && cand->contig == res.rContig) {
+                        eventRef = cand;
+                        break;
+                    }
+                }
+            }
+            if (eventRef != nullptr && eventRef->has_seq())
+                refine_local_chain_breakpoint(res, qSeq, eventRef->seq());
+            VariantCallBridge v;
+            fill_common(v);
+            v.pos   = std::max(1, res.qBreakStart + 1);
+            v.end   = std::max(v.pos, res.qBreakEnd >= 0 ? res.qBreakEnd + 1 : v.pos);
+            v.svlen = res.svLen;
+            if (res.type != T::TRA)
+                v.refContig = res.rContig.empty() ? v.refContig : res.rContig;
+            // ALGORITHMIC FIX (provenance + dedup): when the multi-ref chain
+            // spans contigs from different ref ASSEMBLIES, override the
+            // primaryRef-derived refAsm/cladeRank/phylum to match the actual
+            // event's contig. Without this, every event in the chain inherits
+            // the first contig's assembly even when the SV is anchored on a
+            // different ref's chromosome — corrupting refAsm-keyed dedup
+            // (select_best_call_per_contig, multirank merge_calls) and the
+            // multisample VCF's per-(qAsm, refAsm) provenance tags.
+            if (res.type != T::TRA && eventRef != nullptr && eventRef != primaryRef) {
+                v.refAsm = !eventRef->asmName.empty()
+                    ? eventRef->asmName
+                    : (eventRef->clade.empty() ? v.refAsm : eventRef->clade);
+                if (!eventRef->cladeRank.empty()) v.cladeRank = eventRef->cladeRank;
+                if (!eventRef->phylum.empty())    v.phylum    = eventRef->phylum;
+            }
+            switch (res.type) {
+                case T::INS:
+                    v.type = "INS"; v.pantreeClass = "INS";
+                    v.refPos = res.rBreakStart >= 0 ? (res.rBreakStart + 1) : 0;
+                    v.refEnd = v.refPos;
+                    break;
+                case T::DEL:
+                    v.type = "DEL"; v.pantreeClass = "DEL";
+                    v.refPos = res.rBreakStart >= 0 ? (res.rBreakStart + 1) : 0;
+                    v.refEnd = res.rBreakEnd > 0 ? res.rBreakEnd : v.refPos;
+                    break;
+                case T::INV:
+                    v.type = "INV"; v.pantreeClass = "INV";
+                    v.refPos = res.rBreakStart >= 0 ? (res.rBreakStart + 1) : 0;
+                    v.refEnd = res.rBreakEnd > 0 ? res.rBreakEnd : v.refPos;
+                    break;
+                case T::DUP:
+                    v.type = "DUP"; v.pantreeClass = "DUP";
+                    v.refPos = res.rBreakStart >= 0 ? (res.rBreakStart + 1) : 0;
+                    v.refEnd = res.rBreakEnd > 0 ? res.rBreakEnd : v.refPos;
+                    break;
+                case T::TRA: {
+                    v.type = "TRA"; v.pantreeClass = "NON_REF";
+                    const int srcRPos = !chain.empty()
+                        ? (chain.front().rPos + chain.front().len) : 0;
+                    int srcCi = -1;
+                    for (int ci = 0; ci < static_cast<int>(sa.contigEnd.size()); ++ci) {
+                        if (srcRPos < sa.contigEnd[static_cast<size_t>(ci)]) {
+                            srcCi = ci; break;
+                        }
+                    }
+                    if (srcCi < 0 && !sa.contigEnd.empty())
+                        srcCi = static_cast<int>(sa.contigEnd.size()) - 1;
+                    const int srcOff = (srcCi > 0)
+                        ? sa.contigEnd[static_cast<size_t>(srcCi) - 1] : 0;
+                    if (srcCi >= 0 && static_cast<size_t>(srcCi) < saRefs.size()) {
+                        const auto* srcRef = saRefs[static_cast<size_t>(srcCi)];
+                        if (srcRef != nullptr) {
+                            v.refAsm = !srcRef->asmName.empty()
+                                ? srcRef->asmName
+                                : (srcRef->clade.empty() ? v.refAsm : srcRef->clade);
+                            v.refContig = srcRef->contig.empty() ? v.refContig : srcRef->contig;
+                            if (!srcRef->cladeRank.empty()) v.cladeRank = srcRef->cladeRank;
+                            if (!srcRef->phylum.empty())    v.phylum    = srcRef->phylum;
+                        }
+                    }
+                    v.refPos = srcRPos > 0 ? (srcRPos - srcOff + 1) : 0;
+                    v.refEnd = v.refPos;
+                    v.mateContig = res.rContig;
+                    v.matePos = res.rBreakStart + 1;
+                    v.mateEnd = res.rBreakEnd > 0 ? res.rBreakEnd : v.matePos;
+                    if (!res.rContig.empty()) {
+                        for (const auto* cand : saRefs) {
+                            if (cand == nullptr || cand->contig != res.rContig) continue;
+                            v.mateRefAsm = !cand->asmName.empty()
+                                ? cand->asmName
+                                : (cand->clade.empty() ? "." : cand->clade);
+                            v.mateOffReference = false;
+                            break;
+                        }
+                    }
+                    break;
+                }
+                default: continue;
+            }
+
+            // TE classification (mirror single-emit path).
+            using T2 = SvTypeFromChain::Type;
+            if (res.type == T2::INS || res.type == T2::DUP || res.type == T2::INV) {
+                const double gcBg = (eventRef != nullptr) ? eventRef->cladeGc : 0.45;
+                const int teS = res.qBreakStart;
+                const int teE = (res.type == T2::INS)
+                    ? std::min(teS + res.svLen, static_cast<int>(qSeq.size()))
+                    : std::min(res.qBreakEnd + 1, static_cast<int>(qSeq.size()));
+                if (teE > teS && teS >= 0) {
+                    const ElementClass ec = classify_repeat_element(
+                        std::string_view(qSeq.data() + teS,
+                                         static_cast<size_t>(teE - teS)),
+                        gcBg,
+                        (eventRef != nullptr) ? eventRef->phylum : ".");
+                    if (ec != ElementClass::NONE)
+                        v.elementClass = element_class_name(ec);
+                }
+            } else if (res.type == T2::DEL && eventRef != nullptr && eventRef->has_seq()) {
+                const double gcBg = eventRef->cladeGc;
+                const int rS = res.rBreakStart;
+                const int rE = res.rBreakEnd;
+                const auto& refSeq = eventRef->seq();
+                const int safeS = std::max(0, rS);
+                const int safeE = std::min(static_cast<int>(refSeq.size()), rE);
+                if (safeE > safeS) {
+                    const ElementClass ec = classify_repeat_element(
+                        std::string_view(refSeq.data() + safeS,
+                                         static_cast<size_t>(safeE - safeS)),
+                        gcBg,
+                        eventRef->phylum);
+                    if (ec != ElementClass::NONE)
+                        v.elementClass = element_class_name(ec);
+                }
+            }
+            out.calls.push_back(std::move(v));
+        }
+
+        if (out.calls.empty()) return out;
+        out.score   = bestScore;
+        out.anchors = static_cast<int>(chain.size());
+        out.valid   = true;
+        return out;
+    };
+
+    const int primaryMinMem = min_mem_from_k(fo.primarySketchParams.k);
+    MultiAttempt best = attempt_chain(primaryMinMem, false);
+    if (fo.useSecondarySeeds) {
+        const int secondaryMinMem = min_mem_from_k(fo.secondarySketchParams.k);
+        const bool rescueRequested = !best.valid ||
+            best.anchors < static_cast<int>(std::max<size_t>(fo.repeatRescueMinAnchors, 2));
+        if (secondaryMinMem < primaryMinMem && rescueRequested) {
+            MultiAttempt rescue = attempt_chain(secondaryMinMem, true);
+            if (rescue.valid &&
+                (!best.valid ||
+                 rescue.calls.size() > best.calls.size() ||
+                 rescue.anchors > best.anchors ||
+                 rescue.score   > best.score)) {
+                best = std::move(rescue);
+            }
+        }
+    }
+    if (!best.valid) return false;
+    outCalls = std::move(best.calls);
+    return !outCalls.empty();
+}
+
+// ── per-contig checkpoint hook ───────────────────────────────────────────
+// Thread-local: lets the caller (main.cpp process_query) inject a flush
+// callback that runs the moment each contig is fully processed inside
+// hierarchical_call_assembly. Without this, the function buffers all 15+
+// contigs' calls and only the caller's per-query flush runs — so a SIGTERM
+// mid-query loses every contig that was already chained.
+using PerContigFlushHook = std::function<void(const std::string& qAsm,
+                                              const std::string& contigName,
+                                              const std::vector<VariantCallBridge>& contigCalls)>;
+inline PerContigFlushHook& per_contig_flush_hook() {
+    static thread_local PerContigFlushHook hook;
+    return hook;
+}
+
+struct ScopedPerContigFlushHook {
+    PerContigFlushHook previous;
+
+    explicit ScopedPerContigFlushHook(PerContigFlushHook next)
+        : previous(std::move(per_contig_flush_hook())) {
+        per_contig_flush_hook() = std::move(next);
+    }
+
+    ~ScopedPerContigFlushHook() {
+        per_contig_flush_hook() = std::move(previous);
+    }
+};
+
+// RAII guard: runs the hook at the end of each contig iteration regardless
+// of which `continue` (Path A / B / C / off-ref) ended the iteration.
+struct ContigFlushGuard {
+    std::vector<VariantCallBridge>& out;
+    size_t startIdx;
+    const std::string& qAsm;
+    const std::string& contig;
+    const std::string* rankStr = nullptr;
+    void flush() {
+        auto& hook = per_contig_flush_hook();
+        if (!hook) return;
+        if (out.size() <= startIdx) return;
+        std::vector<VariantCallBridge> sub(out.begin() + startIdx, out.end());
+        if (rankStr) {
+            for (auto& c : sub)
+                if (c.alignmentMode.find("rank=") == std::string::npos)
+                    c.alignmentMode += ";rank=" + *rankStr;
+        }
+        try { hook(qAsm, contig, sub); } catch (...) {}
+        startIdx = out.size();
+    }
+    ~ContigFlushGuard() {
+        flush();
+    }
+};
+
 // ── hierarchical_call_assembly ────────────────────────────────────────────
 inline std::vector<VariantCallBridge>
 hierarchical_call_assembly(const std::string& qAsm,
@@ -2108,12 +3363,31 @@ hierarchical_call_assembly(const std::string& qAsm,
         for (const auto& ow : windows) out.push_back(make_offref_window_call(qAsm, contigName, seq, ow));
     };
 
+    // Debug visibility: env var MYCOSV_DEBUG_HIER=1 turns on per-contig
+    // breadcrumbs through the Path A/B/C decision tree so we can see why
+    // the multisample VCF is dominated by OFF_REF whole-contig calls.
+    const bool debugHier = std::getenv("MYCOSV_DEBUG_HIER") != nullptr;
+    if (debugHier) {
+        std::cerr << "[hier-dbg] qAsm=" << qAsm
+                  << " allRefs=" << allRefPtrs.size()
+                  << " withSeq=" << std::count_if(allRefPtrs.begin(), allRefPtrs.end(),
+                       [](const TolGlobal::RefSeq* r){ return r && r->has_seq(); })
+                  << "\n";
+    }
+    const bool skipPerContigRouting = allRefPtrs.size() <= 50000;
     for (const auto& kv : contigs) {
         const std::string& name = kv.first;
         const std::string& seq  = kv.second;
-        const auto routed = global.route_query_to_clades(
-            seq, fo.primarySketchParams, fo.fallbackSketchParams,
-            fo.routingDensity, fo.routingTopN);
+        // Per-contig flush guard: ensures completed-contig calls are flushed
+        // to the checkpoint sink the moment this iteration ends, regardless
+        // of which `continue` path (A/B/C) terminates it. Without this, a
+        // SIGTERM mid-query loses every previously-finished contig.
+        ContigFlushGuard _flushGuard{out, out.size(), qAsm, name};
+        const auto routed = skipPerContigRouting
+            ? std::vector<std::string>{}
+            : global.route_query_to_clades(
+                seq, fo.primarySketchParams, fo.fallbackSketchParams,
+                fo.routingDensity, fo.routingTopN);
         const std::unordered_set<std::string> routedClades(routed.begin(), routed.end());
         auto clade_allowed = [&](const TolGlobal::RefSeq& ref) {
             return routedClades.empty() ||
@@ -2137,34 +3411,84 @@ hierarchical_call_assembly(const std::string& qAsm,
             for (const auto* r : allRefPtrs)
                 if (r->has_seq()) cands.push_back(r);
 
-        VariantCallBridge chainCall;
-        if (try_mem_chain_call(qAsm, name, seq, cands, fo, chainCall) &&
-            chainCall.anchors >= minHierChainAnchors) {
-            if (!out.empty()) {
-                MergeSortTree mst;
-                std::vector<std::pair<int,int>> existingIvs;
-                existingIvs.reserve(out.size());
-                for (const auto& c : out) existingIvs.push_back({c.pos, c.end});
-                mst.build(existingIvs);
-                auto overlaps = mst.overlapping(chainCall.pos, chainCall.end);
-                if (!overlaps.empty()) {
-                    const auto& prev = out[static_cast<size_t>(overlaps[0])];
-                    auto topo = classify_triallelic(
-                        static_cast<size_t>(prev.pos), static_cast<size_t>(prev.end),
-                        static_cast<size_t>(chainCall.pos), static_cast<size_t>(chainCall.end));
-                    switch (topo) {
-                        case TriallelicTopology::PROPERLY_TRIALLELIC:
-                            chainCall.triallelicTopology = "PROPERLY_TRIALLELIC"; break;
-                        case TriallelicTopology::OVERLAPPING:
-                            chainCall.triallelicTopology = "OVERLAPPING"; break;
-                        case TriallelicTopology::NESTED:
-                            chainCall.triallelicTopology = "NESTED"; break;
-                        case TriallelicTopology::INTERLOCKING:
-                            chainCall.triallelicTopology = "INTERLOCKING"; break;
+        std::vector<VariantCallBridge> chainCalls;
+        if (debugHier) {
+            std::cerr << "[hier-dbg]   contig=" << name
+                      << " qLen=" << seq.size()
+                      << " routedClades=" << routedClades.size()
+                      << " cands=" << cands.size()
+                      << " prefilter=start\n";
+        }
+        const auto chainPrefilter = top_ref_candidates_for_chaining(seq, cands, fo);
+        if (debugHier) {
+            std::cerr << "[hier-dbg]   contig=" << name
+                      << " qLen=" << seq.size()
+                      << " routedClades=" << routedClades.size()
+                      << " cands=" << cands.size()
+                      << " chainPrefilter=" << chainPrefilter.size()
+                      << "\n";
+        }
+        std::vector<VariantCallBridge> multiCalls;
+        size_t multiOk = 0, multiKept = 0, singleOk = 0, singleKept = 0;
+        if (try_mem_chain_call_multi(qAsm, name, seq, chainPrefilter, fo, multiCalls)) {
+            multiOk = multiCalls.size();
+            for (auto& c : multiCalls)
+                if (c.anchors >= minHierChainAnchors ||
+                    (is_reads_pseudocontig_name(name) && c.anchors >= 1)) {
+                    chainCalls.push_back(std::move(c));
+                    ++multiKept;
+                }
+        }
+        for (const auto* cand : chainPrefilter) {
+            std::vector<const TolGlobal::RefSeq*> oneCand{cand};
+            std::vector<VariantCallBridge> oneCalls;
+            if (try_mem_chain_call_multi(qAsm, name, seq, oneCand, fo, oneCalls)) {
+                singleOk += oneCalls.size();
+                for (auto& c : oneCalls)
+                    if (c.anchors >= minHierChainAnchors ||
+                        (is_reads_pseudocontig_name(name) && c.anchors >= 1)) {
+                        chainCalls.push_back(std::move(c));
+                        ++singleKept;
+                    }
+            }
+        }
+        if (debugHier) {
+            std::cerr << "[hier-dbg]   PathA multi: "
+                      << multiOk << " raw / " << multiKept << " kept (>=anchors "
+                      << minHierChainAnchors << "); single-ref: "
+                      << singleOk << " raw / " << singleKept
+                      << " kept; chainCalls.size=" << chainCalls.size() << "\n";
+        }
+        if (!chainCalls.empty()) {
+            MergeSortTree mst;
+            std::vector<std::pair<int,int>> existingIvs;
+            existingIvs.reserve(out.size());
+            for (const auto& c : out) existingIvs.push_back({c.pos, c.end});
+            const bool haveExisting = !existingIvs.empty();
+            if (haveExisting) mst.build(existingIvs);
+            for (auto& chainCall : chainCalls) {
+                if (haveExisting) {
+                    auto overlaps = mst.overlapping(chainCall.pos, chainCall.end);
+                    if (!overlaps.empty()) {
+                        const auto& prev = out[static_cast<size_t>(overlaps[0])];
+                        auto topo = classify_triallelic(
+                            static_cast<size_t>(prev.pos), static_cast<size_t>(prev.end),
+                            static_cast<size_t>(chainCall.pos), static_cast<size_t>(chainCall.end));
+                        switch (topo) {
+                            case TriallelicTopology::PROPERLY_TRIALLELIC:
+                                chainCall.triallelicTopology = "PROPERLY_TRIALLELIC"; break;
+                            case TriallelicTopology::OVERLAPPING:
+                                chainCall.triallelicTopology = "OVERLAPPING"; break;
+                            case TriallelicTopology::NESTED:
+                                chainCall.triallelicTopology = "NESTED"; break;
+                            case TriallelicTopology::INTERLOCKING:
+                                chainCall.triallelicTopology = "INTERLOCKING"; break;
+                        }
                     }
                 }
+                out.push_back(std::move(chainCall));
             }
-            out.push_back(std::move(chainCall));
+            _flushGuard.flush();
             append_window_calls(name, seq);
             continue;
         }
@@ -2226,11 +3550,15 @@ hierarchical_call_assembly(const std::string& qAsm,
                 }
             }
 
-            if (best && bestDelta >= fo.minSvLen && bestDelta <= fo.maxSvLen &&
-                bestDelta <= static_cast<int>(
-                    std::min(seq.size(), best->seq().size()) / 2)) {
+            // Previously: required bestDelta ≤ min(|q|,|r|)/2. That clamp
+            // silently dropped accessory-chromosome PAV (the largest, most
+            // biologically meaningful events in fungal pangenomes) because
+            // the length difference exceeds half the shorter contig by
+            // definition. Length fallback now only requires minSvLen/maxSvLen.
+            if (best && bestDelta >= fo.minSvLen && bestDelta <= fo.maxSvLen) {
                 out.push_back(make_insdel_call(qAsm, name, *best,
                                                static_cast<int>(seq.size()), fo));
+                _flushGuard.flush();
                 append_window_calls(name, seq);
                 continue;
             }
@@ -2260,11 +3588,19 @@ hierarchical_call_assembly(const std::string& qAsm,
         std::string bestOtherAsmName = "OFF_REFERENCE";
         std::string bestOtherCladeRank = ".";
         std::string bestOtherPhylum = ".";
-        const int k = std::max(5, std::min(fo.fallbackSketchParams.k > 0
-                                           ? fo.fallbackSketchParams.k : 7, 9));
+        // Path C novelty k: was clamped to 5–9, which made k-mer Jaccard
+        // saturate for any two fungal sequences (4^7 = 16384 keys vs 30+ Mb
+        // of reference) so the NOVEL tier almost never fired. Raise the
+        // ceiling to 17 so the sketch can actually discriminate, and use
+        // best-containment in addition to Jaccard so an embedded HGT /
+        // STARSHIP block does not get masked by long host flanks.
+        const int k = std::max(11, std::min(fo.fallbackSketchParams.k > 0
+                                            ? fo.fallbackSketchParams.k : 15, 17));
         for (const auto& ref : allRefs) {
             if (!ref.has_seq()) continue;
-            const double ov = kmer_overlap_fraction(seq, ref.seq(), k);
+            const double ovJ = kmer_overlap_fraction(seq, ref.seq(), k);
+            const double ovC = kmer_best_containment_fraction(seq, ref.seq(), k);
+            const double ov  = std::max(ovJ, ovC);
             if (clade_allowed(ref)) {
                 if (ov > sameCladeOverlap) {
                     sameCladeOverlap = ov;
@@ -2284,8 +3620,12 @@ hierarchical_call_assembly(const std::string& qAsm,
             }
         }
         const bool hasRoutingCtx = !routedClades.empty();
+        // Match the loosened thresholds in score_cross_clade_novelty:
+        // sameClade < 0.10, otherClade ≥ 0.08, other − same ≥ 0.05.
         const bool isHgt = hasRoutingCtx &&
-            sameCladeOverlap < 0.05 && otherCladeOverlap >= 0.10;
+            sameCladeOverlap < 0.10 &&
+            otherCladeOverlap >= 0.08 &&
+            (otherCladeOverlap - sameCladeOverlap) >= 0.05;
         if (isHgt) {
             bestCladeGc   = bestOtherCladeGc;
             bestAsmName   = bestOtherAsmName;
@@ -2301,7 +3641,10 @@ hierarchical_call_assembly(const std::string& qAsm,
             ? score_cross_clade_novelty(sameCladeOverlap, otherCladeOverlap)
             : score_off_ref_novelty(std::max(sameCladeOverlap, otherCladeOverlap));
         const std::string tier = novelty_tier_name(noveltyTier);
-        if (tier == "NOVEL" || tier == "NOVEL_WEAK" || tier == "DIVERGED") {
+        // Emit all four tiers including OFF_REF_KNOWN — see note in
+        // discover_graph_native_offref_windows.
+        if (tier == "NOVEL" || tier == "NOVEL_WEAK" || tier == "DIVERGED" ||
+            tier == "OFF_REF_KNOWN") {
             // Prefer per-window OFF_REF calls so a divergent contig produces
             // many small events that can match a per-position truth set.
             // The contig-wide call is kept only as a safety net when graph-
@@ -2366,7 +3709,21 @@ hierarchical_call_assembly_multirank(
             // Stamp the rank that produced this call
             if (c.alignmentMode.find("rank=") == std::string::npos)
                 c.alignmentMode += ";rank=" + rankStr;
-            const std::string key = c.qContig + ":" + std::to_string(c.pos);
+            // Dedup key must include SV type, svlen bucket, AND refAsm.
+            // Earlier history: the (qContig:pos) key collapsed a co-located
+            // INS+DEL — common at TE breakpoints — into a single record,
+            // dropping every secondary co-located event across ranks. Adding
+            // type+svlen fixed that. But omitting refAsm collapses the
+            // SAME-type same-position SV against different refs into one
+            // record (whichever rank's call wins blockScore), discarding
+            // genuine per-(refAsm) signal that the multi-sample VCF needs to
+            // surface as separate rows. Cross-ref calls at the same query
+            // coordinate are biologically distinct events and must survive.
+            const int svlenBucket = std::max(1, std::abs(c.svlen) / 100);
+            const std::string key = c.qContig + ":" + std::to_string(c.pos) +
+                                    ":" + c.type +
+                                    ":" + std::to_string(svlenBucket) +
+                                    ":" + c.refAsm;
             auto kit = bestByKey.find(key);
             if (kit == bestByKey.end()) {
                 bestByKey[key] = merged.size();
@@ -2408,13 +3765,20 @@ hierarchical_call_assembly_multirank(
         std::vector<const TolGlobal::RefSeq*> rankRefPtrs;
         rankRefPtrs.reserve(rankRefs.size());
         for (const auto& r : rankRefs) rankRefPtrs.push_back(&r);
+        const bool skipPerContigRouting = rankRefPtrs.size() <= 50000;
 
         for (const auto& kv : contigs) {
             const std::string& name = kv.first;
             const std::string& seq  = kv.second;
-            const auto routed = global.route_query_to_clades(
-                seq, fo.primarySketchParams, fo.fallbackSketchParams,
-                fo.routingDensity, fo.routingTopN);
+            // Same checkpoint contract as the single-rank caller, but scoped
+            // to rankCalls so each completed rank/contig payload is flushed
+            // before the rank-wide merge/dedup pass can be interrupted.
+            ContigFlushGuard _flushGuard{rankCalls, rankCalls.size(), qAsm, name, &rankStr};
+            const auto routed = skipPerContigRouting
+                ? std::vector<std::string>{}
+                : global.route_query_to_clades(
+                    seq, fo.primarySketchParams, fo.fallbackSketchParams,
+                    fo.routingDensity, fo.routingTopN);
             const std::unordered_set<std::string> routedClades(routed.begin(), routed.end());
             auto clade_allowed = [&](const TolGlobal::RefSeq& ref) {
                 return routedClades.empty() ||
@@ -2438,10 +3802,28 @@ hierarchical_call_assembly_multirank(
                 for (const auto* r : rankRefPtrs)
                     if (r->has_seq()) cands.push_back(r);
 
-            VariantCallBridge chainCall;
-            if (try_mem_chain_call(qAsm, name, seq, cands, fo, chainCall) &&
-                chainCall.anchors >= minHierChainAnchors) {
-                rankCalls.push_back(std::move(chainCall));
+            std::vector<VariantCallBridge> chainCalls;
+            const auto chainPrefilter = top_ref_candidates_for_chaining(seq, cands, fo);
+            std::vector<VariantCallBridge> multiCalls;
+            if (try_mem_chain_call_multi(qAsm, name, seq, chainPrefilter, fo, multiCalls)) {
+                for (auto& c : multiCalls)
+                    if (c.anchors >= minHierChainAnchors ||
+                        (is_reads_pseudocontig_name(name) && c.anchors >= 1))
+                        chainCalls.push_back(std::move(c));
+            }
+            for (const auto* cand : chainPrefilter) {
+                std::vector<const TolGlobal::RefSeq*> oneCand{cand};
+                std::vector<VariantCallBridge> oneCalls;
+                if (try_mem_chain_call_multi(qAsm, name, seq, oneCand, fo, oneCalls)) {
+                    for (auto& c : oneCalls)
+                        if (c.anchors >= minHierChainAnchors ||
+                            (is_reads_pseudocontig_name(name) && c.anchors >= 1))
+                            chainCalls.push_back(std::move(c));
+                }
+            }
+            if (!chainCalls.empty()) {
+                for (auto& c : chainCalls) rankCalls.push_back(std::move(c));
+                _flushGuard.flush();
                 append_rank_window_calls(name, seq);
                 continue;
             }
@@ -2495,11 +3877,10 @@ hierarchical_call_assembly_multirank(
                     }
                 }
 
-                if (best && bestDelta >= fo.minSvLen && bestDelta <= fo.maxSvLen &&
-                    bestDelta <= static_cast<int>(
-                        std::min(seq.size(), best->seq().size()) / 2)) {
+                if (best && bestDelta >= fo.minSvLen && bestDelta <= fo.maxSvLen) {
                     rankCalls.push_back(make_insdel_call(qAsm, name, *best,
                                                          static_cast<int>(seq.size()), fo));
+                    _flushGuard.flush();
                     append_rank_window_calls(name, seq);
                     continue;
                 }
@@ -2524,11 +3905,17 @@ hierarchical_call_assembly_multirank(
                 std::string bestOtherAsmName = "OFF_REFERENCE";
                 std::string bestOtherCladeRank = ".";
                 std::string bestOtherPhylum = ".";
-                const int k = std::max(5, std::min(fo.fallbackSketchParams.k > 0
-                                                   ? fo.fallbackSketchParams.k : 7, 9));
+                // Same Path C novelty-k change as in hierarchical_call_assembly:
+                // raise the clamp from 5–9 to 11–17 and combine Jaccard with
+                // best-containment so HGT/STARSHIP blocks bordered by host
+                // sequence are not masked by long flanks.
+                const int k = std::max(11, std::min(fo.fallbackSketchParams.k > 0
+                                                    ? fo.fallbackSketchParams.k : 15, 17));
                 for (const auto& ref : allRefs) {
                     if (!ref.has_seq()) continue;
-                    const double ov = kmer_overlap_fraction(seq, ref.seq(), k);
+                    const double ovJ = kmer_overlap_fraction(seq, ref.seq(), k);
+                    const double ovC = kmer_best_containment_fraction(seq, ref.seq(), k);
+                    const double ov  = std::max(ovJ, ovC);
                     if (clade_allowed(ref)) {
                         if (ov > sameCladeOverlap) {
                             sameCladeOverlap = ov;
@@ -2548,8 +3935,11 @@ hierarchical_call_assembly_multirank(
                     }
                 }
                 const bool hasRoutingCtx = !routedClades.empty();
+                // Loosened thresholds — see score_cross_clade_novelty note.
                 const bool isHgt = hasRoutingCtx &&
-                    sameCladeOverlap < 0.05 && otherCladeOverlap >= 0.10;
+                    sameCladeOverlap < 0.10 &&
+                    otherCladeOverlap >= 0.08 &&
+                    (otherCladeOverlap - sameCladeOverlap) >= 0.05;
                 if (isHgt) {
                     bestCladeGc   = bestOtherCladeGc;
                     bestAsmName   = bestOtherAsmName;
@@ -2565,7 +3955,8 @@ hierarchical_call_assembly_multirank(
                     ? score_cross_clade_novelty(sameCladeOverlap, otherCladeOverlap)
                     : score_off_ref_novelty(std::max(sameCladeOverlap, otherCladeOverlap));
                 const std::string tier = novelty_tier_name(noveltyTier);
-                if (tier == "NOVEL" || tier == "NOVEL_WEAK" || tier == "DIVERGED") {
+                if (tier == "NOVEL" || tier == "NOVEL_WEAK" ||
+                    tier == "DIVERGED" || tier == "OFF_REF_KNOWN") {
                     size_t windowsBefore = rankCalls.size();
                     append_rank_window_calls(name, seq);
                     if (rankCalls.size() == windowsBefore) {
@@ -2944,6 +4335,16 @@ inline bool try_mem_chain_call_public(
         const FederatedOptions& fo,
         VariantCallBridge& call) {
     return try_mem_chain_call(qAsm, qContig, qSeq, refCandidates, fo, call);
+}
+
+inline bool try_mem_chain_call_multi_public(
+        const std::string& qAsm,
+        const std::string& qContig,
+        const std::string& qSeq,
+        const std::vector<const TolGlobal::RefSeq*>& refCandidates,
+        const FederatedOptions& fo,
+        std::vector<VariantCallBridge>& calls) {
+    return try_mem_chain_call_multi(qAsm, qContig, qSeq, refCandidates, fo, calls);
 }
 
 } // namespace tol

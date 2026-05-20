@@ -189,7 +189,7 @@ du -sh experiments/real_data/$TIMESTAMP
 
 ## System Requirements
 
-- **Python 3.9+** with pytest, numpy, scipy
+- **Python 3.9+** with pytest, numpy, scipy, pandas
 - **g++ 9+** (C++17 compiler)
 - **Threading support** (pthread)
 - **Disk space**: ~10-50 GB for all experiments

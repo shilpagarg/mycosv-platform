@@ -24,13 +24,10 @@ if [[ "${MYCOSV_FORCE_REBUILD:-1}" == "1" && -f "${MYCOSV_BIN}" ]]; then
   rm -f "${MYCOSV_BIN}"
 fi
 
-# Million-real prepare/index build is the stage that has historically lost
-# read_validated_truth.tsv rows to mid-loop OOM kills. The benchmark step
-# now flushes the TSV after every query, but the underlying memory pressure
-# is still there. Bumping the per-thread SA cache budget keeps the binary
-# from spilling to std::bad_alloc under the SLURM cgroup. Override on
-# tighter nodes or when running with --cpus-per-task < 16.
+# Keep million-real benchmark memory bounded by default. Large benchmark ref
+# lists now run hierarchical-only unless MYCOSV_FORCE_FLAT_REF_FALLBACK=1, but
+# these caps still protect explicit flat-fallback debug runs.
 export MILLION_REAL_SINGLE_REF_CACHE_MB="${MILLION_REAL_SINGLE_REF_CACHE_MB:-4096}"
-export MILLION_REAL_MAX_REF_MEMORY_MB="${MILLION_REAL_MAX_REF_MEMORY_MB:-1024}"
+export MILLION_REAL_MAX_REF_MEMORY_MB="${MILLION_REAL_MAX_REF_MEMORY_MB:-4096}"
 
-exec bash /mnt/bmh01-rds/Shilpa_Group/2024/projects/fungi/AMF/scale/run_all_experiments.sh "$@"
+exec bash /mnt/bmh01-rds/Shilpa_Group/2024/projects/fungi/AMF/scale/run_all_experiments.sh --million-real "$@"

@@ -112,8 +112,8 @@ FUNCTIONAL_EXAMPLES: list[dict[str, object]] = [
         'priority': 7,
         'evidence_axis': 'horizontal_gene_transfer',
         'system': 'cross-phylum HGT translocation (Rhizophagus / Puccinia accessory island analogy)',
-        'real_data_signal': 'Translocation breakpoints with HGT-class sequence and low same-clade overlap indicate donor-recipient boundaries of an horizontally transferred genomic island.',
-        'why_relevant': 'Highest-priority hit when a TRA or off-reference segment is both phylogenetically novel within its clade and carried in a sequence class (HGT / Starship) associated with lateral transfer.',
+        'real_data_signal': 'Translocation breakpoints with HGT-class sequence and low same-clade overlap are consistent with candidate donor-recipient boundaries of a horizontally transferred genomic island.',
+        'why_relevant': 'Highest-priority screening hit when a TRA or off-reference segment is both phylogenetically novel within its clade and carried in a sequence class (HGT / Starship) associated with lateral transfer.',
         'suggested_readout': 'Confirm breakpoint with long reads, survey presence/absence across species panel, BLAST cargo genes against fungal + prokaryotic databases, and test expression of cargo under relevant conditions.',
     },
 ]
@@ -809,8 +809,8 @@ def nearest_gene_for_locus(
 
 
 def is_hgt_candidate(ec: str, svtype: str, annot: str) -> bool:
-    """True when the call has hallmarks of horizontal gene transfer:
-    HGT element class OR a translocation with cross-clade novelty signal."""
+    """True when the call has candidate hallmarks of horizontal gene transfer:
+    HGT-like sequence OR a translocation with cross-clade novelty signal."""
     if ec == 'HGT':
         return True
     if svtype == 'TRA' and annot in {'NOVEL', 'NOVEL_WEAK'}:
@@ -847,9 +847,9 @@ def classify_candidate(
     # HGT candidates rank highest: cross-clade or Starship/integrative-island events
     # that are novel relative to the same-clade references.
     if hgt and ancestry_switch:
-        return 'hgt_candidate', 7, 'Cross-clade TRA or HGT-class insertion with multi-clade ancestry — strong HGT signal.'
+        return 'hgt_candidate', 7, 'Cross-clade TRA or HGT-class insertion with multi-clade ancestry — strong candidate HGT signal.'
     if hgt:
-        return 'hgt_candidate', 6, 'HGT element class or cross-clade translocation with novel sequence tier.'
+        return 'hgt_candidate', 6, 'HGT-like element class or cross-clade translocation with novel sequence tier.'
     if expr_supported and te_like and ancestry_switch:
         return 'mosaic_te_expression_link', 6, 'TE-associated ancestry switch near a gene with direct expression support.'
     if expr_supported and te_like:

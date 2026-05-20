@@ -18,6 +18,7 @@
 #include <cassert>
 #include <chrono>
 #include <cmath>
+#include <csignal>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -37,6 +38,7 @@
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
+#include <unistd.h>
 #include <utility>
 #include <vector>
 
@@ -46,6 +48,50 @@
 #include "te_classifier.hpp"
 
 namespace fs = std::filesystem;
+
+// ============================================================
+// Graceful shutdown on SIGTERM/SIGINT.
+//
+// The wrapper run_real_fungal_benchmark.py sends SIGTERM (then SIGKILL after
+// a 30 s grace period) when --mycosv-tool-timeout fires. Without a handler,
+// the SIGKILL discards any in-memory candidate calls that haven't reached
+// the per-query flush in main(). The handler below sets a flag the worker
+// loop polls, and best-effort flushes the open ofstreams so partial output
+// is preserved up to the last per-query flush.
+// ============================================================
+static std::atomic<bool> g_shutdown_requested{false};
+static std::ofstream*    g_signal_tsv_out      = nullptr;
+static std::ofstream*    g_signal_vcf_out      = nullptr;
+static std::ofstream*    g_signal_hier_tsv_out = nullptr;
+static std::ofstream*    g_signal_hier_vcf_out = nullptr;
+static std::ofstream*    g_signal_gfa_out      = nullptr;
+static std::ofstream*    g_signal_anc_out      = nullptr;
+
+static void on_terminate_signal(int sig) {
+    // async-signal-safe portion: set the atomic flag and write a fixed message.
+    g_shutdown_requested.store(true, std::memory_order_relaxed);
+    static const char msg[] =
+        "[mycosv] caught signal, flushing partial outputs before exit\n";
+    ssize_t r = ::write(2, msg, sizeof(msg) - 1);
+    (void)r;
+    // ofstream::flush() is not formally async-signal-safe, but in glibc/libstdc++
+    // is in practice and is the only thing standing between us and lost data
+    // before the wrapper escalates to SIGKILL.
+    if (g_signal_tsv_out      && g_signal_tsv_out->good())      g_signal_tsv_out->flush();
+    if (g_signal_vcf_out      && g_signal_vcf_out->good())      g_signal_vcf_out->flush();
+    if (g_signal_hier_tsv_out && g_signal_hier_tsv_out->good()) g_signal_hier_tsv_out->flush();
+    if (g_signal_hier_vcf_out && g_signal_hier_vcf_out->good()) g_signal_hier_vcf_out->flush();
+    if (g_signal_gfa_out      && g_signal_gfa_out->good())      g_signal_gfa_out->flush();
+    if (g_signal_anc_out      && g_signal_anc_out->good())      g_signal_anc_out->flush();
+    // Re-raise with default handler so the parent sees the correct exit code.
+    std::signal(sig, SIG_DFL);
+    std::raise(sig);
+}
+
+static void install_signal_handlers() {
+    std::signal(SIGTERM, on_terminate_signal);
+    std::signal(SIGINT,  on_terminate_signal);
+}
 
 // ============================================================
 // Options — all CLI parameters
@@ -82,10 +128,17 @@ struct Options {
 
     // Calling thresholds
     int    minSvLen      = 40;
-    int    maxSvLen      = 1000000;
+    // 10 Mb upper bound: fungal accessory chromosome PAV and STARSHIP cargo
+    // reach into the megabase range (Aspergillus accessory chroms, Fusarium
+    // dispensables). The previous 1 Mb cap silently dropped these.
+    int    maxSvLen      = 10000000;
     double minBlockScore = 6.0;
     int    minAnchors    = 2;
-    int    maxCallsPerContig = 128;
+    // Default 10 000 (was 128). Real fungal isolates can carry many
+    // genome-wide SVs, so 128 capped recall at a fraction of the observable
+    // burden. The cap is now a safety net rather than the dominant gate;
+    // selection happens via the minBlockScore floor.
+    int    maxCallsPerContig = 10000;
 
     // Federated mode
     bool   federatedMode = true;
@@ -137,6 +190,18 @@ struct Options {
     // evicted; 0 disables the cap (legacy behavior).
     int    singleRefCacheMB     = 1024;
     bool   noFlatRefFallback    = false; // --no-flat-ref-fallback: skip memory-heavy flat ref fallback
+    // --skip-flat-if-hier-calls N: if the hierarchical phase produced at least N
+    // calls for a query, skip the flat-MEM-chain fallback for that query.
+    // Lets a user keep the flat fallback as a safety net for queries that
+    // hierarchical can't route, without paying its 6 000+ contig cost when
+    // hierarchical already produced a usable callset. 0 = disabled.
+    int    skipFlatIfHierCalls  = 0;
+    // --max-flat-ref-contigs N: hard cap on the total unique contig names
+    // retained in the SimpleRefIndex used by the flat-MEM-chain fallback.
+    // Fungal reference FASTAs commonly contain hundreds of unplaced
+    // scaffolds, so an "8-ref" cap can still load 6 000+ contigs.
+    // 0 = unbounded (legacy behaviour).
+    int    maxFlatRefContigs    = 0;
 
     // TOL three-layer
     bool        useTolHierarchical = false;
@@ -192,7 +257,7 @@ struct Options {
     int    srK              = 21;            // --sr-kmer-size
     int    srMinKmerFreq    = 0;             // --sr-min-kmer-freq  (0=auto)
     int    srMinUnitigLen   = 200;           // --sr-min-unitig-len
-    int    srMinReadLen     = 50;            // --sr-min-read-len
+    int    srMinReadLen     = 35;            // --sr-min-read-len
     int    srMaxReadLen     = 600;           // --sr-max-read-len
 
     // Coverage estimation
@@ -206,6 +271,14 @@ struct Options {
     // TE classification mode
     bool        teTrainMode    = false;   // --te-train
     bool        teClassifyMode = false;   // --te-classify
+
+    // Diagnostics: fast offline checks that exit before any SV calling.
+    //   --diagnose registry   : load --tol-registry-dir / --tol-index-dir, report
+    //                            descriptors, FASTAs found, FASTAs on disk, CR-in-path,
+    //                            and the resulting TolGlobal allRefs_ size. Catches
+    //                            the CRLF manifest / missing-FASTA class of bug in
+    //                            seconds without going through SV calling.
+    std::string diagnoseMode;
     std::string teIndexPrefix;            // --te-index-prefix  (save/load path stem)
     int         teK            = 21;      // --te-k
     double      teFracminP     = 0.05;    // --te-fracmin-p
@@ -293,6 +366,19 @@ static void usage(const char* argv0) {
 "  --max-ref-memory-mb INT  Cap total reference sequence memory in MB (default 32768)\n"
 "  --single-ref-cache-mb INT Per-thread SA cache cap in MB (default 1024; 0 = unbounded)\n"
 "  --no-flat-ref-fallback Skip flat ref loading/fallback when hierarchical routing is enabled\n"
+"  --skip-flat-if-hier-calls INT  Skip flat-MEM-chain fallback for a query when the\n"
+"                            hierarchical phase already produced >= INT calls (0=off)\n"
+"  --max-flat-ref-contigs INT  Cap unique ref contigs retained in the flat fallback\n"
+"                            SimpleRefIndex (0=unbounded). Useful for fungal refs that\n"
+"                            ship hundreds of unplaced scaffolds per FASTA.\n"
+"\n"
+"Diagnostics:\n"
+"  --diagnose MODE          Run a fast offline health check and exit.\n"
+"                            MODE=registry: replay TolGlobal::init and report\n"
+"                            descriptor count, FASTA existence, CR-in-path, and the\n"
+"                            resulting allRefs_ size. Exit 0 OK, 1 broken, 2 usage.\n"
+"                            Catches CRLF-mangled manifests and missing-FASTA bugs\n"
+"                            in seconds, before any SV calling.\n"
 "\n"
 "TOL three-layer hierarchical:\n"
 "  --tol-hierarchical       Enable the three-layer TOL pipeline\n"
@@ -344,7 +430,7 @@ static void usage(const char* argv0) {
 "  --sr-kmer-size INT       k-mer size for de Bruijn assembly (default 21)\n"
 "  --sr-min-kmer-freq INT   Min k-mer frequency; 0 = auto-detect (default 0)\n"
 "  --sr-min-unitig-len INT  Min unitig bp to emit as pseudo-contig (default 200)\n"
-"  --sr-min-read-len INT    Drop reads shorter than this bp (default 50)\n"
+"  --sr-min-read-len INT    Drop reads shorter than this bp (default 35)\n"
 "  --sr-max-read-len INT    Drop reads longer than this bp (default 600)\n"
 "\n"
 "  Coverage / load:\n"
@@ -444,6 +530,8 @@ static Options parse_args(int argc, char** argv) {
         else if (x == "--max-ref-memory-mb")           o.maxRefMemoryMB    = std::stoi(need(x.c_str(),i));
         else if (x == "--single-ref-cache-mb")         o.singleRefCacheMB  = std::stoi(need(x.c_str(),i));
         else if (x == "--no-flat-ref-fallback")        o.noFlatRefFallback = true;
+        else if (x == "--skip-flat-if-hier-calls")     o.skipFlatIfHierCalls = std::stoi(need(x.c_str(),i));
+        else if (x == "--max-flat-ref-contigs")        o.maxFlatRefContigs = std::stoi(need(x.c_str(),i));
         else if (x == "--query-window-size")           o.queryWindowSize   = std::stoi(need(x.c_str(),i));
         else if (x == "--query-window-overlap")        o.queryWindowOverlap= std::stoi(need(x.c_str(),i));
         else if (x == "--threads")                     o.threads           = std::stoi(need(x.c_str(),i));
@@ -494,6 +582,7 @@ static Options parse_args(int argc, char** argv) {
         // TE classification
         else if (x == "--te-train")                    o.teTrainMode          = true;
         else if (x == "--te-classify")                 o.teClassifyMode       = true;
+        else if (x == "--diagnose")                    o.diagnoseMode         = need(x.c_str(),i);
         else if (x == "--te-index-prefix")             o.teIndexPrefix        = need(x.c_str(),i);
         else if (x == "--te-k")                        o.teK                  = std::stoi(need(x.c_str(),i));
         else if (x == "--te-fracmin-p")                o.teFracminP           = std::stod(need(x.c_str(),i));
@@ -622,6 +711,20 @@ static double kmer_query_containment_from_hashes(const std::unordered_set<uint64
     return static_cast<double>(inter) / static_cast<double>(query.size());
 }
 
+static double kmer_best_containment_from_hashes(const std::unordered_set<uint64_t>& a,
+                                                const std::unordered_set<uint64_t>& b) {
+    if (a.empty() || b.empty()) return 0.0;
+    const auto* small = &a;
+    const auto* big   = &b;
+    if (small->size() > big->size()) std::swap(small, big);
+    size_t inter = 0;
+    for (uint64_t h : *small)
+        if (big->count(h)) ++inter;
+    const double aContain = static_cast<double>(inter) / static_cast<double>(a.size());
+    const double bContain = static_cast<double>(inter) / static_cast<double>(b.size());
+    return std::max(aContain, bContain);
+}
+
 static std::vector<FlatRefView> collect_flat_refs(const SimpleRefIndex& refIdx) {
     std::vector<FlatRefView> flatRefs;
     for (const auto& bucket : refIdx) {
@@ -738,7 +841,9 @@ struct RefSearchCache {
         scored.reserve(flatRefs.size());
         const auto& refHashes = ensure_hashes(k);
         for (size_t i = 0; i < flatRefs.size(); ++i) {
-            const double frac = kmer_jaccard_from_hashes(qHashes, refHashes[i]);
+            const double jaccard = kmer_jaccard_from_hashes(qHashes, refHashes[i]);
+            const double contain = kmer_best_containment_from_hashes(qHashes, refHashes[i]);
+            const double frac = std::max(jaccard, contain);
             if (frac < minOverlap) continue;
             scored.push_back({frac, flatRefs[i].info});
         }
@@ -866,6 +971,20 @@ static bool try_mem_chain_call_single_ref_cached(
         const tol::FederatedOptions& fo,
         VariantCallBridge& call);
 
+// Multi-emit variant: returns ALL per-pair INS/DEL events from the MEM chain
+// (not just the dominant one). TRA/INV/DUP still emit a single representative
+// event, matching the legacy semantics. This is the primary recall fix for
+// real diverged fungal genomes where each query chain contains tens of small
+// SVs that the single-emit path collapsed into one call.
+static bool try_mem_chain_call_single_ref_cached_multi(
+        const std::string& qAsm,
+        const std::string& qContig,
+        const std::string& qSeq,
+        const RefContigInfo* refInfo,
+        SingleRefMemCache& memCache,
+        const tol::FederatedOptions& fo,
+        std::vector<VariantCallBridge>& calls);
+
 static SimpleRefIndex load_simple_ref_index(const Options& o) {
     SimpleRefIndex idx;
 
@@ -875,49 +994,152 @@ static SimpleRefIndex load_simple_ref_index(const Options& o) {
     idx.reserve(paths.size() * 4 + 1);
 
     const size_t maxRefBytes = static_cast<size_t>(std::max(0, o.maxRefMemoryMB)) * 1024 * 1024;
+
+    // ── Visibility: announce the load up front. ──────────────────────────
+    // Without this, the operator saw nothing between Python's "[mycosv]
+    // flat-ref fallback ENABLED" line and the first per-query "[progress]"
+    // line — 5–15 minutes of silence on million_real (256 fungal ref
+    // FASTAs × ~30 Mb on RDS shared storage). That looked like a hang
+    // even when the binary was working correctly.
+    // Threads sized below; emit the announcement after sizing so the
+    // message reflects what will actually happen (serial vs N threads).
+    const auto t0 = std::chrono::steady_clock::now();
+
+    // ── Parallel FASTA load. ─────────────────────────────────────────────
+    // The previous serial loop was the dominant cost in the silent gap
+    // before the first per-query progress line (one syscall + ~30 Mb
+    // string allocation per ref × 256 refs ≈ 5–15 min on shared storage).
+    // Each worker builds a thread-local SimpleRefIndex chunk, then we
+    // merge serially. The memory cap is re-checked at merge time — a
+    // worker may have produced more bytes than the cap allows, but we
+    // accept the soft overshoot rather than blocking workers on a shared
+    // atomic counter. The cap is a budget, not a hard guard.
+    const unsigned hw = std::max(1u, std::thread::hardware_concurrency());
+    unsigned nThreads = std::min<unsigned>(8u, std::min<unsigned>(hw, static_cast<unsigned>(paths.size())));
+    if (const char* env = std::getenv("MYCOSV_REFLOAD_THREADS")) {
+        try { nThreads = std::max<unsigned>(1u, std::min<unsigned>(64u, static_cast<unsigned>(std::stoi(env)))); }
+        catch (...) {}
+    }
+    if (paths.size() <= 1) nThreads = 1;
+
+    if (!o.quiet) {
+        std::cerr << "[refload] reading " << paths.size() << " reference FASTAs ("
+                  << "max " << o.maxRefMemoryMB << " MB)";
+        if (nThreads > 1) std::cerr << " with " << nThreads << " threads";
+        else              std::cerr << " serially";
+        std::cerr << "\n";
+    }
+
+    struct ChunkResult {
+        SimpleRefIndex chunk;
+        size_t bytes = 0;
+    };
+    auto worker = [&](size_t lo, size_t hi, ChunkResult* out, std::atomic<size_t>* doneCounter,
+                      std::atomic<size_t>* lastReportSec, std::chrono::steady_clock::time_point t0) {
+        for (size_t i = lo; i < hi; ++i) {
+            const std::string& fasta_path = paths[i];
+            if (fasta_path.empty() || !fs::exists(fasta_path)) {
+                ++(*doneCounter);
+                continue;
+            }
+            std::string asmName = fs::path(fasta_path).stem().string();
+            try {
+                auto contigs = read_fasta(fasta_path);
+                for (auto& kv : contigs) {
+                    if (kv.first.find("__sv_") != std::string::npos) {
+                        std::cerr << "[warn] reference contig '" << kv.first
+                                  << "' in " << fasta_path
+                                  << " carries a simulator hint suffix (__sv_)."
+                                     " Reference genomes must have plain biological"
+                                     " contig names. This contig will not be indexed.\n";
+                        continue;
+                    }
+                    const int len = static_cast<int>(kv.second.size());
+                    out->bytes += kv.second.size();
+                    out->chunk[kv.first].push_back(RefContigInfo{asmName, kv.first, std::move(kv.second), len});
+                }
+            } catch (const std::exception& e) {
+                std::cerr << "[warn] cannot load reference FASTA " << fasta_path
+                          << ": " << e.what() << '\n';
+            }
+            const size_t done = ++(*doneCounter);
+            if (!o.quiet) {
+                const auto now = std::chrono::steady_clock::now();
+                const size_t elapsed = static_cast<size_t>(
+                    std::chrono::duration_cast<std::chrono::seconds>(now - t0).count());
+                // Per-25-ref OR per-30-second progress, whichever comes first.
+                bool emit = (done % 25 == 0) || (done == paths.size());
+                if (!emit) {
+                    size_t prev = lastReportSec->load(std::memory_order_relaxed);
+                    if (elapsed >= prev + 30) {
+                        if (lastReportSec->compare_exchange_strong(prev, elapsed)) emit = true;
+                    }
+                }
+                if (emit) {
+                    std::cerr << "[refload] " << done << "/" << paths.size()
+                              << " refs loaded (" << elapsed << "s elapsed)\n";
+                }
+            }
+        }
+    };
+
+    std::vector<ChunkResult> chunks(nThreads);
+    std::vector<std::thread> threads;
+    std::atomic<size_t> doneCounter{0};
+    std::atomic<size_t> lastReportSec{0};
+    const size_t per = (paths.size() + nThreads - 1) / nThreads;
+    for (unsigned t = 0; t < nThreads; ++t) {
+        const size_t lo = std::min<size_t>(t * per, paths.size());
+        const size_t hi = std::min<size_t>(lo + per, paths.size());
+        if (lo >= hi) break;
+        threads.emplace_back(worker, lo, hi, &chunks[t], &doneCounter, &lastReportSec, t0);
+    }
+    for (auto& th : threads) th.join();
+
+    // ── Serial merge with memory-cap enforcement. ────────────────────────
     size_t totalRefBytes = 0;
     bool refCapWarned = false;
-
-    auto add_fasta = [&](const std::string& fasta_path) {
-        if (fasta_path.empty() || !fs::exists(fasta_path)) return;
-        if (maxRefBytes > 0 && totalRefBytes >= maxRefBytes) return;
-        std::string asmName = fs::path(fasta_path).stem().string();
-        try {
-            auto contigs = read_fasta(fasta_path);
-            for (const auto& kv : contigs) {
-                if (maxRefBytes > 0 && totalRefBytes + kv.second.size() > maxRefBytes) {
+    // Bug 4 fix: cap unique contig names retained in the flat-fallback
+    // SimpleRefIndex. The per-FASTA cap upstream doesn't constrain the
+    // load — a single fungal ref can ship hundreds of unplaced scaffolds
+    // and a 8-FASTA cap can still expand to 6 000+ contigs at the flat
+    // fallback's iteration unit.
+    const size_t maxRefContigs = static_cast<size_t>(std::max(0, o.maxFlatRefContigs));
+    bool refContigCapWarned = false;
+    for (auto& c : chunks) {
+        for (auto& kv : c.chunk) {
+            for (auto& contig : kv.second) {
+                if (maxRefBytes > 0 && totalRefBytes + contig.sequence.size() > maxRefBytes) {
                     if (!refCapWarned) {
                         std::cerr << "[warn] --max-ref-memory-mb cap (" << o.maxRefMemoryMB
                                   << " MB) reached; skipping remaining reference contigs\n";
                         refCapWarned = true;
                     }
-                    return;
-                }
-                totalRefBytes += kv.second.size();
-                // Reject reference contigs whose names carry simulator hint
-                // suffixes.  If a reference FASTA has __sv_ in a contig name
-                // it means a simulator-generated assembly was accidentally
-                // passed as a reference.  Silently stripping the suffix would
-                // allow the fallback to match via hint structure rather than
-                // via biological contig identity — a ground-truth leak.
-                // We refuse and warn so the user can fix the input.
-                if (kv.first.find("__sv_") != std::string::npos) {
-                    std::cerr << "[warn] reference contig '" << kv.first
-                              << "' in " << fasta_path
-                              << " carries a simulator hint suffix (__sv_)."
-                                 " Reference genomes must have plain biological"
-                                 " contig names. This contig will not be indexed.\n";
                     continue;
                 }
-                idx[kv.first].push_back(RefContigInfo{asmName, kv.first, kv.second, static_cast<int>(kv.second.size())});
+                if (maxRefContigs > 0 && idx.size() >= maxRefContigs &&
+                    idx.find(kv.first) == idx.end()) {
+                    if (!refContigCapWarned) {
+                        std::cerr << "[warn] --max-flat-ref-contigs cap ("
+                                  << o.maxFlatRefContigs
+                                  << ") reached; skipping remaining unique reference contigs\n";
+                        refContigCapWarned = true;
+                    }
+                    continue;
+                }
+                totalRefBytes += contig.sequence.size();
+                idx[kv.first].push_back(std::move(contig));
             }
-        } catch (const std::exception& e) {
-            std::cerr << "[warn] cannot load reference FASTA " << fasta_path
-                      << ": " << e.what() << '\n';
         }
-    };
+    }
 
-    for (const auto& p : paths) add_fasta(p);
+    if (!o.quiet) {
+        const auto t1 = std::chrono::steady_clock::now();
+        const auto sec = std::chrono::duration_cast<std::chrono::seconds>(t1 - t0).count();
+        std::cerr << "[refload] done: " << idx.size() << " unique contig names, "
+                  << (totalRefBytes / (1024 * 1024)) << " MB, "
+                  << sec << "s\n";
+    }
     return idx;
 }
 
@@ -978,7 +1200,33 @@ static int reads_mode_overlap_k(query_input::QueryMode mode, size_t qLen) {
         return (qLen >= 2000) ? 11 : 13;
     if (mode == query_input::QueryMode::SHORT_READS)
         return (qLen >= 800) ? 13 : 17;
-    return 9;
+    // ASSEMBLY: k=9 saturated the 4^9=262 k k-mer space for any multi-Mb
+    // fungal contig, so containment_with_ref_hashes returned ~1.0 for EVERY
+    // reference contig — the prefilter could not tell a true syntenic
+    // homolog from an unrelated genome, and ref selection (perRefRanked /
+    // select_mem_chain_refs) degenerated to an arbitrary partial_sort tie
+    // break. Query chromosomes got chained against the wrong genomes and
+    // the per-sample call volume collapsed. Assembly contigs are error-free,
+    // so a large k is both safe and discriminative: at k=16 a genus-level
+    // homolog still scores ~0.05–0.4 containment while non-homologs fall to
+    // ~0, restoring meaningful ranking. Short assembly fragments keep enough
+    // 16-mers to rank against; sub-16 bp contigs yield no hashes either way.
+    return 16;
+}
+
+static int dynamic_calls_per_contig_cap(const Options& o,
+                                        query_input::QueryMode mode,
+                                        size_t contigLen) {
+    const int base = std::max(1, o.maxCallsPerContig);
+    if (mode != query_input::QueryMode::ASSEMBLY) return base;
+    // Density-aware safety cap. Real fungal SV densities (Fg, Zt, Fo
+    // pangenomes) reach ~1 SV per 1–2 kb in TE-rich accessory compartments
+    // and one per 5–10 kb in core compartments. Scale at the high-density
+    // end (1 / 1500 bp) so chromosome-sized contigs aren't artificially
+    // throttled.
+    const size_t byLength = std::max<size_t>(static_cast<size_t>(base),
+                                              contigLen / 1500);
+    return static_cast<int>(std::min<size_t>(50000, std::max<size_t>(base, byLength)));
 }
 
 static std::vector<const RefContigInfo*>
@@ -1119,8 +1367,17 @@ simple_length_fallback_calls(const std::string& qAsm,
                              ? std::min(best->length,
                                         v.pos + std::abs(delta) - 1)
                              : v.pos;
-        v.refPos       = v.pos;
-        v.refEnd       = v.end;
+        // Same rationale as reads_mode_kmer_fallback above: the length-only
+        // path picked a ref contig from a name match without running an
+        // alignment, so the position is a fixed placeholder
+        // (segmentLen/4 + 1). Setting refPos / refEnd to 0 lets the VCF
+        // emitter skip those INFO fields and the benchmark loader exclude
+        // the call from reference-coord scoring rather than report a
+        // breakpoint at a non-real position. The call is still emitted in
+        // query-coord; downstream callers can promote it back if a real
+        // alignment becomes available.
+        v.refPos       = 0;
+        v.refEnd       = 0;
         v.pantreeClass = v.type;
         v.isNonRefVariant = false;
         v.triallelicTopology = ".";
@@ -1145,11 +1402,29 @@ mem_chain_sv_calls(const std::string& qAsm,
     if (cache.flatRefs.empty()) return out;
 
     out.reserve(contigs.size());
+    // Only pathologically fragmented draft assemblies (>1000 contigs) trip
+    // the per-fragment guard, and even then we skip just the truly tiny
+    // (<10 kb) contigs. The original >100-contig / <1 Mb rule discarded
+    // EVERY sub-Mb contig of a hybrid assembly — e.g. GCA_030512215 has 26
+    // contigs between 10 kb and 1 Mb carrying real genomic sequence that
+    // were all silently dropped. With the k=16 prefilter each fragment now
+    // matches only its true homolog, so the per-fragment SA cost the old
+    // guard worried about is naturally bounded; the guard need only exclude
+    // sub-10 kb scaffolds that cannot carry meaningful chain breakpoints.
+    const bool fragmentedAssembly =
+        mode == query_input::QueryMode::ASSEMBLY && contigs.size() > 1000;
     for (const auto& kv : contigs) {
         const std::string& contigName = kv.first;
         const std::string& seq = kv.second;
         if (static_cast<int>(seq.size()) < o.minSvLen) continue;
         if (is_low_complexity_sequence(seq)) continue;
+        if (fragmentedAssembly && seq.size() < 10000) {
+            // Sub-10 kb fragments of a >1000-contig draft assembly: the
+            // length / off-reference fallbacks below still report coarse
+            // structural signal, but an exact-MEM chain on a fragment this
+            // short produces noise, not breakpoint evidence.
+            continue;
+        }
 
         const int prefilterK = reads_mode_overlap_k(mode, seq.size());
         const auto prefilterHashes = cache.query_hashes(seq, prefilterK);
@@ -1170,31 +1445,109 @@ mem_chain_sv_calls(const std::string& qAsm,
             is_reads_mode_fragment(seq.size(), prefilterBestRefLen, prefilterBestOverlap, o, mode)) {
             continue;
         }
-        VariantCallBridge cachedChainCall;
-        const bool cachedSuccess = prefilterBestRef != nullptr &&
-            prefilterBestOverlap >= 0.01 &&
-            try_mem_chain_call_single_ref_cached(
-                qAsm, contigName, seq, prefilterBestRef, memCache, eff_fo, cachedChainCall);
-        if (cachedSuccess) {
-            out.push_back(cachedChainCall);
-            // For simple indel/duplication calls skip the more expensive multi-ref
-            // chain path. For TRA/INV the single-ref alignment cannot see an
-            // inter-contig breakpoint, so fall through and also try the multi-ref
-            // chain; select_best_call_per_contig will pick the better result.
-            const bool complexRearr = (cachedChainCall.type == "TRA" ||
-                                       cachedChainCall.type == "INV");
-            if (!complexRearr) continue;
-        }
-
+        // ALGORITHMIC FIX (per-ref pairwise + non-waterfall):
+        //   Previously two short-circuits dropped most of the SV burden:
+        //     (a) the multi-ref MEM chain ran ONCE over the top-K refs
+        //         concatenated into a single suffix-array text; the chain
+        //         mosaic across refs is NOT the same as per-ref pairwise
+        //         calls, and one query-vs-best-mosaic loses the SVs that
+        //         only exist relative to OTHER refs.
+        //     (b) if the multi-ref path emitted ANY call, the single-ref
+        //         cached path was skipped (`continue`).
+        //   The literature standard (svim_asm, minigraph, SyRI) is per-ref
+        //   pairwise. We now run BOTH the multi-ref pangenome chain AND a
+        //   per-ref cached chain against every reference whose prefilter
+        //   k-mer containment exceeds a modest floor. Calls union and are
+        //   later type+svlen-deduplicated by select_best_call_per_contig.
         const auto shortlist = select_mem_chain_refs(
             contigName, seq, refIdx, cache, mode,
-            (mode == query_input::QueryMode::ASSEMBLY) ? 8u : 12u);
-        if (shortlist.empty()) continue;
-        const auto refBundle = make_refseq_bundle(shortlist);
+            (mode == query_input::QueryMode::ASSEMBLY) ? 24u : 32u);
+        if (!shortlist.empty()) {
+            const auto refBundle = make_refseq_bundle(shortlist);
+            std::vector<VariantCallBridge> chainCalls;
+            if (tol::try_mem_chain_call_multi_public(qAsm, contigName, seq,
+                                                     refBundle.ptrs, eff_fo, chainCalls)) {
+                for (auto& chainCall : chainCalls)
+                    out.push_back(std::move(chainCall));
+            }
+        }
 
-        VariantCallBridge chainCall;
-        if (tol::try_mem_chain_call_public(qAsm, contigName, seq, refBundle.ptrs, eff_fo, chainCall)) {
-            out.push_back(std::move(chainCall));
+        // Per-ref cached chain over the top-K prefilter-positive references.
+        // The SingleRefMemCache amortises SA cost across queries; the
+        // top-K cap is needed for million_real where N_refs can exceed
+        // 1000 and an unbounded loop blows up runtime even with caching.
+        //
+        // Per-ref selection floor + cap.
+        //
+        // History: the 2026-05-14 "performance fix" raised the floor to 0.10
+        // and the cap to 8 to bound runtime. But with the old k=9 prefilter
+        // every ref scored ~1.0, so 0.10 filtered nothing and the cap of 8
+        // just kept 8 ARBITRARY refs — the genuine homolog was routinely not
+        // among them, which is what collapsed per-sample call volume.
+        //
+        // Now that reads_mode_overlap_k uses k=16 for assembly, containment
+        // is discriminative: a true genus-level homolog scores ~0.05–0.4
+        // while unrelated genomes fall to ~0. A small floor (0.02) therefore
+        // excludes non-homologs on its own — the cap is only a safety net.
+        //
+        // Per-assembly diversity: with the broadened bench_ref_list (hundreds
+        // of ref ASSEMBLIES × several contigs each), a global
+        // top-K is heavily skewed toward whichever ref has the most homologous
+        // chromosomes. We first reserve N slots per ref ASSEMBLY (best contig
+        // each) so every loaded ref gets a chance, then fill remaining slots
+        // with the global top by overlap. Without this, sister-species refs
+        // can shadow more-distant refs entirely and queries from sparser
+        // genera (Lodderomyces, Dactylellina — 6-7 corpus refs each) end up
+        // with 0 contigs from their own genus in the per-ref pairwise loop.
+        constexpr double kPerRefMinOverlap = 0.02;
+        constexpr size_t kMaxPerRefRefs   = 256;
+        constexpr size_t kPerAsmReserved  = 3;
+        struct PerRefCand { size_t idx; double frac; };
+        std::vector<PerRefCand> perRefRanked;
+        perRefRanked.reserve(cache.flatRefs.size());
+        for (size_t i = 0; i < cache.flatRefs.size(); ++i) {
+            const double frac = cache.containment_with_ref_hashes(
+                prefilterHashes, i, prefilterK);
+            if (frac < kPerRefMinOverlap) continue;
+            perRefRanked.push_back({i, frac});
+        }
+        if (perRefRanked.size() > kMaxPerRefRefs) {
+            std::sort(perRefRanked.begin(), perRefRanked.end(),
+                      [](const PerRefCand& a, const PerRefCand& b) {
+                          return a.frac > b.frac;
+                      });
+            // Reserve slots per ref ASSEMBLY in overlap order.
+            std::unordered_map<std::string, size_t> kept_per_asm;
+            std::vector<PerRefCand> diverse;
+            std::vector<PerRefCand> remainder;
+            diverse.reserve(kMaxPerRefRefs);
+            remainder.reserve(perRefRanked.size());
+            for (const auto& pr : perRefRanked) {
+                const RefContigInfo* info = cache.flatRefs[pr.idx].info;
+                if (info == nullptr) { remainder.push_back(pr); continue; }
+                if (kept_per_asm[info->asmName] < kPerAsmReserved) {
+                    diverse.push_back(pr);
+                    ++kept_per_asm[info->asmName];
+                } else {
+                    remainder.push_back(pr);
+                }
+            }
+            for (const auto& pr : remainder) {
+                if (diverse.size() >= kMaxPerRefRefs) break;
+                diverse.push_back(pr);
+            }
+            if (diverse.size() > kMaxPerRefRefs) diverse.resize(kMaxPerRefRefs);
+            perRefRanked = std::move(diverse);
+        }
+        for (const auto& pr : perRefRanked) {
+            const RefContigInfo* refInfo = cache.flatRefs[pr.idx].info;
+            if (refInfo == nullptr) continue;
+            std::vector<VariantCallBridge> perRefCalls;
+            if (try_mem_chain_call_single_ref_cached_multi(
+                    qAsm, contigName, seq, refInfo, memCache,
+                    eff_fo, perRefCalls)) {
+                for (auto& c : perRefCalls) out.push_back(std::move(c));
+            }
         }
     }
     return out;
@@ -1417,6 +1770,365 @@ static bool try_mem_chain_call_single_ref_cached(
     return true;
 }
 
+// Multi-emit chain caller (assembly + reads-mode INS/DEL recall fix).
+// Mirrors try_mem_chain_call_single_ref_cached but uses SvTypeFromChain::classify_all
+// to yield every per-pair INS/DEL gap instead of only the chain's dominant event.
+// On real diverged fungal genomes a single chain typically contains 10–100 small SVs
+// that the single-emit path collapsed into one call, driving recall to ~5%.
+static bool try_mem_chain_call_single_ref_cached_multi(
+        const std::string& qAsm,
+        const std::string& qContig,
+        const std::string& qSeq,
+        const RefContigInfo* refInfo,
+        SingleRefMemCache& memCache,
+        const tol::FederatedOptions& fo,
+        std::vector<VariantCallBridge>& calls) {
+    calls.clear();
+    if (refInfo == nullptr || refInfo->sequence.empty() || qSeq.empty()) return false;
+
+    SingleRefMemIndex& idx = memCache.get(refInfo);
+    const tol::SuffixArray& sa = idx.sa;
+    const tol::TolGlobal::RefSeq& primaryRef = idx.ref;
+    const std::string rcSeq = tol::SuffixArray::revcomp(qSeq);
+
+    auto min_mem_from_k = [](int k) {
+        return std::max(15, k - 5);
+    };
+
+    struct MultiChainAttempt {
+        std::vector<VariantCallBridge> calls;
+        double score   = 0.0;
+        int    anchors = 0;
+        bool   valid   = false;
+    };
+
+    auto attempt_chain = [&](int minMem, bool secondaryPass) {
+        MultiChainAttempt out;
+        auto fwdMems = sa.find_mems(qSeq, minMem);
+        auto revMems = sa.find_mems(rcSeq, minMem);
+        for (auto& m : revMems)
+            m.qPos = static_cast<int>(qSeq.size()) - m.qPos - m.len;
+
+        std::vector<tol::SuffixArray::Mem> allMems;
+        std::vector<bool> isRev;
+        allMems.reserve(fwdMems.size() + revMems.size());
+        isRev.reserve(fwdMems.size() + revMems.size());
+        for (auto& m : fwdMems) { allMems.push_back(m); isRev.push_back(false); }
+        for (auto& m : revMems) { allMems.push_back(m); isRev.push_back(true); }
+        if (allMems.empty()) return out;
+
+        std::vector<int> order(allMems.size());
+        std::iota(order.begin(), order.end(), 0);
+        std::sort(order.begin(), order.end(),
+                  [&](int a, int b) {
+                      return allMems[static_cast<size_t>(a)].qPos <
+                             allMems[static_cast<size_t>(b)].qPos;
+                  });
+
+        std::unordered_map<uint64_t, size_t> posToMemIdx;
+        posToMemIdx.reserve(allMems.size());
+        for (size_t mi = 0; mi < allMems.size(); ++mi) {
+            uint64_t key = (static_cast<uint64_t>(allMems[mi].qPos) << 32) |
+                           static_cast<uint64_t>(static_cast<uint32_t>(allMems[mi].rPos));
+            posToMemIdx.emplace(key, mi);
+        }
+
+        // Fix 4: short pseudocontigs (typical sr_unitig in short-reads mode,
+        // lr_pcN clusters in long-reads mode) often carry one strong MEM
+        // anchor plus weak/divergent flanks — the chain.size() >= 2 +
+        // minBlockScore = 6 gate forced 98 % of them to OFF_REF. Soften both
+        // gates when qSeq is short so the chain caller can fire on a single
+        // good anchor.
+        const bool shortPseudocontig = qSeq.size() < 1000;
+        const double scoreFloor = shortPseudocontig
+            ? std::min(fo.minBlockScore, 3.0)
+            : fo.minBlockScore;
+        const size_t minChainAnchors = shortPseudocontig ? 1u : 2u;
+
+        // Fix 1: iterative multi-chain extraction. A chromosome-length contig
+        // typically has 5–50 independent syntenic blocks separated by SVs
+        // (each block is its own MEM chain because the gap between blocks
+        // exceeds chainGapBand=5 kbp). The old code took only
+        // treap.best_chain_path() — i.e. one block per (qcontig, ref) pair —
+        // so a sample with 250 SVs scattered across the genome got reduced
+        // to ~17 emitted calls. Now we extract chains best-first, mark their
+        // MEMs as consumed, rebuild the treap from the rest, and repeat.
+        //
+        // Cap scales with query length at ~1 chain per 50 kb (matches the
+        // typical fungal syntenic-block spacing), capped at 1024 for safety.
+        const int maxChainsPerCall = std::max(
+            64,
+            std::min(1024, static_cast<int>(qSeq.size() / 50000)));
+        const int maxGap = fo.chainGapBand > 0 ? fo.chainGapBand : 5000;
+        std::vector<bool> memConsumed(allMems.size(), false);
+        std::vector<tol::SvTypeFromChain::Result> aggregatedEvents;
+        double topChainScore = 0.0;
+        int    topChainAnchors = 0;
+        std::vector<tol::SuffixArray::Mem> topChain;
+        std::vector<bool> topChainRev;
+
+        for (int chainIter = 0; chainIter < maxChainsPerCall; ++chainIter) {
+            tol::ChainTreap treap;
+            int memsLeft = 0;
+            for (int i : order) {
+                if (memConsumed[static_cast<size_t>(i)]) continue;
+                ++memsLeft;
+                const auto& m = allMems[static_cast<size_t>(i)];
+                treap.insert_and_chain(m.qPos, m.rPos, m.len,
+                                       static_cast<float>(m.len), maxGap);
+            }
+            if (memsLeft == 0) break;
+
+            auto chainIdx = treap.best_chain_path();
+            if (chainIdx.empty()) break;
+
+            const double bestScore = static_cast<double>(treap.best_chain_score());
+            if (bestScore < scoreFloor) break;
+
+            std::vector<tol::SuffixArray::Mem> chain;
+            std::vector<bool> chainRev;
+            std::vector<size_t> chainMemIdx;
+            chain.reserve(chainIdx.size());
+            chainRev.reserve(chainIdx.size());
+            chainMemIdx.reserve(chainIdx.size());
+            for (int ni : chainIdx) {
+                const auto& nd = treap.nodes_[static_cast<size_t>(ni)];
+                uint64_t key = (static_cast<uint64_t>(nd.qPos) << 32) |
+                               static_cast<uint64_t>(static_cast<uint32_t>(nd.rPos));
+                auto it = posToMemIdx.find(key);
+                if (it != posToMemIdx.end()) {
+                    chain.push_back(allMems[it->second]);
+                    chainRev.push_back(isRev[it->second]);
+                    chainMemIdx.push_back(it->second);
+                }
+            }
+
+            // ALGORITHMIC FIX (recall): treap.best_chain_path() returns the
+            // highest-SCORING chain, not the longest. A single long MEM
+            // (score = len) routinely outranks a multi-anchor chain of
+            // shorter MEMs. The old code did `break` here, so as soon as
+            // the top-scoring residual chain had < minChainAnchors anchors
+            // we abandoned ALL further iterations — including any genuine
+            // multi-anchor chains hiding behind the long singleton. Mark
+            // the offending MEMs consumed and `continue` instead: the next
+            // iteration's treap rebuild will then surface the multi-anchor
+            // chains we actually want. The `chainIdx.empty()` and
+            // `bestScore < scoreFloor` breaks above already guarantee
+            // forward progress (the loop bound also fences against runaway).
+            if (chain.size() < minChainAnchors) {
+                for (size_t mi : chainMemIdx) memConsumed[mi] = true;
+                continue;
+            }
+
+            // Mark this chain's MEMs as consumed so the next iteration
+            // searches the remaining genome instead of re-extracting the
+            // same chain.
+            for (size_t mi : chainMemIdx) memConsumed[mi] = true;
+
+            auto events = tol::SvTypeFromChain::classify_all(
+                chain, chainRev, sa, fo.minSvLen);
+
+            // DUP fallback applies only on the first chain — the rescue is
+            // about catching a tandem-dup pattern that ChainTreap silently
+            // drops because it requires strictly-increasing rPos. After we
+            // start iterating, the previously consumed MEMs would distort
+            // this signal.
+            if (chainIter == 0) {
+                const bool needsDupRescue = events.empty() ||
+                    (events.size() == 1 &&
+                     (events.front().type == tol::SvTypeFromChain::Type::INS));
+                if (needsDupRescue) {
+                    std::vector<tol::SuffixArray::Mem> fwdSorted;
+                    fwdSorted.reserve(fwdMems.size());
+                    for (int i : order)
+                        if (!isRev[static_cast<size_t>(i)])
+                            fwdSorted.push_back(allMems[static_cast<size_t>(i)]);
+                    if (fwdSorted.size() >= 2) {
+                        auto dupRes = tol::SvTypeFromChain::classify(
+                            fwdSorted, std::vector<bool>(fwdSorted.size(), false),
+                            sa, fo.minSvLen);
+                        if (dupRes.type == tol::SvTypeFromChain::Type::DUP) {
+                            double dupScore = 0.0;
+                            for (const auto& m : fwdSorted) dupScore += static_cast<double>(m.len);
+                            if (dupScore >= fo.minBlockScore) {
+                                events.assign(1, dupRes);
+                                chain    = fwdSorted;
+                                chainRev.assign(fwdSorted.size(), false);
+                            }
+                        }
+                    }
+                }
+            }
+            if (events.empty()) continue;
+
+            // ALGORITHMIC FIX (recall): capture topChain on the first chain
+            // that PRODUCES EVENTS, not strictly chainIter==0. The old check
+            // would leave topChain empty if iteration 0 yielded no events
+            // (now also possible because the <minChainAnchors continue we
+            // added above can skip iteration 0). With topChain empty,
+            // fill_common would emit every aggregatedEvent with
+            // blockScore=0 and anchors=0 — and select_best_call_per_contig
+            // would drop them all via its blockScore < minBlockScore (=6)
+            // gate, silently throwing away every event from this query
+            // contig × ref pair.
+            if (topChain.empty()) {
+                topChainScore   = bestScore;
+                topChainAnchors = static_cast<int>(chain.size());
+                topChain        = chain;
+                topChainRev     = chainRev;
+            }
+            for (auto& ev : events) aggregatedEvents.push_back(std::move(ev));
+        }
+
+        if (aggregatedEvents.empty()) return out;
+
+        // Sub-event aggregation: when classify_all emits many tiny INS/DEL within
+        // a few hundred bp of each other (typical of microsatellite mis-anchoring),
+        // merging them into a single representative call reduces FP rate without
+        // hurting recall — the comparator truth set also collapses these.
+        // Decoupled from minSvLen — see fungi_tol_bridge.hpp:mergeWindow note.
+        const int mergeWindow = 80;
+        std::sort(aggregatedEvents.begin(), aggregatedEvents.end(),
+                  [](const tol::SvTypeFromChain::Result& a,
+                     const tol::SvTypeFromChain::Result& b) {
+                      if (a.qBreakStart != b.qBreakStart) return a.qBreakStart < b.qBreakStart;
+                      return a.svLen > b.svLen;
+                  });
+        std::vector<tol::SvTypeFromChain::Result> merged;
+        merged.reserve(aggregatedEvents.size());
+        for (auto& ev : aggregatedEvents) {
+            if (!merged.empty()) {
+                auto& last = merged.back();
+                if (last.type == ev.type &&
+                    last.rContig == ev.rContig &&
+                    std::abs(ev.qBreakStart - last.qBreakEnd) <= mergeWindow) {
+                    last.qBreakEnd = std::max(last.qBreakEnd, ev.qBreakEnd);
+                    last.rBreakEnd = std::max(last.rBreakEnd, ev.rBreakEnd);
+                    last.svLen     = std::max(last.svLen, ev.svLen);
+                    continue;
+                }
+            }
+            merged.push_back(std::move(ev));
+        }
+
+        // Use the top chain's metadata for the call header (alignment mode,
+        // score, anchor count). Per-event chain identity isn't currently
+        // recorded; downstream metrics only use the per-VCF aggregate.
+        const double bestScore = topChainScore;
+        std::vector<tol::SuffixArray::Mem>& chain = topChain;
+        std::vector<bool>& chainRev = topChainRev;
+        (void)chainRev;  // silence unused warning when no TRA emitted
+
+        auto fill_common = [&](VariantCallBridge& v) {
+            v.qAsm = qAsm;
+            v.qContig = qContig;
+            v.refAsm = primaryRef.asmName.empty() ? "unknown" : primaryRef.asmName;
+            v.refContig = primaryRef.contig.empty() ? "." : primaryRef.contig;
+            v.refPos = 0;
+            v.refEnd = 0;
+            v.genotype = "0/1";
+            v.gq = 40.0;
+            v.blockScore = bestScore;
+            v.anchors = static_cast<int>(chain.size());
+            v.alignmentMode = secondaryPass
+                ? "mem_chain_cached_single_ref_multi;secondary_seed_rescue"
+                : "mem_chain_cached_single_ref_multi";
+            v.mapq = 50.0;
+            v.annotation = "NONE";
+            v.triallelicTopology = ".";
+            v.isNonRefVariant = false;
+            v.cladeRank = ".";
+            v.phylum = ".";
+        };
+
+        using T = tol::SvTypeFromChain::Type;
+        for (const auto& res : merged) {
+            if (res.type == T::NONE) continue;
+            VariantCallBridge v;
+            fill_common(v);
+            v.pos = std::max(1, res.qBreakStart + 1);
+            v.end = std::max(v.pos, res.qBreakEnd >= 0 ? res.qBreakEnd + 1 : v.pos);
+            v.svlen = res.svLen;
+            switch (res.type) {
+                case T::INS:
+                    v.type = "INS"; v.pantreeClass = "INS";
+                    v.refPos = res.rBreakStart >= 0 ? (res.rBreakStart + 1) : 0;
+                    v.refEnd = v.refPos;
+                    break;
+                case T::DEL:
+                    v.type = "DEL"; v.pantreeClass = "DEL";
+                    v.refPos = res.rBreakStart >= 0 ? (res.rBreakStart + 1) : 0;
+                    v.refEnd = res.rBreakEnd > 0 ? res.rBreakEnd : v.refPos;
+                    break;
+                case T::INV:
+                    v.type = "INV"; v.pantreeClass = "INV";
+                    v.refPos = res.rBreakStart >= 0 ? (res.rBreakStart + 1) : 0;
+                    v.refEnd = res.rBreakEnd > 0 ? res.rBreakEnd : v.refPos;
+                    break;
+                case T::DUP:
+                    v.type = "DUP"; v.pantreeClass = "DUP";
+                    v.refPos = res.rBreakStart >= 0 ? (res.rBreakStart + 1) : 0;
+                    v.refEnd = res.rBreakEnd > 0 ? res.rBreakEnd : v.refPos;
+                    break;
+                case T::TRA:
+                    v.type = "TRA"; v.pantreeClass = "NON_REF";
+                    {
+                        const int srcRPos = !chain.empty()
+                            ? (chain.front().rPos + chain.front().len) : 0;
+                        int srcCi = -1;
+                        for (int ci = 0; ci < static_cast<int>(sa.contigEnd.size()); ++ci) {
+                            if (srcRPos < sa.contigEnd[static_cast<size_t>(ci)]) {
+                                srcCi = ci; break;
+                            }
+                        }
+                        if (srcCi < 0 && !sa.contigEnd.empty())
+                            srcCi = static_cast<int>(sa.contigEnd.size()) - 1;
+                        const int srcOff = (srcCi > 0)
+                            ? sa.contigEnd[static_cast<size_t>(srcCi) - 1] : 0;
+                        v.refPos = srcRPos > 0 ? (srcRPos - srcOff + 1) : 0;
+                        v.refEnd = v.refPos;
+                    }
+                    v.mateContig = res.rContig.empty() ? primaryRef.contig : res.rContig;
+                    v.matePos = res.rBreakStart + 1;
+                    v.mateEnd = res.rBreakEnd > 0 ? res.rBreakEnd : v.matePos;
+                    v.mateRefAsm = primaryRef.asmName.empty() ? "." : primaryRef.asmName;
+                    v.mateOffReference = false;
+                    break;
+                default:
+                    continue;
+            }
+            out.calls.push_back(std::move(v));
+        }
+
+        if (out.calls.empty()) return out;
+        out.score   = bestScore;
+        out.anchors = static_cast<int>(chain.size());
+        out.valid   = true;
+        return out;
+    };
+
+    const int primaryMinMem = min_mem_from_k(fo.primarySketchParams.k);
+    MultiChainAttempt best = attempt_chain(primaryMinMem, false);
+    if (fo.useSecondarySeeds) {
+        const int secondaryMinMem = min_mem_from_k(fo.secondarySketchParams.k);
+        const bool rescueRequested = !best.valid ||
+            best.anchors < static_cast<int>(std::max<size_t>(fo.repeatRescueMinAnchors, 2));
+        if (secondaryMinMem < primaryMinMem && rescueRequested) {
+            MultiChainAttempt rescue = attempt_chain(secondaryMinMem, true);
+            if (rescue.valid &&
+                (!best.valid ||
+                 rescue.calls.size() > best.calls.size() ||
+                 rescue.anchors > best.anchors ||
+                 rescue.score   > best.score)) {
+                best = std::move(rescue);
+            }
+        }
+    }
+    if (!best.valid) return false;
+    calls = std::move(best.calls);
+    return !calls.empty();
+}
+
 static std::vector<VariantCallBridge>
 simple_offref_fallback_calls(const std::string& qAsm,
                              const std::unordered_map<std::string, std::string>& contigs,
@@ -1427,11 +2139,21 @@ simple_offref_fallback_calls(const std::string& qAsm,
     std::vector<VariantCallBridge> out;
     const int noveltyK = std::max(5, std::min(o.tolFallbackK, 9));
     cache.ensure_hashes(noveltyK);
+    const bool fragmentedAssembly =
+        mode == query_input::QueryMode::ASSEMBLY && contigs.size() > 100;
     for (const auto& kv : contigs) {
         const std::string& contigName = kv.first;
         const std::string& seq = kv.second;
         if (static_cast<int>(seq.size()) < o.minSvLen) continue;
         if (is_low_complexity_sequence(seq)) continue;
+        if (fragmentedAssembly && seq.size() < 1000000) {
+            // Whole-contig novelty scans are not meaningful for highly
+            // fragmented draft assemblies: hundreds of short contigs would
+            // each be compared to every benchmark reference contig, dominating
+            // runtime while producing coarse OFF_REF calls. Length fallback
+            // still captures obvious PAV/indel-scale differences.
+            continue;
+        }
 
         // Do not reject a contig purely because its FASTA name exists in the
         // reference set. In the hint-free simulator and in real data, a query
@@ -1499,7 +2221,9 @@ simple_offref_fallback_calls(const std::string& qAsm,
         }
 
         const std::string tier = novelty_tier_for_overlap(bestOverlap);
-        if (tier != "NOVEL" && tier != "NOVEL_WEAK" && tier != "DIVERGED") continue;
+        // Emit all four tiers including OFF_REF_KNOWN.
+        if (tier != "NOVEL" && tier != "NOVEL_WEAK" && tier != "DIVERGED" &&
+            tier != "OFF_REF_KNOWN") continue;
 
         // Compute background GC from the best-matching reference if available,
         // otherwise default to 0.45.
@@ -1540,28 +2264,6 @@ simple_offref_fallback_calls(const std::string& qAsm,
         v.cladeRank = ".";
         v.phylum = ".";
         out.push_back(std::move(v));
-    }
-    if (mode != query_input::QueryMode::ASSEMBLY && out.size() > 1) {
-        std::vector<VariantCallBridge> filtered;
-        filtered.reserve(out.size());
-        const VariantCallBridge* bestWeak = nullptr;
-        for (const auto& call : out) {
-            const bool weakGeneric =
-                call.type == "OFF_REF" &&
-                call.annotation == "NOVEL_WEAK" &&
-                (call.elementClass.empty() || call.elementClass == "NONE");
-            if (!weakGeneric) {
-                filtered.push_back(call);
-                continue;
-            }
-            if (bestWeak == nullptr ||
-                call.svlen > bestWeak->svlen ||
-                (call.svlen == bestWeak->svlen && call.qContig < bestWeak->qContig)) {
-                bestWeak = &call;
-            }
-        }
-        if (bestWeak != nullptr) filtered.push_back(*bestWeak);
-        return filtered;
     }
     return out;
 }
@@ -1644,33 +2346,70 @@ reads_mode_sv_calls(const std::string& qAsm,
             is_reads_mode_fragment(seq.size(), prefilterBestRefLen, prefilterBestOverlap, o, mode)) {
             continue;
         }
-        // Pass 1a: single-ref MEM chain (fast path; good for INS/DEL).
-        VariantCallBridge cachedChainCall;
-        bool singleRefOk = false;
-        if (prefilterBestRef != nullptr &&
-            prefilterBestOverlap >= 0.01 &&
-            try_mem_chain_call_single_ref_cached(
-                qAsm, contigName, seq, prefilterBestRef, memCache, eff_fo, cachedChainCall)) {
-            out.push_back(cachedChainCall);
-            singleRefOk = true;
-            // TRA/INV/DUP already confirmed from a single reference — no need for
-            // the more expensive multi-ref chain.
-            if (cachedChainCall.type != "INS" && cachedChainCall.type != "DEL") {
-                continue;
+        // ALGORITHMIC FIX (per-ref pairwise + non-waterfall) — mirrors the
+        // assembly path. Run BOTH the multi-ref pangenome MEM chain AND a
+        // per-ref cached MEM chain against every prefilter-positive
+        // reference, AND the length-delta Pass 2 below. No `continue`
+        // short-circuits between passes.
+        const auto shortlist = select_mem_chain_refs(contigName, seq, refIdx, cache, mode, 32u);
+        if (!shortlist.empty()) {
+            const auto refBundle = make_refseq_bundle(shortlist);
+            std::vector<VariantCallBridge> chainCalls;
+            if (tol::try_mem_chain_call_multi_public(qAsm, contigName, seq,
+                                                     refBundle.ptrs, eff_fo, chainCalls)) {
+                for (auto& chainCall : chainCalls) out.push_back(std::move(chainCall));
             }
         }
-
-        // Pass 1b: multi-ref MEM chain (detects TRA/INV/DUP across contig boundaries).
-        // Runs even when Pass 1a succeeded with an indel so that a cross-contig TRA
-        // gets added as a competing candidate and arbitration can pick the better call.
-        const auto shortlist = select_mem_chain_refs(contigName, seq, refIdx, cache, mode, 12u);
-        const auto refBundle = make_refseq_bundle(shortlist);
-        VariantCallBridge chainCall;
-        if (tol::try_mem_chain_call_public(qAsm, contigName, seq, refBundle.ptrs, eff_fo, chainCall)) {
-            out.push_back(std::move(chainCall));
-            continue;
+        // Per-assembly diversity (see assembly-mode comment above).
+        constexpr double kPerRefMinOverlap = 0.02;
+        constexpr size_t kMaxPerRefRefs   = 160;
+        constexpr size_t kPerAsmReserved  = 3;
+        struct PerRefCand { size_t idx; double frac; };
+        std::vector<PerRefCand> perRefRanked;
+        perRefRanked.reserve(cache.flatRefs.size());
+        for (size_t i = 0; i < cache.flatRefs.size(); ++i) {
+            const double frac = cache.containment_with_ref_hashes(
+                prefilterHashes, i, prefilterK);
+            if (frac < kPerRefMinOverlap) continue;
+            perRefRanked.push_back({i, frac});
         }
-        if (singleRefOk) continue;
+        if (perRefRanked.size() > kMaxPerRefRefs) {
+            std::sort(perRefRanked.begin(), perRefRanked.end(),
+                      [](const PerRefCand& a, const PerRefCand& b) {
+                          return a.frac > b.frac;
+                      });
+            std::unordered_map<std::string, size_t> kept_per_asm;
+            std::vector<PerRefCand> diverse;
+            std::vector<PerRefCand> remainder;
+            diverse.reserve(kMaxPerRefRefs);
+            remainder.reserve(perRefRanked.size());
+            for (const auto& pr : perRefRanked) {
+                const RefContigInfo* info = cache.flatRefs[pr.idx].info;
+                if (info == nullptr) { remainder.push_back(pr); continue; }
+                if (kept_per_asm[info->asmName] < kPerAsmReserved) {
+                    diverse.push_back(pr);
+                    ++kept_per_asm[info->asmName];
+                } else {
+                    remainder.push_back(pr);
+                }
+            }
+            for (const auto& pr : remainder) {
+                if (diverse.size() >= kMaxPerRefRefs) break;
+                diverse.push_back(pr);
+            }
+            if (diverse.size() > kMaxPerRefRefs) diverse.resize(kMaxPerRefRefs);
+            perRefRanked = std::move(diverse);
+        }
+        for (const auto& pr : perRefRanked) {
+            const RefContigInfo* refInfo = cache.flatRefs[pr.idx].info;
+            if (refInfo == nullptr) continue;
+            std::vector<VariantCallBridge> perRefCalls;
+            if (try_mem_chain_call_single_ref_cached_multi(
+                    qAsm, contigName, seq, refInfo, memCache,
+                    eff_fo, perRefCalls)) {
+                for (auto& c : perRefCalls) out.push_back(std::move(c));
+            }
+        }
 
         // ── Pass 2: k-mer overlap + length delta (INS/DEL) ────────────
         double    bestOverlap = 0.0;
@@ -1734,15 +2473,26 @@ reads_mode_sv_calls(const std::string& qAsm,
             v.end           = (v.type == "DEL")
                 ? std::min(bestRefLen, midPoint + std::abs(delta) - 1)
                 : midPoint;
-            v.refPos        = v.pos;
-            v.refEnd        = v.end;
+            // Reference coordinates are NOT meaningful in the kmer-fallback
+            // path — we picked the best-containment ref contig by k-mer
+            // sketch but ran no alignment, so the midpoint is a placeholder
+            // and would always miss a comparator's actual breakpoint. Leave
+            // refPos/refEnd at 0 so write_vcf_record omits the REFPOS /
+            // REFEND fields and load_mycosv_reference_calls excludes the
+            // call from the reference-coord truth/pred set. The call still
+            // appears in query-coord scoring and the multisample VCF.
+            v.refPos        = 0;
+            v.refEnd        = 0;
             v.pantreeClass  = v.type;
             v.isNonRefVariant    = false;
             v.triallelicTopology = ".";
             v.cladeRank = ".";
             v.phylum = ".";
             out.push_back(std::move(v));
-            continue;
+            // Algorithmic fix: removed the `continue` that short-circuited
+            // Pass 3 below. Pass 3 OFF_REF emission is handled by
+            // simple_offref_fallback_calls downstream, but we no longer
+            // skip the rest of the per-contig accumulator either way.
         }
 
         // ── Pass 3: OFF_REF (overlap < 0.20) ──────────────────────────
@@ -2009,24 +2759,21 @@ static double candidate_priority_score(const VariantCallBridge& call,
             score += namedOverlap * 60.0;
         }
 
-        // Only apply the "large rearrangement that looks like indel" suppression for
-        // DUP (which should match by length).  INV legitimately spans large fractions
-        // of repeat-rich pathogen contigs, so applying this penalty causes false
-        // negatives in two_speed_pathogen_extreme and similar scenarios.
-        if (call.type == "DUP" && deltaLooksLikeIndel && namedOverlap >= 0.35) {
-            score -= 90.0;
-            if (!sameNamedRef) score -= 50.0;
-        }
-        // Do not penalise INV for spanning >60% of the query contig: large whole-
-        // contig inversions are common in TE-rich fungal pathogens.
+        // Algorithmic fix: dropped the DUP "looks-like-indel" -90/-140
+        // penalty. In fungi, tandem duplications of effector clusters or
+        // TE arrays *do* produce a length delta matching the duplicated
+        // copy, and the previous code systematically downvoted them to
+        // below the secondary floor, eliminating real DUP calls in
+        // two-speed pathogens (Fusarium, Zymoseptoria).
     } else if (mode != query_input::QueryMode::ASSEMBLY) {
-        // Reads-mode pseudo-contigs usually have synthetic names (sr_unitig*,
-        // lr_pc*), so name-based arbitration is unavailable. In that case,
-        // favor indels that still show real sequence overlap and penalize
-        // large rearrangements whose assigned reference has essentially none.
+        // Reads-mode pseudo-contigs (sr_unitig*, lr_pc*) lack stable contig
+        // names so name-based arbitration is unavailable. The penalties
+        // below are appropriate for reads mode because near-zero overlap
+        // with the assigned reference signals a chimeric assembly artifact
+        // (genuine reads-mode SVs always anchor at one end). For ASSEMBLY
+        // mode these don't fire (the if-branch above runs instead), so
+        // they don't suppress real low-overlap fungal pangenome SVs.
         if (indel && overlap >= 0.04) score += 110.0;
-        // TRA confirmed across two reference contigs (mateContig set, primary overlap
-        // high) is treated on equal footing with a high-confidence indel.
         if (call.type == "TRA" && !call.mateContig.empty() && overlap >= 0.30) score += 115.0;
         if (largeRearr && overlap < 0.02) score -= 180.0;
         if (largeRearr && overlap < 0.05) score -= 70.0;
@@ -2057,67 +2804,193 @@ select_best_call_per_contig(const std::unordered_map<std::string, std::string>& 
         const auto seqIt = contigs.find(kv.first);
         if (seqIt == contigs.end()) continue;
         const std::string& qSeq = seqIt->second;
-        const VariantCallBridge* best = nullptr;
-        tol::FusedEvidenceScore bestFused;
-        double bestScore = -1e100;
-        // Track best OFF_REF candidate separately so we can override the
-        // winner when it turns out to be a hallucinated indel/rearrangement
-        // on a contig that is actually novel (see post-pass below).
-        const VariantCallBridge* bestOff = nullptr;
-        tol::FusedEvidenceScore bestOffFused;
-        double bestOffOverlap = 0.0;
+
+        // ALGORITHMIC FIX (recall):
+        //   The previous design picked ONE top winner per contig and then
+        //   added up to (contigCap-1) "secondaries" gated by a hard
+        //   secondaryFloor = bestSc.score - 200. On real fungal pangenomes
+        //   (e.g. F. graminearum 52 420 SVs / panel, ≈500 per pairwise) most
+        //   genuine SVs score well below the top pick and were silently
+        //   dropped. The pipeline became architecturally bounded at
+        //   O(maxCallsPerContig * n_contigs) regardless of true SV burden.
+        //
+        //   New behaviour: emit EVERY candidate whose blockScore meets the
+        //   user-set minBlockScore floor and whose svlen/anchor counts are
+        //   above the configured minima, with type-aware non-overlap so a
+        //   co-located INS+DEL+DUP+OFF_REF set (typical at TE breakpoints)
+        //   all survive. The single contigCap is retained only as a runaway
+        //   safety net at 10× the previous default.
+        struct ScoredCand {
+            const VariantCallBridge* call = nullptr;
+            tol::FusedEvidenceScore fused;
+            double score = 0.0;
+        };
+        std::vector<ScoredCand> scored;
+        scored.reserve(kv.second.size());
+
         for (const auto& cand : kv.second) {
             tol::FusedEvidenceScore fused;
             const double score = candidate_priority_score(
                 cand, kv.second, qSeq, refIdx, cache, o, mode, report, &fused);
-            if (best == nullptr || score > bestScore) {
-                best = &cand;
-                bestScore = score;
-                bestFused = fused;
+            scored.push_back({ &cand, fused, score });
+        }
+        if (scored.empty()) continue;
+
+        std::sort(scored.begin(), scored.end(),
+                  [](const ScoredCand& a, const ScoredCand& b) {
+                      return a.score > b.score;
+                  });
+
+        // Safety cap retained but very large; the meaningful floor is now
+        // minBlockScore + minAnchors on the candidate itself.
+        const int contigCap = dynamic_calls_per_contig_cap(o, mode, qSeq.size());
+        // mergeSlop kept very small — only collapse two truly identical
+        // SVs at the same coordinate. SAME-TYPE adjacency is the only
+        // legitimate fusion case; cross-type calls always coexist.
+        const int mergeSlop = std::max(20, o.minSvLen / 2);
+
+        // ── ALGORITHMIC FIX (precision): per-contig reference consolidation ──
+        //   The hierarchical multi-ref search emits candidate calls against
+        //   EVERY reference assembly a query contig touched. A length/off-ref
+        //   fallback that a real chain alignment has already superseded, or a
+        //   2-anchor `secondary_seed_rescue` stub on the SAME ref the chain
+        //   already explains, is a search artifact. We drop those when a true
+        //   chain has out-scored them by a wide margin.
+        //
+        //   We deliberately DO NOT drop genuine cross-reference chain calls
+        //   here, even when they are far weaker than the dominant ref's chain.
+        //   In a fungal multi-reference benchmark each query contig may carry
+        //   real, distinct SVs against several related refs (sister-species
+        //   pangenome; the same query position can be DEL vs ref_A and INS
+        //   vs ref_B). The earlier 4× cross-ref drop collapsed per-query call
+        //   counts ~10× on million_real because the strongest sister-species
+        //   chain shadowed every other ref's signal.
+        double dominantBlock = 0.0;
+        for (const auto& sc : scored) {
+            if (sc.call && sc.call->blockScore > dominantBlock) {
+                dominantBlock = sc.call->blockScore;
             }
-            if (cand.type == "OFF_REF" &&
-                (cand.annotation == "NOVEL" || cand.annotation == "NOVEL_WEAK" ||
-                 cand.annotation == "DIVERGED")) {
-                if (bestOff == nullptr || cand.svlen > bestOff->svlen) {
-                    bestOff = &cand;
-                    bestOffFused = fused;
-                    bestOffOverlap = candidate_ref_overlap(qSeq, cand, refIdx, cache, mode);
+        }
+        const double dominanceFactor = 4.0;
+        auto is_simple_fallback = [](const std::string& m) {
+            return m.rfind("simple_length_fallback", 0) == 0 ||
+                   m.rfind("simple_offref_fallback", 0) == 0;
+        };
+        // `secondary_seed_rescue` is a recall-oriented second pass that emits
+        // marginal 2–4 anchor stubs. Such a stub is legitimate only when no
+        // primary chain explains the contig — once a real chain dominates
+        // (4× block score), a far-weaker rescue stub is redundant noise even
+        // when it lands on the dominant reference.
+        auto is_secondary_rescue = [](const std::string& m) {
+            return m.find("secondary_seed_rescue") != std::string::npos;
+        };
+
+        // Per-type kept intervals: an INS at pos X does not block a DEL
+        // or OFF_REF at the same position (literature: TE breakpoints
+        // routinely carry co-located insertions, deletions and novelty).
+        struct KeptInterval { int pos; int end; int svlen; };
+        std::unordered_map<std::string, std::vector<KeptInterval>> keptByType;
+
+        // Score floor must be below the OFF_REF starting score (-250). The
+        // real per-candidate gate is the minBlockScore check below, which
+        // is exempt for OFF_REF (those have no chain-derived blockScore).
+        const double scoreFloor = -400.0;
+
+        int emittedThisContig = 0;
+        for (const auto& sc : scored) {
+            if (sc.call == nullptr) continue;
+            if (sc.score < scoreFloor) continue;
+            // Apply the user-set minimum-block-score floor as the real gate,
+            // not a runtime-relative cutoff. Off-ref/novelty calls do not
+            // have a chain-derived blockScore so are exempt.
+            if (sc.call->type != "OFF_REF" &&
+                sc.call->blockScore < o.minBlockScore) continue;
+
+            // Reference-consolidation gate (see comment above): drop only the
+            // search artifacts — simple_* fallbacks and secondary_seed_rescue
+            // stubs — when they are far weaker than the dominant chain. Genuine
+            // cross-reference chain calls are kept; a sister-species pangenome
+            // legitimately surfaces distinct SVs against multiple refs.
+            const bool farWeaker =
+                sc.call->blockScore * dominanceFactor < dominantBlock;
+            bool lengthDeltaSupportedIndel = false;
+            if (is_simple_fallback(sc.call->alignmentMode) &&
+                (sc.call->type == "INS" || sc.call->type == "DEL")) {
+                const RefContigInfo* namedBest =
+                    best_ref_match(refIdx, sc.call->qContig, static_cast<int>(qSeq.size()));
+                if (namedBest != nullptr &&
+                    sc.call->refAsm == namedBest->asmName &&
+                    sc.call->refContig == namedBest->contigName) {
+                    const int delta = static_cast<int>(qSeq.size()) - namedBest->length;
+                    const int deltaAbs = std::abs(delta);
+                    const int svAbs = std::abs(sc.call->svlen);
+                    lengthDeltaSupportedIndel =
+                        deltaAbs >= o.minSvLen &&
+                        deltaAbs <= o.maxSvLen &&
+                        std::abs(svAbs - deltaAbs) <= std::max(10, deltaAbs / 10);
                 }
             }
-        }
-        // OFF_REF override (assembly mode only): if the priority winner is an
-        // indel/rearrangement with very low chain support AND there is a
-        // valid novelty-tier OFF_REF candidate on the same contig, the indel
-        // is almost certainly a stray-k-mer artifact (the caller forced an
-        // alignment against an unrelated reference because the contig is
-        // actually novel).  Switch to the OFF_REF candidate.  Real anchored
-        // indels in the simulator accumulate BSCORE in the thousands, so the
-        // BSCORE<100 cap reliably separates noise from signal.
-        //
-        // Restricted to assembly mode because reads-mode pseudo-contigs
-        // (sr_unitig*, lr_pc*) legitimately have low overlap on every
-        // candidate; reads mode already filters spurious OFF_REF emissions
-        // upstream in simple_offref_fallback_calls (locus-overlap gates).
-        if (mode == query_input::QueryMode::ASSEMBLY &&
-            best != nullptr && bestOff != nullptr && best != bestOff) {
-            const bool indel = (best->type == "INS" || best->type == "DEL");
-            const bool rearr = (best->type == "INV" || best->type == "DUP" ||
-                                is_translocation_type(best->type));
-            const double bestOverlap = candidate_ref_overlap(qSeq, *best, refIdx, cache, mode);
-            if ((indel || rearr) && best->blockScore < 100.0 && bestOverlap < 0.10) {
-                best = bestOff;
-                bestFused = bestOffFused;
-                (void)bestOffOverlap;
+            if (farWeaker &&
+                (is_simple_fallback(sc.call->alignmentMode) ||
+                 is_secondary_rescue(sc.call->alignmentMode)) &&
+                !lengthDeltaSupportedIndel) {
+                continue;
             }
-        }
-        if (best != nullptr) {
-            VariantCallBridge chosen = *best;
+
+            // ALGORITHMIC FIX (recall): bucket by (type, refAsm), not type
+            // alone. A DEL of the query at position X relative to sister-
+            // species ref_A and a DEL at the same X relative to a more
+            // distant ref_B are GENUINELY DIFFERENT calls — distinct
+            // (qAsm, refAsm) pairs in the multi-sample VCF. The earlier
+            // type-only key collapsed all per-ref pairwise emissions into a
+            // single call per (type, pos), undoing the cross-ref dominance
+            // gate fix above: 11 of every 12 cross-ref signals were lost in
+            // dedup, even though we explicitly kept them through the gate.
+            auto& kept = keptByType[sc.call->type + "\x1f" + sc.call->refAsm];
+
+            const int cs = sc.call->pos, ce = sc.call->end;
+            const int svl = std::abs(sc.call->svlen);
+            bool overlaps = false;
+            for (const auto& kp : kept) {
+                const int ks = kp.pos, ke = kp.end;
+                // Same-type / same-ref proximity window: two same-type calls
+                // on one query contig against the SAME ref whose positions
+                // fall within ~half the event length AND whose lengths agree
+                // (within 2×) are the SAME SV reported by two alignment
+                // modes — e.g. mem_chain_ds13 and mem_chain_cached emitting
+                // the identical 500 bp DEL a few dozen bp apart. Collapsing
+                // them is the dominant same-type FP source. Genuinely
+                // distinct co-located SVs (different size or >window apart)
+                // still coexist via the bare mergeSlop.
+                const int sameSvl = std::abs(kp.svlen);
+                // Only collapse two same-type calls that are genuinely the
+                // SAME event reported twice: near-identical size (within
+                // 1.5x + 50 bp) AND physically close. The previous rule
+                // (2x + 100 bp size tolerance, window up to 1000 bp) fused
+                // distinct co-located SVs in TE-rich fungal compartments —
+                // exactly the high-density regions that carry most of the
+                // real SV burden — and was a major drag on call volume.
+                const bool lenAgree =
+                    2 * std::max(svl, sameSvl) <= 3 * std::min(svl, sameSvl) + 100;
+                const int win = lenAgree
+                    ? std::max(mergeSlop, std::min(std::max(svl, sameSvl) / 6, 100))
+                    : mergeSlop;
+                if (cs <= ke + win && ce + win >= ks) {
+                    overlaps = true;
+                    break;
+                }
+            }
+            if (overlaps) continue;
+
+            VariantCallBridge chosen = *sc.call;
             chosen.queryMode = modeLabel;
-            chosen.fusedPosteriorAlt = bestFused.posteriorAlt;
-            chosen.fusedLogOddsAlt = bestFused.logOddsAlt;
-            chosen.fusedEffectiveDepth = bestFused.effectiveDepth;
-            chosen.fusedLayersUsed = static_cast<int>(bestFused.layersUsed);
+            chosen.fusedPosteriorAlt = sc.fused.posteriorAlt;
+            chosen.fusedLogOddsAlt = sc.fused.logOddsAlt;
+            chosen.fusedEffectiveDepth = sc.fused.effectiveDepth;
+            chosen.fusedLayersUsed = static_cast<int>(sc.fused.layersUsed);
             out.push_back(std::move(chosen));
+            kept.push_back({cs, ce, sc.call->svlen});
+            if (++emittedThisContig >= contigCap) break;
         }
     }
     return out;
@@ -2131,12 +3004,22 @@ deduplicate_read_mode_events(std::vector<VariantCallBridge> calls) {
     std::unordered_map<std::string, size_t> bestByEvent;
 
     auto event_key = [](const VariantCallBridge& c) {
-        if (c.type == "OFF_REF" && c.annotation == "NOVEL_WEAK")
-            return std::string("OFF_REF:NOVEL_WEAK");
+        // Tightened position bucket from 250 → 25 bp. The wider bucket fused
+        // genuine adjacent SVs in TE-rich loci where the literature finds the
+        // densest signal (Fusarium two-speed compartments, Zymoseptoria
+        // accessory chromosomes). svlen bucket is 50 bp — together they
+        // require both close position and similar size to collapse.
+        if (c.type == "OFF_REF") {
+            const int posBucket = std::max(0, c.pos) / 25;
+            return c.type + ":" + c.annotation + ":" + c.qContig + ":" +
+                   std::to_string(posBucket);
+        }
         if (c.type == "INS" || c.type == "DEL" || c.type == "DUP" ||
             c.type == "INV" || is_translocation_type(c.type)) {
-            const int bucket = std::max(1, std::abs(c.svlen) / 100);
-            return c.type + ":" + c.refAsm + ":" + c.refContig + ":" + std::to_string(bucket);
+            const int bucket = std::max(1, std::abs(c.svlen) / 50);
+            const int posBucket = std::max(0, c.refPos > 0 ? c.refPos : c.pos) / 25;
+            return c.type + ":" + c.refAsm + ":" + c.refContig + ":" +
+                   std::to_string(posBucket) + ":" + std::to_string(bucket);
         }
         return c.type + ":" + c.qContig + ":" + std::to_string(c.pos);
     };
@@ -2189,13 +3072,30 @@ filter_low_coverage_read_artifacts(std::vector<VariantCallBridge> calls,
         const bool anchoredIndel = c.type == "INS" || c.type == "DEL";
         const bool cachedSingleRef =
             c.alignmentMode.find("mem_chain_cached_single_ref") != std::string::npos;
-        if (rearrangement &&
-            cachedSingleRef) {
-            continue;
+        // Previously: every cachedSingleRef INV/DUP/TRA was wiped at low
+        // coverage, which killed real low-coverage ONT rearrangements (a
+        // primary use case for fungal pangenome work). Keep them when chain
+        // evidence is reasonable; only drop the most fragile.
+        // Algorithmic fix: anchors<3 AND blockScore<8 at low coverage is
+        // exactly what real fungal 5–10× ONT data looks like — the chain
+        // is short by sequencing depth, not by artifact. Use a much
+        // gentler gate that only drops the weakest combination, and
+        // recognise type-specific evidence (mated TRA, mem_chain INV
+        // with cross-strand evidence) as adequate even at minimal anchors.
+        if (rearrangement && cachedSingleRef) {
+            const bool stronglyEvidenced =
+                (c.type == "TRA" && !c.mateContig.empty()) ||
+                c.blockScore >= 6.0 ||
+                c.anchors >= 2 ||
+                parse_pseudo_contig_read_support(c.qContig) >= 2;
+            if (!stronglyEvidenced) continue;
         }
         if (report.mode == query_input::QueryMode::LONG_READS &&
             anchoredIndel && cachedSingleRef &&
-            parse_pseudo_contig_read_support(c.qContig) < 3) {
+            parse_pseudo_contig_read_support(c.qContig) < 1) {
+            // Single-read INS/DEL at 5–10× ONT *can* be real, especially in
+            // TE-rich loci where coverage collapses. Only drop if pseudo
+            // contig carries explicit read support of 0.
             continue;
         }
         out.push_back(std::move(c));
@@ -2332,9 +3232,13 @@ static tol::FederatedOptions make_fed_opts(const Options& o) {
         o.tolAncestralRecomb,
         o.tolRecombMinSegBp,
         o.tolRecombMaxBp);
-    // Multi-ref SA cap = 2× single-ref limit; each of the up to 8 shortlisted
-    // refs can be up to saMaxContigMB, so the total text cap is twice that.
-    fo.saMaxTextMB = static_cast<size_t>(std::max(0, o.saMaxContigMB)) * 2;
+    // Multi-ref SA is a pangenome-rescue path, not the main pairwise caller.
+    // It still needs enough text to hold ordinary fungal chromosomes/scaffolds;
+    // a 1 MB cap silently skipped nearly every real contig and disabled
+    // cross-contig TRA evidence.  Keep it bounded for the old compact_yeast
+    // hang, but allow a modest chromosome-scale bundle.
+    const size_t userMultiRefCap = static_cast<size_t>(std::max(0, o.saMaxContigMB)) * 2;
+    fo.saMaxTextMB = userMultiRefCap == 0 ? 64 : std::min<size_t>(userMultiRefCap, 64);
     return fo;
 }
 
@@ -2626,11 +3530,23 @@ struct QueryResult {
     std::vector<VariantCallBridge> calls;
 };
 
+// CheckpointWriters: optional sink for per-phase partial outputs. When provided,
+// process_query writes the raw hierarchical-phase calls to hier_vcf / hier_tsv
+// before the flat-MEM-chain fallback starts, so a SIGKILL during the fallback
+// does not discard work the hierarchical phase already completed.
+struct CheckpointWriters {
+    std::ofstream*    hier_tsv = nullptr;
+    std::ofstream*    hier_vcf = nullptr;
+    std::mutex*       mu       = nullptr;
+    std::atomic<int>* sv_id    = nullptr;
+};
+
 static QueryResult
 process_query(const std::string& qAsmPath,
               const Options& o,
               const tol::FederatedOptions& fo,
-              const SimpleRefIndex* refIdx = nullptr) {
+              const SimpleRefIndex* refIdx = nullptr,
+              const CheckpointWriters* ckpt = nullptr) {
     QueryResult qr;
     qr.qAsm = fs::path(qAsmPath).stem().string();
 
@@ -2682,33 +3598,168 @@ process_query(const std::string& qAsmPath,
         }
     };
 
+    size_t hierarchical_call_count = 0;
     if (qo.useTolHierarchical && tol::TolGlobal::instance().is_initialized()) {
+        if (!qo.quiet)
+            std::cerr << "[query-progress] " << qr.qAsm
+                      << ": hierarchical routing/calling start (contigs="
+                      << qr.contigs.size() << ")\n";
+        const bool per_contig_checkpoint =
+            ckpt && ckpt->hier_tsv && ckpt->hier_vcf && ckpt->mu && ckpt->sv_id;
+        size_t per_contig_checkpoint_calls = 0;
+        std::unique_ptr<tol::ScopedPerContigFlushHook> scoped_flush_hook;
+        if (per_contig_checkpoint) {
+            scoped_flush_hook = std::make_unique<tol::ScopedPerContigFlushHook>(
+                [ckpt, &modeLabel, &per_contig_checkpoint_calls](
+                    const std::string&,
+                    const std::string&,
+                    const std::vector<VariantCallBridge>& contigCalls) {
+                    if (contigCalls.empty()) return;
+                    std::lock_guard<std::mutex> lk(*ckpt->mu);
+                    for (const auto& c : contigCalls) {
+                        VariantCallBridge cc = c;
+                        if (cc.queryMode.empty()) cc.queryMode = modeLabel;
+                        write_tsv_record(*ckpt->hier_tsv, cc);
+                        write_vcf_record(*ckpt->hier_vcf, cc, ckpt->sv_id->fetch_add(1));
+                        ++per_contig_checkpoint_calls;
+                    }
+                    ckpt->hier_tsv->flush();
+                    ckpt->hier_vcf->flush();
+                });
+        }
         auto hcalls = qo.tolMultiRank
             ? tol::hierarchical_call_assembly_multirank(
                   qr.qAsm, qr.contigs, eff_fo,
                   static_cast<size_t>(std::max(1, qo.routingTopN)))
             : tol::hierarchical_call_assembly(qr.qAsm, qr.contigs, eff_fo);
+        scoped_flush_hook.reset();
+        hierarchical_call_count = hcalls.size();
+        if (!qo.quiet)
+            std::cerr << "[query-progress] " << qr.qAsm
+                      << ": hierarchical routing/calling done (calls="
+                      << hierarchical_call_count << ")\n";
+        // Bug 1 fix: write raw hierarchical calls to the checkpoint outputs
+        // BEFORE the flat-MEM-chain fallback runs. The flat fallback can
+        // iterate thousands of contigs and exceed the wrapper's
+        // mycosv_tool_timeout; without this write, SIGKILL discards the
+        // hierarchical work entirely. The checkpoint files are append-only
+        // and represent a "guaranteed at least this much" view.
+        if (per_contig_checkpoint) {
+            if (!qo.quiet)
+                std::cerr << "[query-progress] " << qr.qAsm
+                          << ": hierarchical per-contig checkpoint flushed ("
+                          << per_contig_checkpoint_calls << " calls)\n";
+        } else if (ckpt && ckpt->hier_tsv && ckpt->hier_vcf && ckpt->mu && ckpt->sv_id) {
+            std::lock_guard<std::mutex> lk(*ckpt->mu);
+            for (auto& c : hcalls) {
+                VariantCallBridge cc = c;
+                if (cc.queryMode.empty()) cc.queryMode = modeLabel;
+                write_tsv_record(*ckpt->hier_tsv, cc);
+                write_vcf_record(*ckpt->hier_vcf, cc, ckpt->sv_id->fetch_add(1));
+            }
+            ckpt->hier_tsv->flush();
+            ckpt->hier_vcf->flush();
+            if (!qo.quiet)
+                std::cerr << "[query-progress] " << qr.qAsm
+                          << ": hierarchical checkpoint flushed ("
+                          << hierarchical_call_count << " calls)\n";
+        }
         add_candidates(std::move(hcalls));
     }
 
-    if (refIdx != nullptr) {
+    // Bug 2 fix: optional gate that skips the flat-MEM-chain fallback when
+    // the hierarchical phase already produced enough calls. Set via
+    // --skip-flat-if-hier-calls N. The flat fallback iterates every contig
+    // in the SimpleRefIndex (thousands on a fungal ref panel) and is the
+    // dominant per-query cost; this gate lets the operator keep the
+    // fallback as a safety net for queries that didn't route, without
+    // paying its cost on queries hierarchical handled.
+    const bool skip_flat_due_to_hier =
+        (qo.skipFlatIfHierCalls > 0 &&
+         hierarchical_call_count >= static_cast<size_t>(qo.skipFlatIfHierCalls));
+    if (skip_flat_due_to_hier && refIdx != nullptr && !qo.quiet) {
+        std::cerr << "[query-progress] " << qr.qAsm
+                  << ": flat MEM-chain fallback SKIPPED (hierarchical calls="
+                  << hierarchical_call_count
+                  << " >= --skip-flat-if-hier-calls "
+                  << qo.skipFlatIfHierCalls << ")\n";
+    }
+
+    if (refIdx != nullptr && !skip_flat_due_to_hier) {
         if (prep.report.mode == query_input::QueryMode::ASSEMBLY) {
-            add_candidates(mem_chain_sv_calls(
-                qr.qAsm, qr.contigs, *refIdx, *refCache, *singleRefMemCache,
-                qo, eff_fo, prep.report.mode));
-            add_candidates(simple_length_fallback_calls(qr.qAsm, qr.contigs, *refIdx, qo));
+            if (!qo.quiet)
+                std::cerr << "[query-progress] " << qr.qAsm
+                          << ": flat MEM-chain fallback start (refs="
+                          << refIdx->size() << " contig names)\n";
+            try {
+                add_candidates(mem_chain_sv_calls(
+                    qr.qAsm, qr.contigs, *refIdx, *refCache, *singleRefMemCache,
+                    qo, eff_fo, prep.report.mode));
+            } catch (const std::bad_alloc&) {
+                std::cerr << "[warn] " << qr.qAsm
+                          << ": flat MEM-chain fallback skipped after std::bad_alloc; "
+                             "continuing with hierarchical/simple candidates\n";
+            } catch (const std::exception& e) {
+                std::cerr << "[warn] " << qr.qAsm
+                          << ": flat MEM-chain fallback skipped: "
+                          << e.what() << '\n';
+            }
+            if (!qo.quiet)
+                std::cerr << "[query-progress] " << qr.qAsm
+                          << ": flat MEM-chain fallback done\n";
+            try {
+                add_candidates(simple_length_fallback_calls(qr.qAsm, qr.contigs, *refIdx, qo));
+            } catch (const std::exception& e) {
+                std::cerr << "[warn] " << qr.qAsm
+                          << ": simple length fallback skipped: "
+                          << e.what() << '\n';
+            }
         } else {
-            add_candidates(reads_mode_sv_calls(
-                qr.qAsm, qr.contigs, *refIdx, *refCache, *singleRefMemCache,
-                qo, eff_fo, prep.report.mode));
+            if (!qo.quiet)
+                std::cerr << "[query-progress] " << qr.qAsm
+                          << ": reads-mode flat fallback start (refs="
+                          << refIdx->size() << " contig names)\n";
+            try {
+                add_candidates(reads_mode_sv_calls(
+                    qr.qAsm, qr.contigs, *refIdx, *refCache, *singleRefMemCache,
+                    qo, eff_fo, prep.report.mode));
+            } catch (const std::bad_alloc&) {
+                std::cerr << "[warn] " << qr.qAsm
+                          << ": reads-mode flat fallback skipped after std::bad_alloc; "
+                             "continuing with hierarchical/simple candidates\n";
+            } catch (const std::exception& e) {
+                std::cerr << "[warn] " << qr.qAsm
+                          << ": reads-mode flat fallback skipped: "
+                          << e.what() << '\n';
+            }
+            if (!qo.quiet)
+                std::cerr << "[query-progress] " << qr.qAsm
+                          << ": reads-mode flat fallback done\n";
         }
 
-        add_candidates(simple_offref_fallback_calls(
-            qr.qAsm, qr.contigs, *refIdx, *refCache, qo, prep.report.mode));
+        if (!qo.quiet)
+            std::cerr << "[query-progress] " << qr.qAsm
+                      << ": off-reference fallback/select start\n";
+        try {
+            add_candidates(simple_offref_fallback_calls(
+                qr.qAsm, qr.contigs, *refIdx, *refCache, qo, prep.report.mode));
+        } catch (const std::bad_alloc&) {
+            std::cerr << "[warn] " << qr.qAsm
+                      << ": off-reference fallback skipped after std::bad_alloc; "
+                         "selecting existing candidates\n";
+        } catch (const std::exception& e) {
+            std::cerr << "[warn] " << qr.qAsm
+                      << ": off-reference fallback skipped: "
+                      << e.what() << '\n';
+        }
 
         qr.calls = select_best_call_per_contig(qr.contigs, candidates, *refIdx, *refCache, qo,
                                                prep.report.mode, modeLabel,
                                                &prep.report);
+        if (!qo.quiet)
+            std::cerr << "[query-progress] " << qr.qAsm
+                      << ": off-reference fallback/select done (selected="
+                      << qr.calls.size() << ")\n";
         if (prep.report.mode != query_input::QueryMode::ASSEMBLY) {
             qr.calls = deduplicate_read_mode_events(std::move(qr.calls));
             qr.calls = filter_low_coverage_read_artifacts(std::move(qr.calls), prep.report);
@@ -2718,7 +3769,9 @@ process_query(const std::string& qAsmPath,
             assign_low_coverage_genotype_cosine(qr.calls, prep.report);
         }
     } else {
-        // No flat-ref fallback active (--no-flat-ref-fallback + tol-hierarchical).
+        // No flat-ref fallback active (either --no-flat-ref-fallback + tol-hierarchical,
+        // or --skip-flat-if-hier-calls fired on this query because the hierarchical
+        // phase already produced enough calls).
         // candidates here only carry hierarchical calls; without refIdx we
         // can't rerun candidate_priority_score, but we must still pick the
         // BEST hierarchical candidate per query contig — taking front()
@@ -2733,20 +3786,54 @@ process_query(const std::string& qAsmPath,
                    0.001 * static_cast<double>(std::abs(c.svlen)) +
                    (c.type == "OFF_REF" && c.annotation == "NOVEL" ? 1.0 : 0.0);
         };
+        const int mergeSlop = std::max(20, qo.minSvLen / 2);
         for (auto& kv : candidates) {
             if (kv.second.empty()) continue;
-            const VariantCallBridge* best = &kv.second.front();
-            double bestScore = fallback_score(*best);
-            for (auto it = kv.second.begin() + 1; it != kv.second.end(); ++it) {
-                const double s = fallback_score(*it);
-                if (s > bestScore) {
-                    best = &(*it);
-                    bestScore = s;
-                }
+            const auto seqIt = qr.contigs.find(kv.first);
+            const size_t contigLen = (seqIt == qr.contigs.end()) ? 0 : seqIt->second.size();
+            const int contigCap = dynamic_calls_per_contig_cap(qo, prep.report.mode, contigLen);
+            std::vector<std::pair<const VariantCallBridge*, double>> scored;
+            scored.reserve(kv.second.size());
+            for (const auto& cand : kv.second) {
+                scored.emplace_back(&cand, fallback_score(cand));
             }
-            VariantCallBridge chosen = *best;
-            chosen.queryMode = modeLabel;
-            qr.calls.push_back(std::move(chosen));
+            std::sort(scored.begin(), scored.end(),
+                      [](const auto& a, const auto& b) { return a.second > b.second; });
+            // Top-K non-overlapping per-contig: same idea as the flat-ref path.
+            // Single-pick collapsed multi-emit chain output (and the per-chain
+            // INS/DEL events surfaced by classify_all) down to one call,
+            // throttling recall on chromosome-sized contigs that carry many
+            // distinct SVs.
+            struct KeptInterval { int pos; int end; int svlen; };
+            std::unordered_map<std::string, std::vector<KeptInterval>> keptByType;
+            int keptCount = 0;
+            for (const auto& sc : scored) {
+                if (keptCount >= contigCap) break;
+                if (sc.first == nullptr) continue;
+                const int cs = sc.first->pos, ce = sc.first->end;
+                const int svl = std::abs(sc.first->svlen);
+                auto& kept = keptByType[sc.first->type + "\x1f" + sc.first->refAsm];
+                bool overlaps = false;
+                for (const auto& kp : kept) {
+                    const int ks = kp.pos, ke = kp.end;
+                    const int sameSvl = std::abs(kp.svlen);
+                    const bool lenAgree =
+                        2 * std::max(svl, sameSvl) <= 3 * std::min(svl, sameSvl) + 100;
+                    const int win = lenAgree
+                        ? std::max(mergeSlop, std::min(std::max(svl, sameSvl) / 4, 250))
+                        : mergeSlop;
+                    if (cs <= ke + win && ce + win >= ks) {
+                        overlaps = true;
+                        break;
+                    }
+                }
+                if (overlaps) continue;
+                VariantCallBridge chosen = *sc.first;
+                chosen.queryMode = modeLabel;
+                qr.calls.push_back(std::move(chosen));
+                kept.push_back({cs, ce, sc.first->svlen});
+                ++keptCount;
+            }
         }
         if (prep.report.mode != query_input::QueryMode::ASSEMBLY) {
             qr.calls = deduplicate_read_mode_events(std::move(qr.calls));
@@ -3067,12 +4154,172 @@ static int run_tol_validation(const Options& o) {
 // main
 // ============================================================
 int main(int argc, char** argv) {
+    install_signal_handlers();
     Options o;
     try {
         o = parse_args(argc, argv);
     } catch (const std::exception& e) {
         std::cerr << "[error] " << e.what() << '\n';
         return 1;
+    }
+
+    // ---- Diagnose mode -----------------------------------------------
+    // Login-node-fast health checks; exits before any SV calling. Use this
+    // when the multisample VCF is empty/all-OFF_REF or when changing
+    // routing-index inputs — catches CRLF-mangled paths, missing FASTAs,
+    // and unloaded registry sequences in seconds.
+    if (!o.diagnoseMode.empty()) {
+        if (o.diagnoseMode == "registry") {
+            if (o.tolRegistryDir.empty()) {
+                std::cerr << "[diagnose] --tol-registry-dir is required for --diagnose registry\n";
+                return 2;
+            }
+            const fs::path manifestPath = fs::path(o.tolRegistryDir) / "clade_manifest.tsv";
+            std::cout << "[diagnose] registry: " << o.tolRegistryDir << "\n";
+            std::cout << "[diagnose] manifest: " << manifestPath.string()
+                      << "  exists=" << (fs::exists(manifestPath) ? "yes" : "NO") << "\n";
+
+            // 1) Raw manifest CR check — counts ANY \r in the file, not just
+            // trailing CR. The original bug ([Bug 5]) had \r mid-line, embedded
+            // inside column 8 (fasta_paths), so a trailing-only check missed it.
+            size_t cr_anywhere = 0, total_lines = 0;
+            if (fs::exists(manifestPath)) {
+                std::ifstream in(manifestPath);
+                std::string line;
+                while (std::getline(in, line)) {
+                    ++total_lines;
+                    for (char c : line) if (c == '\r') ++cr_anywhere;
+                }
+            }
+            std::cout << "[diagnose] manifest: " << total_lines
+                      << " lines, " << cr_anywhere
+                      << " stray CR character(s) in body";
+            if (cr_anywhere > 0) {
+                std::cout << "  (CRLF/embedded-CR detected — readers MUST strip \\r; "
+                             "see split_tab/split_csv in fungi_tol_bridge.hpp; "
+                             "ignoring this corrupts fs::exists on the final path "
+                             "of every multi-FASTA cell)";
+            }
+            std::cout << "\n";
+
+            // 2) Manifest-only sanity (cheap, no FASTA reads). Always runs.
+            tol::ManifestRegistry quickReg(o.tolRegistryDir);
+            try { quickReg.load_from_disk(); }
+            catch (const std::exception& e) {
+                std::cerr << "[diagnose] manifest load threw: " << e.what() << "\n";
+                return 1;
+            }
+            const auto& descs = quickReg.descriptors();
+
+            size_t descs_with_fastas = 0, total_fastapaths = 0, paths_exist = 0,
+                   paths_with_cr = 0, paths_with_ws = 0;
+            std::unordered_set<std::string> unique_paths;
+            for (const auto& d : descs) {
+                if (!d.fastaPaths.empty()) ++descs_with_fastas;
+                for (const auto& fp : d.fastaPaths) {
+                    ++total_fastapaths;
+                    unique_paths.insert(fp);
+                    if (fs::exists(fp)) ++paths_exist;
+                    if (fp.find('\r') != std::string::npos) ++paths_with_cr;
+                    if (!fp.empty() && (std::isspace(static_cast<unsigned char>(fp.front())) ||
+                                         std::isspace(static_cast<unsigned char>(fp.back()))))
+                        ++paths_with_ws;
+                }
+            }
+
+            std::cout << "[diagnose] descriptors=" << descs.size()
+                      << " with_fastas=" << descs_with_fastas
+                      << "\n";
+            std::cout << "[diagnose] fasta_paths total=" << total_fastapaths
+                      << " unique=" << unique_paths.size()
+                      << " exist_on_disk=" << paths_exist
+                      << " with_embedded_CR=" << paths_with_cr
+                      << " with_leading_or_trailing_WS=" << paths_with_ws
+                      << "\n";
+
+            // Sample 3 paths for eyeballing.
+            std::cout << "[diagnose] sample registry paths:\n";
+            size_t shown = 0;
+            for (const auto& d : descs) {
+                if (shown >= 3) break;
+                if (d.fastaPaths.empty()) continue;
+                const std::string& p = d.fastaPaths.front();
+                std::cout << "  clade=" << d.cladeName
+                          << " rank=" << d.cladeRank
+                          << " fasta=" << p
+                          << " exists=" << (fs::exists(p) ? "yes" : "NO")
+                          << "\n";
+                ++shown;
+            }
+
+            // 3) Optional full-load check — only if --ref-list provides a
+            // constraint. Without it, TolGlobal::init would try to load all
+            // 9 000+ FASTAs (~300 GB) which OOMs on a login node. With a
+            // constraint, we load only those refs and report allRefs_ size.
+            size_t allRefsAfter = 0, byContigAfter = 0;
+            bool ranInit = false;
+            if (!o.refList.empty()) {
+                std::unordered_set<std::string> allowedTolFastas;
+                for (const auto& p : read_list(o.refList))
+                    if (!p.empty()) allowedTolFastas.insert(p);
+                if (!allowedTolFastas.empty()) {
+                    std::cout << "[diagnose] running TolGlobal::init with --ref-list filter ("
+                              << allowedTolFastas.size() << " allowed FASTAs)...\n";
+                    try {
+                        tol::TolGlobal::instance().init(
+                            o.tolIndexDir.empty() ? o.tolRegistryDir : o.tolIndexDir,
+                            o.tolRegistryDir,
+                            o.tolCacheGB << 30,
+                            o.tolCacheEntries,
+                            &allowedTolFastas);
+                        ranInit = true;
+                        allRefsAfter   = tol::TolGlobal::instance().all_refs().size();
+                        byContigAfter  = tol::TolGlobal::instance().refs_by_contig().size();
+                        std::cout << "[diagnose] TolGlobal.allRefs_=" << allRefsAfter
+                                  << " refs_by_contig=" << byContigAfter << "\n";
+                    } catch (const std::exception& e) {
+                        std::cerr << "[diagnose] TolGlobal::init threw: " << e.what() << "\n";
+                        return 1;
+                    }
+                }
+            } else {
+                std::cout << "[diagnose] skipping TolGlobal::init (no --ref-list "
+                             "supplied; pass --ref-list to verify allRefs_ load)\n";
+            }
+
+            // Verdict — non-zero exit on any clear-cut breakage so callers
+            // (smoke scripts, pre-flight checks in submit.sh) can branch on rc.
+            int rc = 0;
+            std::cout << "[diagnose] verdict: ";
+            if (descs.empty()) {
+                std::cout << "BROKEN — no descriptors parsed from manifest";
+                rc = 1;
+            } else if (paths_exist == 0 && total_fastapaths > 0) {
+                std::cout << "BROKEN — every manifest FASTA missing on disk "
+                             "(CR-mangled?=" << paths_with_cr << ", total="
+                          << total_fastapaths << ")";
+                rc = 1;
+            } else if (ranInit && allRefsAfter == 0) {
+                std::cout << "BROKEN — TolGlobal::init produced allRefs_=0 even with --ref-list";
+                rc = 1;
+            } else if (cr_anywhere > 0) {
+                std::cout << "DEGRADED — manifest contains " << cr_anywhere
+                          << " stray CR char(s); readers must strip "
+                             "(split_tab/split_csv in fungi_tol_bridge.hpp do this since [Bug 5] fix)";
+                rc = 0;
+            } else if (paths_with_cr > 0) {
+                std::cout << "DEGRADED — " << paths_with_cr
+                          << " path(s) contain \\r; readers must strip (split_tab/split_csv do)";
+                rc = 0;
+            } else {
+                std::cout << "OK";
+            }
+            std::cout << "\n";
+            return rc;
+        }
+        std::cerr << "[diagnose] unknown mode '" << o.diagnoseMode
+                  << "'.  Supported: registry\n";
+        return 2;
     }
 
     // ---- TE train mode -----------------------------------------------
@@ -3215,21 +4462,51 @@ int main(int argc, char** argv) {
             return 1;
         }
         try {
+            std::unordered_set<std::string> allowedTolFastas;
+            if (!o.refList.empty()) {
+                for (const auto& p : read_list(o.refList)) {
+                    if (!p.empty()) allowedTolFastas.insert(p);
+                }
+            }
+            const std::unordered_set<std::string>* allowedTolFastasPtr =
+                allowedTolFastas.empty() ? nullptr : &allowedTolFastas;
             tol::TolGlobal::instance().init(
                 o.tolIndexDir,
                 o.tolRegistryDir,
                 o.tolCacheGB << 30,
-                o.tolCacheEntries);
+                o.tolCacheEntries,
+                allowedTolFastasPtr);
             if (o.tolMultiRank || o.tolAncestralAlign) {
                 tol::MultiRankIndex::instance().init(
                     o.tolIndexDir,
                     o.tolRegistryDir,
                     o.tolCacheGB << 30,
-                    o.tolCacheEntries);
+                    o.tolCacheEntries,
+                    allowedTolFastasPtr);
             }
         } catch (const std::exception& e) {
             std::cerr << "[error] TOL init failed: " << e.what() << '\n';
             return 1;
+        }
+
+        // Pre-flight: refuse to run SV calling when no reference sequences
+        // loaded. Without this guard the hierarchical caller would silently
+        // fall through to the whole-contig OFF_REF safety net (one
+        // SVTYPE=OFF_REF per query contig, NOVEL tier, no real SVs) and
+        // produce a misleading "successful" run. Common causes: CRLF-encoded
+        // manifest paths, --ref-list filter that excludes every registry
+        // FASTA, missing FASTAs on disk after a partial download.
+        const auto& tolAllRefs = tol::TolGlobal::instance().all_refs();
+        if (tolAllRefs.empty()) {
+            std::cerr << "[error] --tol-hierarchical: zero reference sequences loaded "
+                         "into TolGlobal after init. The hierarchical caller would emit "
+                         "only OFF_REF whole-contig calls.\n"
+                         "        Run `" << argv[0] << " --diagnose registry "
+                         "--tol-registry-dir " << o.tolRegistryDir;
+            if (!o.tolIndexDir.empty()) std::cerr << " --tol-index-dir " << o.tolIndexDir;
+            if (!o.refList.empty())     std::cerr << " --ref-list " << o.refList;
+            std::cerr << "` for a per-cause breakdown.\n";
+            return 3;
         }
     }
 
@@ -3254,11 +4531,18 @@ int main(int argc, char** argv) {
     std::string vcf_path = o.outPrefix + ".vcf";
     std::string gfa_path = o.outPrefix + ".gfa";
     std::string ancestral_path = o.tolAncestralOut.empty() ? (o.outPrefix + ".ancestral.tsv") : o.tolAncestralOut;
+    // Bug 1 fix: hierarchical-only checkpoint outputs written before the
+    // flat-MEM-chain fallback starts. These are durable across SIGTERM/SIGKILL
+    // so the operator always has the hierarchical-phase callset available.
+    std::string hier_tsv_path = o.outPrefix + ".hierarchical.hits.tsv";
+    std::string hier_vcf_path = o.outPrefix + ".hierarchical.vcf";
     if (auto out_parent = fs::path(o.outPrefix).parent_path(); !out_parent.empty()) {
         fs::create_directories(out_parent);
     }
     std::ofstream tsv_out(tsv_path);
     std::ofstream vcf_out(vcf_path);
+    std::ofstream hier_tsv_out(hier_tsv_path);
+    std::ofstream hier_vcf_out(hier_vcf_path);
     std::ofstream anc_out;
     std::ofstream gfa_out;
     if (o.tolAncestralAlign) {
@@ -3272,14 +4556,35 @@ int main(int argc, char** argv) {
     }
     if (!tsv_out) { std::cerr << "[error] cannot open " << tsv_path << '\n'; return 1; }
     if (!vcf_out) { std::cerr << "[error] cannot open " << vcf_path << '\n'; return 1; }
+    if (!hier_tsv_out) { std::cerr << "[error] cannot open " << hier_tsv_path << '\n'; return 1; }
+    if (!hier_vcf_out) { std::cerr << "[error] cannot open " << hier_vcf_path << '\n'; return 1; }
 
     tsv_out << "query_asm\tquery_contig\ttype\tref_asm\tref_contig"
                "\tref_pos\tref_end\tpos\tend\tsvlen\tblock_score\tanchors"
                "\tgenotype\tgq\tannotation\talignment_mode\tquery_mode"
                "\tfused_posterior_alt\tfused_logodds_alt\tfused_effective_depth\tfused_layers"
                "\tread_support\n";
+    hier_tsv_out << "query_asm\tquery_contig\ttype\tref_asm\tref_contig"
+                    "\tref_pos\tref_end\tpos\tend\tsvlen\tblock_score\tanchors"
+                    "\tgenotype\tgq\tannotation\talignment_mode\tquery_mode"
+                    "\tfused_posterior_alt\tfused_logodds_alt\tfused_effective_depth\tfused_layers"
+                    "\tread_support\n";
     write_vcf_header(vcf_out, "fungi_graphsv_tol_v3");
+    write_vcf_header(hier_vcf_out, "fungi_graphsv_tol_v3_hierarchical_checkpoint");
+    tsv_out.flush();
+    vcf_out.flush();
+    hier_tsv_out.flush();
+    hier_vcf_out.flush();
     if (o.tolAncestralAlign) tol::write_ancestral_tsv_header(anc_out);
+
+    // Bug 3 fix: register open streams with the signal handler so SIGTERM
+    // can best-effort flush partial output before the wrapper's SIGKILL.
+    g_signal_tsv_out      = &tsv_out;
+    g_signal_vcf_out      = &vcf_out;
+    g_signal_hier_tsv_out = &hier_tsv_out;
+    g_signal_hier_vcf_out = &hier_vcf_out;
+    if (!o.noGfa)            g_signal_gfa_out = &gfa_out;
+    if (o.tolAncestralAlign) g_signal_anc_out = &anc_out;
 
     const tol::FederatedOptions fo = make_fed_opts(o);
     std::optional<SimpleRefIndex> simpleRefIdx;
@@ -3313,18 +4618,37 @@ int main(int argc, char** argv) {
     std::mutex           vcf_mutex;
     std::mutex           gfa_mutex;
     std::mutex           anc_mutex;
+    // Bug 1 fix: dedicated mutex + atomic id for the hierarchical checkpoint
+    // stream. Independent of the main vcf_mutex so the checkpoint flush
+    // inside process_query never contends with the per-query final flush.
+    std::mutex           hier_mutex;
+    std::atomic<int>     hier_sv_id{1};
     std::atomic<int>     sv_id{1};
     std::atomic<size_t>  total_calls{0};
     std::atomic<size_t>  queries_done{0};
+    std::atomic<size_t>  query_failures{0};
     const size_t         n_queries = queries.size();
+    CheckpointWriters    ckpt{&hier_tsv_out, &hier_vcf_out, &hier_mutex, &hier_sv_id};
 
     std::unordered_set<std::string> gfa_seen;
     auto process_one = [&](const std::string& qpath) {
+        // Bug 3 fix: respect shutdown requests so a SIGTERM mid-run stops
+        // launching new queries instead of trying to start fresh ones that
+        // will just be killed by the impending SIGKILL.
+        if (g_shutdown_requested.load(std::memory_order_relaxed)) {
+            if (!o.quiet)
+                std::cerr << "[mycosv] shutdown requested, skipping remaining query "
+                          << qpath << "\n";
+            ++queries_done;
+            return;
+        }
         QueryResult qr;
         try {
             qr = process_query(qpath, o, fo,
-                               simpleRefIdx ? &(*simpleRefIdx) : nullptr);
+                               simpleRefIdx ? &(*simpleRefIdx) : nullptr,
+                               &ckpt);
         } catch (const std::bad_alloc&) {
+            ++query_failures;
             if (!o.quiet)
                 std::cerr << "[warn] skipping " << qpath
                           << ": std::bad_alloc while processing query\n";
@@ -3334,6 +4658,7 @@ int main(int argc, char** argv) {
                           << " queries, " << total_calls.load() << " calls\n";
             return;
         } catch (const std::exception& e) {
+            ++query_failures;
             if (!o.quiet)
                 std::cerr << "[warn] skipping " << qpath
                           << ": " << e.what() << '\n';
@@ -3355,6 +4680,14 @@ int main(int argc, char** argv) {
                 write_vcf_record(vcf_out, c, cur_id);
             }
         }
+        {
+            std::lock_guard<std::mutex> lk(tsv_mutex);
+            tsv_out.flush();
+        }
+        {
+            std::lock_guard<std::mutex> lk(vcf_mutex);
+            vcf_out.flush();
+        }
         if (!o.noGfa) {
             std::lock_guard<std::mutex> lk(gfa_mutex);
             write_gfa_segments(gfa_out, qr, qr.calls, gfa_seen);
@@ -3367,7 +4700,7 @@ int main(int argc, char** argv) {
         }
         total_calls  += qr.calls.size();
         size_t done  = ++queries_done;
-        if (!o.quiet && done % 10 == 0)
+        if (!o.quiet)
             std::cerr << "[progress] " << done << '/' << n_queries
                       << " queries, " << total_calls.load() << " calls\n";
     };
@@ -3393,7 +4726,26 @@ int main(int argc, char** argv) {
         std::cerr << "[done] " << total_calls.load() << " SV calls across "
                   << n_queries << " queries\n"
                   << "  TSV: " << tsv_path << '\n'
-                  << "  VCF: " << vcf_path << '\n';
+                  << "  VCF: " << vcf_path << '\n'
+                  << "  Hierarchical checkpoint TSV: " << hier_tsv_path << '\n'
+                  << "  Hierarchical checkpoint VCF: " << hier_vcf_path << '\n';
+
+    // Bug 3 fix: clear signal-handler pointers before the streams go out of
+    // scope, so a late SIGTERM doesn't reach a destroyed ofstream.
+    g_signal_tsv_out      = nullptr;
+    g_signal_vcf_out      = nullptr;
+    g_signal_hier_tsv_out = nullptr;
+    g_signal_hier_vcf_out = nullptr;
+    g_signal_gfa_out      = nullptr;
+    g_signal_anc_out      = nullptr;
+
+    if (total_calls.load() == 0 && query_failures.load() > 0) {
+        if (!o.quiet)
+            std::cerr << "[error] all emitted callsets are empty after "
+                      << query_failures.load()
+                      << " query preprocessing/calling failure(s)\n";
+        return 2;
+    }
 
     return 0;
 }

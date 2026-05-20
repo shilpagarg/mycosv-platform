@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import os
 import struct
 import subprocess
 import sys
@@ -202,22 +203,39 @@ def augment_routing_store(index_dir: Path, target_centroids: int, seed: int) -> 
 
     hashes_per_centroid = max(16, max(len(row["hashes"]) for row in real_rows if row["hashes"]))
     decoys = target_centroids - len(real_rows)
-    with store_path.open("wb") as fh:
-        fh.write(struct.pack("<Q", target_centroids))
-        for row in real_rows:
-            write_disk_record(
-                fh,
-                str(row["clade_name"]),
-                str(row["phylum"]),
-                str(row["clade_rank"]),
-                list(row["hashes"]),
-            )
-        for i in range(decoys):
-            phylum = f"DecoyPhylum_{i % 16}"
-            rank_cycle = ("phylum", "class", "order", "family", "genus", "species")
-            rank = rank_cycle[i % len(rank_cycle)]
-            hashes = make_hashes(hashes_per_centroid, seed ^ (i * 0x9E3779B97F4A7C15))
-            write_disk_record(fh, f"decoy_clade_{i}", phylum, rank, hashes)
+    # Write to a per-process tmp path and os.replace() into position so a
+    # SLURM kill or OOM mid-write leaves the previous routing_centroids.bin
+    # intact instead of a half-written file with a truthful header and
+    # missing decoy records (which the C++ external store would then parse
+    # past EOF). The .skip companion is unlinked AFTER the rename so any
+    # stale skip index is purged only when the new store actually lands.
+    tmp_path = store_path.with_name(
+        f"{store_path.name}.part.{os.getpid()}"
+    )
+    try:
+        with tmp_path.open("wb") as fh:
+            fh.write(struct.pack("<Q", target_centroids))
+            for row in real_rows:
+                write_disk_record(
+                    fh,
+                    str(row["clade_name"]),
+                    str(row["phylum"]),
+                    str(row["clade_rank"]),
+                    list(row["hashes"]),
+                )
+            for i in range(decoys):
+                phylum = f"DecoyPhylum_{i % 16}"
+                rank_cycle = ("phylum", "class", "order", "family", "genus", "species")
+                rank = rank_cycle[i % len(rank_cycle)]
+                hashes = make_hashes(hashes_per_centroid, seed ^ (i * 0x9E3779B97F4A7C15))
+                write_disk_record(fh, f"decoy_clade_{i}", phylum, rank, hashes)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp_path, store_path)
+    except BaseException:
+        if tmp_path.exists():
+            tmp_path.unlink()
+        raise
 
     skip_path = Path(str(store_path) + ".skip")
     if skip_path.exists():

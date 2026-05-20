@@ -3,7 +3,7 @@
 
 Reads each panel's prepared/query_manifest.tsv + mycosv/calls.vcf +
 comparators/{tool}/{query}/* and re-derives the TSV with the new "Fix B"
-(any-clade row) and "Fix C" (consensus-of-comparators row) logic, plus
+(any-clade row) and comparator-agreement row logic, plus
 OFF_REF/misrouted-call diagnostics in the JSON. Tools are NOT re-run.
 
 Usage:
@@ -31,6 +31,7 @@ from run_real_fungal_benchmark import (
     load_reference_vcf_calls,
     load_syri_query_calls,
     score_callsets,
+    validation_basis_for_label,
     _emit_per_svtype_rows,
     _lift_calls_to_benchmark_ref,
     tool_path,
@@ -52,7 +53,7 @@ def load_query_manifest(prepared_dir: Path) -> list[dict[str, str]]:
 def discover_truth_sets(
     out_dir: Path, mode: str, query_manifest: list[dict[str, str]]
 ) -> dict[str, dict[tuple[str, str], list[NormalizedCall]]]:
-    """Walk benchmark_*/comparators/{tool}/{query}/ and load truth sets."""
+    """Walk benchmark_*/comparators/{tool}/{query}/ and load comparator callsets."""
     truth: dict[str, dict[tuple[str, str], list[NormalizedCall]]] = defaultdict(dict)
     comp_root = out_dir / "comparators"
     if not comp_root.exists():
@@ -103,8 +104,15 @@ def discover_truth_sets(
                 d = comp_root / label / qasm
                 if not d.exists():
                     continue
-                vcfs = sorted(list(d.glob("*.vcf")) + list(d.glob("*.vcf.gz")))
-                vcfs = [v for v in vcfs if v.stat().st_size > 0]
+                # svim writes to <d>/svim_out/variants.vcf, not <d>/*.vcf —
+                # the previous glob missed it and silently dropped svim from
+                # the comparator callsets for every long-reads recompute.
+                candidates: list[Path] = []
+                if label == "svim":
+                    candidates.append(d / "svim_out" / "variants.vcf")
+                candidates.extend(d.glob("*.vcf"))
+                candidates.extend(d.glob("*.vcf.gz"))
+                vcfs = sorted({p for p in candidates if p.exists() and p.stat().st_size > 0})
                 if vcfs:
                     calls = load_reference_vcf_calls(vcfs[0], label, qasm)
                     if calls:
@@ -115,8 +123,18 @@ def discover_truth_sets(
                 d = comp_root / label / qasm
                 if not d.exists():
                     continue
-                vcfs = sorted(list(d.glob("*.vcf")) + list(d.glob("*.vcf.gz")))
-                vcfs = [v for v in vcfs if v.stat().st_size > 0]
+                # Manta writes to <d>/results/variants/diploidSV.vcf.gz; delly
+                # writes a single <d>/delly.vcf next to the BAM. The flat glob
+                # alone misses Manta on real runs.
+                candidates: list[Path] = []
+                if label == "manta":
+                    candidates.extend([
+                        d / "results" / "variants" / "diploidSV.vcf.gz",
+                        d / "results" / "variants" / "candidateSV.vcf.gz",
+                    ])
+                candidates.extend(d.glob("*.vcf"))
+                candidates.extend(d.glob("*.vcf.gz"))
+                vcfs = sorted({p for p in candidates if p.exists() and p.stat().st_size > 0})
                 if vcfs:
                     calls = load_reference_vcf_calls(vcfs[0], label, qasm)
                     if calls:
@@ -291,6 +309,7 @@ def recompute_for_mode(panel_dir: Path, mode: str) -> bool:
                     "query_asm": qasm,
                     "coordinate_space": coord_space,
                     "truth_label": "no_comparator",
+                    "validation_basis": validation_basis_for_label("no_comparator"),
                     "svtype": "ALL",
                     "method": "mycosv",
                     "truth_calls": float("nan"),

@@ -233,9 +233,86 @@ def safe_groupby_mean(df: pd.DataFrame, group_cols: List[str], value_cols: List[
 
 
 
-def top_n(df: pd.DataFrame, col: str, n: int = 20) -> pd.DataFrame:
-    vc = df[col].fillna("NA").value_counts().head(n)
+NULL_LABELS = frozenset({"", ".", "NA", "N/A", "NONE", "NULL", "NAN", "NONE_SET", "UNKNOWN"})
+
+
+def non_null_label_mask(series: pd.Series) -> pd.Series:
+    labels = series.fillna("").astype(str).str.strip()
+    return ~labels.str.upper().isin(NULL_LABELS)
+
+
+def clean_label_series(series: pd.Series) -> pd.Series:
+    return series.fillna("").astype(str).str.strip()
+
+
+def first_non_null_label(df: pd.DataFrame, columns: Sequence[str], default: str = "") -> pd.Series:
+    out = pd.Series(default, index=df.index, dtype="object")
+    unresolved = pd.Series(True, index=df.index)
+    for col in columns:
+        if col not in df.columns:
+            continue
+        values = clean_label_series(df[col])
+        use = unresolved & non_null_label_mask(values)
+        out.loc[use] = values.loc[use]
+        unresolved &= ~use
+    return out
+
+
+def top_n(df: pd.DataFrame, col: str, n: int = 20, *, drop_null_like: bool = True) -> pd.DataFrame:
+    values = clean_label_series(df[col])
+    if drop_null_like:
+        values = values[non_null_label_mask(values)]
+    vc = values.value_counts().head(n)
     return vc.rename_axis(col).reset_index(name="count")
+
+
+def biology_effect_plot_table(bio_df: pd.DataFrame, top_n_labels: int = 15) -> pd.DataFrame:
+    """Rows for the biology_gene_effects plot.
+
+    Rank by informative repeat/mobile-element effects, not by total gene
+    counts. Rows such as TE_LINE can be locus-level biology candidates with
+    no affected gene assignment, so fall back to affected_locus/query_contig
+    instead of dropping them from the effect-composition panel.
+    """
+    needed = {"effect"}
+    if bio_df is None or bio_df.empty or not needed.issubset(bio_df.columns):
+        return pd.DataFrame()
+    out = bio_df.copy()
+    out["_effect_label"] = first_non_null_label(
+        out,
+        ["gene", "affected_gene", "expression_gene", "affected_locus", "query_contig"],
+    )
+    out["_effect_class"] = clean_label_series(out["effect"])
+    out = out[
+        non_null_label_mask(out["_effect_label"])
+        & non_null_label_mask(out["_effect_class"])
+    ].copy()
+    if out.empty:
+        return pd.DataFrame()
+    label_counts = out["_effect_label"].value_counts()
+    selected = list(label_counts.head(top_n_labels).index)
+
+    # Preserve rare informative classes (for example TE_LINE) even when many
+    # HGT/RIP loci tie ahead of them by count.
+    for effect in sorted(out["_effect_class"].unique()):
+        best_for_effect = (
+            out[out["_effect_class"].eq(effect)]["_effect_label"]
+            .value_counts()
+            .index
+        )
+        if len(best_for_effect) and best_for_effect[0] not in selected:
+            selected.append(best_for_effect[0])
+
+    return out[out["_effect_label"].isin(selected)].copy()
+
+
+def numeric_pair_table(df: pd.DataFrame, x: str, y: str) -> pd.DataFrame:
+    if df is None or df.empty or not {x, y}.issubset(df.columns):
+        return pd.DataFrame(columns=[x, y])
+    out = df[[x, y]].copy()
+    out[x] = pd.to_numeric(out[x], errors="coerce")
+    out[y] = pd.to_numeric(out[y], errors="coerce")
+    return out.replace([np.inf, -np.inf], np.nan).dropna(subset=[x, y])
 
 
 
@@ -275,6 +352,12 @@ def benchmark_pred_call_counts(df: pd.DataFrame, *, include_all: bool = False) -
     tmp = df.copy()
     tmp["pred_calls"] = pd.to_numeric(tmp["pred_calls"], errors="coerce").fillna(0)
     tmp["svtype"] = tmp["svtype"].astype(str)
+    if "coordinate_space" in tmp.columns:
+        coord = tmp["coordinate_space"].astype(str).str.lower()
+        tmp = tmp[coord.ne("reference_any_clade")].copy()
+        coord = tmp["coordinate_space"].astype(str).str.lower()
+        if coord.eq("query").any():
+            tmp = tmp[coord.eq("query")].copy()
     if not include_all:
         tmp = tmp[tmp["svtype"] != "ALL"]
     keep_methods = tmp["method"].astype(str).ne("")
@@ -425,7 +508,7 @@ def plot_stacked_counts(df: pd.DataFrame, index_col: str, stack_col: str, title:
 
 def plot_scatter(df: pd.DataFrame, x: str, y: str, title: str, xlabel: Optional[str] = None, ylabel: Optional[str] = None) -> plt.Figure:
     fig, ax = plt.subplots(figsize=(7, 5))
-    clean = df[[x, y]].dropna()
+    clean = numeric_pair_table(df, x, y)
     ax.scatter(clean[x], clean[y], alpha=0.7)
     ax.set_title(title)
     ax.set_xlabel(xlabel or x)
@@ -689,14 +772,15 @@ def build_biology_section(bio_df: Optional[pd.DataFrame], outdir: Path) -> Tuple
         gene_counts = top_n(bio_df, "gene", 20)
         tables.append(gene_counts)
         save_df(gene_counts, outdir / "biology_top_genes.tsv")
-        fig = plot_bar(gene_counts, "gene", "count", "Top recurrent genes affected by SVs", "Gene", "Event count", rotate_xticks=True)
-        encoded = write_figure(fig, outdir / "biology_top_genes.png")
-        figs.append(FigureRecord(
-            title="Top recurrent genes",
-            filename="biology_top_genes.png",
-            encoded_png=encoded,
-            caption="Most recurrent genes linked to called structural variants."
-        ))
+        if not gene_counts.empty:
+            fig = plot_bar(gene_counts, "gene", "count", "Top recurrent genes affected by SVs", "Gene", "Event count", rotate_xticks=True)
+            encoded = write_figure(fig, outdir / "biology_top_genes.png")
+            figs.append(FigureRecord(
+                title="Top recurrent genes",
+                filename="biology_top_genes.png",
+                encoded_png=encoded,
+                caption="Most recurrent genes linked to called structural variants; placeholder labels such as NA or . are excluded."
+            ))
 
     if "pathway" in bio_df.columns:
         pathway_counts = top_n(bio_df, "pathway", 15)
@@ -711,42 +795,71 @@ def build_biology_section(bio_df: Optional[pd.DataFrame], outdir: Path) -> Tuple
             caption="Most frequently implicated pathways or annotations among biological findings."
         ))
 
-    if {"effect", "gene"}.issubset(bio_df.columns):
-        effect_counts = pd.crosstab(bio_df["gene"].fillna("NA"), bio_df["effect"].fillna("NA"))
-        effect_counts = effect_counts.sum(axis=1).sort_values(ascending=False).head(15).index
-        subset = bio_df[bio_df["gene"].isin(effect_counts)]
-        fig = plot_stacked_counts(subset, "gene", "effect", "Functional effect composition of top genes", normalize=True)
-        encoded = write_figure(fig, outdir / "biology_gene_effects.png")
-        figs.append(FigureRecord(
-            title="Functional effect composition",
-            filename="biology_gene_effects.png",
-            encoded_png=encoded,
-            caption="Relative composition of annotated functional effects among recurrent genes."
-        ))
+    if "effect" in bio_df.columns:
+        subset = biology_effect_plot_table(bio_df, 15)
+        if not subset.empty:
+            effect_summary = (
+                subset.groupby(["_effect_label", "_effect_class"], dropna=False)
+                .size()
+                .reset_index(name="count")
+                .rename(columns={"_effect_label": "gene_or_locus", "_effect_class": "effect"})
+            )
+            save_df(effect_summary, outdir / "biology_gene_effects.tsv")
+            fig = plot_stacked_counts(
+                subset,
+                "_effect_label",
+                "_effect_class",
+                "Functional effect composition of top genes/loci",
+                normalize=True,
+            )
+            encoded = write_figure(fig, outdir / "biology_gene_effects.png")
+            figs.append(FigureRecord(
+                title="Functional effect composition",
+                filename="biology_gene_effects.png",
+                encoded_png=encoded,
+                caption=(
+                    "Relative composition of informative repeat/mobile-element "
+                    "effects among recurrent genes or loci. Rows with placeholder "
+                    "effects such as NONE are excluded; locus labels are used "
+                    "when no affected gene was assigned."
+                )
+            ))
 
     if {"expression", "cn"}.issubset(bio_df.columns):
-        fig = plot_scatter(bio_df, "cn", "expression", "Copy number vs expression for SV-associated loci")
-        encoded = write_figure(fig, outdir / "biology_cn_vs_expression.png")
-        figs.append(FigureRecord(
-            title="Copy number vs expression",
-            filename="biology_cn_vs_expression.png",
-            encoded_png=encoded,
-            caption="Association between copy-number state and expression at SV-associated loci."
-        ))
+        cn_expr = numeric_pair_table(bio_df, "cn", "expression")
+        save_df(cn_expr, outdir / "biology_cn_vs_expression.tsv")
+        if not cn_expr.empty:
+            fig = plot_scatter(cn_expr, "cn", "expression", "Copy number vs expression for SV-associated loci")
+            encoded = write_figure(fig, outdir / "biology_cn_vs_expression.png")
+            figs.append(FigureRecord(
+                title="Copy number vs expression",
+                filename="biology_cn_vs_expression.png",
+                encoded_png=encoded,
+                caption="Association between copy-number state and expression at SV-associated loci."
+            ))
+        else:
+            blocks.append(
+                "<p>Copy number vs expression plot skipped: no rows have both "
+                "numeric copy-number/priority and expression log2 fold-change "
+                "values.</p>"
+            )
 
     if {"phenotype", "gene"}.issubset(bio_df.columns):
-        top_genes = bio_df["gene"].fillna("NA").value_counts().head(10).index
-        subset = bio_df[bio_df["gene"].isin(top_genes)]
-        phen = pd.crosstab(subset["phenotype"].fillna("NA"), subset["gene"].fillna("NA"))
-        phen = phen.reset_index().melt(id_vars="phenotype", var_name="gene", value_name="count")
-        fig = plot_grouped_metric(phen, "phenotype", "count", "gene", "Top recurrent genes across phenotypes")
-        encoded = write_figure(fig, outdir / "biology_genes_by_phenotype.png")
-        figs.append(FigureRecord(
-            title="Genes across phenotypes",
-            filename="biology_genes_by_phenotype.png",
-            encoded_png=encoded,
-            caption="Distribution of recurrent SV-linked genes across phenotype groups."
-        ))
+        gene_df = bio_df[non_null_label_mask(bio_df["gene"])].copy()
+        top_genes = clean_label_series(gene_df["gene"]).value_counts().head(10).index
+        subset = gene_df[clean_label_series(gene_df["gene"]).isin(top_genes)].copy()
+        if not subset.empty:
+            subset["gene"] = clean_label_series(subset["gene"])
+            phen = pd.crosstab(subset["phenotype"].fillna("NA"), subset["gene"])
+            phen = phen.reset_index().melt(id_vars="phenotype", var_name="gene", value_name="count")
+            fig = plot_grouped_metric(phen, "phenotype", "count", "gene", "Top recurrent genes across phenotypes")
+            encoded = write_figure(fig, outdir / "biology_genes_by_phenotype.png")
+            figs.append(FigureRecord(
+                title="Genes across phenotypes",
+                filename="biology_genes_by_phenotype.png",
+                encoded_png=encoded,
+                caption="Distribution of recurrent SV-linked genes across phenotype groups."
+            ))
 
     blocks.append("<p>This section focuses on biological interpretation, highlighting recurrent genes, pathways, functional effects, and optional multi-omic associations.</p>")
     return "\n".join(blocks), figs, tables
@@ -858,27 +971,16 @@ def plot_hgt_propagation(df: pd.DataFrame, outdir: Path) -> Optional[FigureRecor
     )
 
 
-_WINS_TRUTH_LABEL_PREFIXES = (
-    "consensus_",        # consensus_2of_N and consensus_2of_N_read_supported
-    "minigraph_read_supported",
-    "delly_read_supported",
-    "manta_read_supported",
-    "sniffles_read_supported",
-    "cutesv_read_supported",
-    "svim_read_supported",
-)
-
-
 def _select_wins_subset(real_df: pd.DataFrame) -> pd.DataFrame:
     """Slice real_merged.tsv to the rows that drive the wins-matrix panel.
 
-    We want per-(query, svtype, method) F1 scored against a *bias-free*
-    truth — that is: anything that ends with _read_supported, plus the
-    consensus_2of_N rows themselves so the operator can see how much the
-    read-level filter changed the verdict. We exclude the per-comparator
-    aggregate rows (where method=mycosv against a single algorithm — those
-    are the "mycosv vs comparator-as-truth" view, not the apples-to-apples
-    view we want here).
+    We want per-(query, label, svtype, method) F1 scored against the most
+    independent validation basis available. Prefer raw-read validated
+    `read_level_union` rows. Fall back to read-supported comparator agreement,
+    then to unvalidated comparator consensus for older/partial outputs.
+    Deliberately exclude per-comparator labels such as minigraph_read_supported;
+    those are "mycosv vs one comparator baseline" diagnostics, not the
+    apples-to-apples wins view.
     """
     if real_df is None or real_df.empty:
         return pd.DataFrame()
@@ -887,12 +989,20 @@ def _select_wins_subset(real_df: pd.DataFrame) -> pd.DataFrame:
         return pd.DataFrame()
     out = real_df.copy()
     label = out["truth_label"].astype(str)
-    keep = label.str.startswith("consensus_") & label.str.endswith("_read_supported")
+    keep = label.eq("read_level_union") | label.str.startswith("consensus_")
     if "truth_calls" in out.columns:
         keep &= pd.to_numeric(out["truth_calls"], errors="coerce").fillna(0) > 0
     if "status" in out.columns:
         keep &= ~out["status"].astype(str).eq("no_truth")
     out = out[keep].copy()
+    label = out["truth_label"].astype(str)
+    raw_label = label.eq("read_level_union")
+    if raw_label.any():
+        out = out[raw_label].copy()
+    else:
+        rs_label = label.str.contains("_read_supported", regex=False)
+        if rs_label.any():
+            out = out[rs_label].copy()
     out["f1"] = pd.to_numeric(out["f1"], errors="coerce")
     out = out.dropna(subset=["f1"])
     return out
@@ -900,17 +1010,17 @@ def _select_wins_subset(real_df: pd.DataFrame) -> pd.DataFrame:
 
 def plot_wins_matrix(real_df: pd.DataFrame, outdir: Path) -> List[FigureRecord]:
     """Render the per-SV-type wins matrix: for each comparator-as-method row,
-    is MycoSV's F1 ≥ that comparator's F1 on the same read-validated truth?
+    is MycoSV's F1 ≥ that comparator's F1 on the same validation basis?
 
     Outputs three figure cards:
       A. F1 heatmap, rows=method (mycosv + each comparator), cols=svtype.
          Cell value = mean F1 across queries.
       B. Wins bar: per (svtype, comparator), fraction of queries where
-         mycosv F1 ≥ comparator F1 on the read-validated consensus truth.
+         mycosv F1 ≥ comparator F1 on the same validation label.
       C. Per-query F1 scatter: mycosv vs each comparator, one panel per
          comparator, dot per (query × svtype).
-    Always anchored on the `_read_supported` truth so we never rank against
-    an algorithm-only baseline.
+    Prefer raw-read validated labels so we never promote a comparator-only
+    baseline to biological truth.
     """
     figs: List[FigureRecord] = []
     subset = _select_wins_subset(real_df)
@@ -950,19 +1060,21 @@ def plot_wins_matrix(real_df: pd.DataFrame, outdir: Path) -> List[FigureRecord]:
                 label = "NA" if np.isnan(v) else f"{v:.2f}"
                 ax.text(j, i, label, ha="center", va="center",
                         color=("white" if not np.isnan(v) and v < 0.55 else "black"), fontsize=9)
-        ax.set_title("Mean F1 vs read-validated truth (by method × SV type)")
+        ax.set_title("Mean F1 by validation basis (method × SV type)")
         fig.colorbar(im, ax=ax, label="F1")
         fig.tight_layout()
         encoded = write_figure(fig, outdir / "wins_f1_heatmap.png")
         save_df(pivot.reset_index(), outdir / "wins_f1_heatmap.tsv")
         figs.append(FigureRecord(
-            title="Mean F1 by method × SV type (read-validated truth)",
+            title="Mean F1 by method × SV type",
             filename="wins_f1_heatmap.png",
             encoded_png=encoded,
             caption=(
-                "Each cell is the mean F1 across queries when scoring "
-                "<method> against the consensus_2of_N_read_supported truth "
-                "for that SV type. mycosv row is pinned to the top. "
+                "Each cell is the mean F1 across queries when scoring a "
+                "method against the strongest available validation basis for "
+                "that SV type: raw-read validated rows first, then "
+                "read-supported comparator agreement, then comparator "
+                "consensus for older outputs. mycosv row is pinned to the top. "
                 "wins_f1_heatmap.tsv carries the underlying numbers."
             ),
         ))
@@ -970,27 +1082,30 @@ def plot_wins_matrix(real_df: pd.DataFrame, outdir: Path) -> List[FigureRecord]:
     # ── (B) Wins bar: % queries where mycosv ≥ comparator ───────────────
     if "query_asm" in rs.columns:
         wide = rs.pivot_table(
-            index=["query_asm", "svtype"], columns="method",
+            index=["query_asm", "truth_label", "svtype"], columns="method",
             values="f1", aggfunc="mean",
         )
         if "mycosv" in wide.columns:
             wins_rows = []
             for cmp in [c for c in wide.columns if c != "mycosv"]:
                 pair = wide[["mycosv", cmp]].dropna()
-                pair = pair[(pair["mycosv"] > 0) | (pair[cmp] > 0)]
                 if pair.empty:
                     continue
-                for sv in sorted({sv for (_, sv) in pair.index}):
+                for sv in sorted(pair.index.get_level_values("svtype").unique()):
                     sub = pair.xs(sv, level="svtype", drop_level=False)
                     if sub.empty:
                         continue
                     n = len(sub)
                     wins = int((sub["mycosv"] >= sub[cmp]).sum())
+                    ties = int((sub["mycosv"] == sub[cmp]).sum())
+                    zero_ties = int(((sub["mycosv"] == 0) & (sub[cmp] == 0)).sum())
                     wins_rows.append({
                         "comparator": cmp,
                         "svtype": sv,
                         "queries": n,
                         "mycosv_wins": wins,
+                        "mycosv_ties": ties,
+                        "zero_ties": zero_ties,
                         "win_rate": wins / n if n else 0.0,
                     })
             if wins_rows:
@@ -1018,8 +1133,8 @@ def plot_wins_matrix(real_df: pd.DataFrame, outdir: Path) -> List[FigureRecord]:
                                 color=("white" if not np.isnan(v) and v < 0.65 else "black"), fontsize=9)
                 ax.set_xlabel("Comparator")
                 ax.set_ylabel("SV type")
-                ax.set_title("Per-(SV type, comparator) win rate of MycoSV (read-validated truth)")
-                fig.colorbar(im, ax=ax, label="MycoSV win rate (F1 >= comparator)")
+                ax.set_title("Per-(SV type, comparator) win/tie rate of MycoSV")
+                fig.colorbar(im, ax=ax, label="MycoSV win/tie rate (F1 >= comparator)")
                 fig.tight_layout()
                 encoded = write_figure(fig, outdir / "wins_rate.png")
                 save_df(wins_df, outdir / "wins_rate.tsv")
@@ -1028,11 +1143,13 @@ def plot_wins_matrix(real_df: pd.DataFrame, outdir: Path) -> List[FigureRecord]:
                     filename="wins_rate.png",
                     encoded_png=encoded,
                     caption=(
-                        "Per (SV type, comparator), the fraction of queries "
-                        "where MycoSV F1 ≥ that comparator's F1 on the "
-                        "read-validated consensus truth. Grey cells are "
-                        "unavailable comparisons. wins_rate.tsv lists every "
-                        "(query, svtype, comparator) cell."
+                        "Per (SV type, comparator), the fraction of comparable "
+                        "query/truth-label cells where MycoSV F1 ≥ that "
+                        "comparator's F1 on the same validation label. "
+                        "Ties, including 0-vs-0 ties with non-empty truth, "
+                        "count because the panel is a win/tie rate. Grey "
+                        "cells are unavailable comparisons. wins_rate.tsv "
+                        "also reports tie counts."
                     ),
                 ))
 
@@ -1092,16 +1209,15 @@ def build_wins_matrix_section(
     # downstream filter.
     figs = plot_wins_matrix(df, outdir)
     if not figs:
-        return ("<p>No read-validated PR rows found in the real-data table — "
+        return ("<p>No raw-read or comparator-agreement PR rows found in the real-data table — "
                 "wins matrix skipped.</p>", [], [])
     html = (
         "<p>Apples-to-apples comparison: every method (MycoSV + each "
-        "algorithmic comparator) is scored as a predictor against the "
-        "<code>consensus_2of_N_read_supported</code> truth — i.e. SVs that "
-        "≥2 algorithm comparators agreed on AND the raw query reads "
-        "support via split / clipped alignments. Per SV type and per "
-        "comparator, the panels below show whether MycoSV beats the "
-        "comparator on bias-free ground truth.</p>"
+        "algorithmic comparator) is scored as a predictor against the same "
+        "validation basis. The report prefers <code>read_level_union</code> "
+        "rows, which are independently anchored in raw FASTQ/read evidence. "
+        "Comparator consensus rows are retained as baseline agreement only, "
+        "not treated as fungal truth.</p>"
     )
     return html, figs, []
 
@@ -1373,6 +1489,144 @@ def _novel_q3_expression(joined: pd.DataFrame, outdir: Path) -> Optional[FigureR
     )
 
 
+def build_evidence_panorama_section(
+    tiers_df: Optional[pd.DataFrame],
+    outdir: Path,
+) -> Tuple[str, List[FigureRecord], List[pd.DataFrame]]:
+    """Per-query stacked-bar panorama of MycoSV calls by evidence tier.
+
+    Reads `mycosv_evidence_tiers.tsv` (query_asm, svtype, tier, n_calls) and
+    plots one stacked bar per query (ALL svtypes summed) plus a per-svtype
+    grid. Tier ordering is fixed at strong > moderate > intrinsic_only > weak
+    so the legend and color scheme are stable across panels. The point of this
+    panel is to surface MycoSV calls that are real-but-unvalidatable
+    (intrinsic_only) — these would otherwise be invisible in the F1 panels
+    because validation drops them from the independently validated set.
+    """
+    if tiers_df is None or tiers_df.empty:
+        return ("<p>No evidence-tier table provided "
+                "(--evidence-tiers mycosv_evidence_tiers.tsv).</p>", [], [])
+    if not plotting_available():
+        return (plotting_unavailable_html(), [], [])
+
+    df = tiers_df.copy()
+    needed = {"query_asm", "svtype", "tier", "n_calls"}
+    if not needed.issubset(df.columns):
+        missing = ", ".join(sorted(needed - set(df.columns)))
+        return (f"<p>evidence-tier table is missing columns: {missing}</p>", [], [])
+    df["n_calls"] = pd.to_numeric(df["n_calls"], errors="coerce").fillna(0).astype(int)
+    df = df[df["n_calls"] > 0]
+    if df.empty:
+        return ("<p>No MycoSV calls to tier in this run.</p>", [], [])
+
+    tier_order = ["strong", "moderate", "intrinsic_only", "weak"]
+    tier_colors = {
+        "strong":         "#1b7837",  # comparator + read evidence
+        "moderate":       "#7fbf7b",  # one of the two
+        "intrinsic_only": "#f1a340",  # MycoSV cluster only — the real-but-unvalidatable bucket
+        "weak":           "#998ec3",  # very low intrinsic, rare
+    }
+
+    figs: List[FigureRecord] = []
+    # ── (A) per query, all SV types summed ───────────────────────────────
+    by_query = df.groupby(["query_asm", "tier"], as_index=False)["n_calls"].sum()
+    pivot_q = by_query.pivot(index="query_asm", columns="tier", values="n_calls").fillna(0)
+    for tier in tier_order:
+        if tier not in pivot_q.columns:
+            pivot_q[tier] = 0
+    pivot_q = pivot_q[tier_order]
+    fig, ax = plt.subplots(figsize=(max(7, 0.6 * len(pivot_q) + 4), 4.5))
+    pivot_q.plot(kind="bar", stacked=True, ax=ax,
+                 color=[tier_colors[t] for t in tier_order])
+    ax.set_title("MycoSV call panorama by evidence tier (per query)")
+    ax.set_xlabel("query")
+    ax.set_ylabel("MycoSV calls")
+    ax.legend(title="evidence", loc="upper right")
+    plt.setp(ax.get_xticklabels(), rotation=30, ha="right")
+    fig.tight_layout()
+    encoded = write_figure(fig, outdir / "mycosv_evidence_panorama.png")
+    save_df(pivot_q.reset_index(), outdir / "mycosv_evidence_panorama.tsv")
+    figs.append(FigureRecord(
+        title="MycoSV call panorama — strong / moderate / intrinsic_only / weak",
+        filename="mycosv_evidence_panorama.png",
+        encoded_png=encoded,
+        caption=(
+            "Stacked counts of every MycoSV call in this run, tiered by the "
+            "evidence backing it. <b>strong</b> = matched by ≥1 comparator AND "
+            "read-validated. <b>moderate</b> = matched by one of the two. "
+            "<b>intrinsic_only</b> = no external evidence, but the MycoSV "
+            "C++ caller clustered the call at SUPPORT≥2 (sibling-clade "
+            "contig absent from the validation BAM, low query coverage, …). "
+            "These are real-but-unvalidatable calls that the F1 plots "
+            "otherwise penalize as FP. <b>weak</b> = residual intrinsic≤1. "
+            "Source: mycosv_evidence_tiers.tsv."
+        ),
+    ))
+
+    # ── (B) per (query × svtype) grid ────────────────────────────────────
+    by_q_svt = df.groupby(["query_asm", "svtype", "tier"], as_index=False)["n_calls"].sum()
+    pivot_sv = by_q_svt.pivot_table(
+        index=["query_asm", "svtype"], columns="tier",
+        values="n_calls", aggfunc="sum",
+    ).fillna(0)
+    for tier in tier_order:
+        if tier not in pivot_sv.columns:
+            pivot_sv[tier] = 0
+    pivot_sv = pivot_sv[tier_order]
+    # Render each query as a row of svtype subplots so the reader can compare
+    # tier mix across SV classes within the same query.
+    queries = sorted(df["query_asm"].unique())
+    sv_order = [s for s in ("INS", "DEL", "DUP", "INV", "TRA", "OFF_REF") if s in df["svtype"].unique()]
+    if queries and sv_order:
+        fig2, axes = plt.subplots(
+            len(queries), 1,
+            figsize=(max(7, 0.8 * len(sv_order) + 3), max(3, 2.3 * len(queries))),
+            sharex=True, squeeze=False,
+        )
+        for i, qa in enumerate(queries):
+            ax = axes[i, 0]
+            sub = pivot_sv.loc[qa] if qa in pivot_sv.index.get_level_values(0) else pd.DataFrame()
+            if sub.empty:
+                ax.set_visible(False)
+                continue
+            sub = sub.reindex(sv_order).fillna(0)[tier_order]
+            sub.plot(kind="bar", stacked=True, ax=ax,
+                     color=[tier_colors[t] for t in tier_order], legend=(i == 0))
+            ax.set_title(short_sample_label(qa))
+            ax.set_xlabel("")
+            ax.set_ylabel("calls")
+            plt.setp(ax.get_xticklabels(), rotation=0)
+        fig2.suptitle("MycoSV evidence tier × SV type (per query)")
+        fig2.tight_layout()
+        encoded2 = write_figure(fig2, outdir / "mycosv_evidence_by_svtype.png")
+        save_df(pivot_sv.reset_index(), outdir / "mycosv_evidence_by_svtype.tsv")
+        figs.append(FigureRecord(
+            title="MycoSV evidence tier × SV type (per query)",
+            filename="mycosv_evidence_by_svtype.png",
+            encoded_png=encoded2,
+            caption=(
+                "Per-SV-type breakdown of the panorama. Tall <b>intrinsic_only</b> "
+                "bars on a given SV type usually indicate one of: (a) sibling-clade "
+                "REFCONTIG that the validation BAM never indexed, (b) DUP/INV/TRA "
+                "lacking a clean split-read signal in the assembly-mode "
+                "contig-vs-ref BAM, or (c) low query coverage. None of these "
+                "imply the call is wrong; they just mean the bench's external "
+                "scaffolding can't reach it."
+            ),
+        ))
+
+    body = (
+        "<p>This panel makes <b>real-but-unvalidatable</b> MycoSV calls "
+        "first-class. F1 plots above use a validation set that has been shrunk "
+        "by read-validation; calls in the <b>intrinsic_only</b> tier here are "
+        "MycoSV predictions that the external pipeline could not confirm "
+        "even though MycoSV's own clustering passed (SUPPORT≥2). Counts come "
+        "from <code>mycosv_evidence_tiers.tsv</code>; per-call tiers are in "
+        "<code>novel_mycosv_calls.tsv</code> and <code>biology_findings.tsv</code>.</p>"
+    )
+    return body, figs, [pivot_q.reset_index(), pivot_sv.reset_index()]
+
+
 def build_novel_questions_section(
     novel_df: Optional[pd.DataFrame],
     bio_df: Optional[pd.DataFrame],
@@ -1495,6 +1749,8 @@ def build_html_report(
     novel_figs: Optional[List[FigureRecord]] = None,
     wins_html: str = "",
     wins_figs: Optional[List[FigureRecord]] = None,
+    panorama_html: str = "",
+    panorama_figs: Optional[List[FigureRecord]] = None,
 ) -> str:
     if clade_figs is None:
         clade_figs = []
@@ -1502,6 +1758,8 @@ def build_html_report(
         novel_figs = []
     if wins_figs is None:
         wins_figs = []
+    if panorama_figs is None:
+        panorama_figs = []
     return f"""
 <!doctype html>
 <html lang=\"en\">
@@ -1551,9 +1809,15 @@ def build_html_report(
     </div>
 
     <div class=\"section\">
-      <h2>2b. MycoSV vs comparators per SV type &mdash; read-validated wins matrix</h2>
+      <h2>2b. MycoSV vs comparators per SV type &mdash; validation-basis wins matrix</h2>
       {wins_html}
       <div class=\"grid\">{render_figure_cards(wins_figs)}</div>
+    </div>
+
+    <div class=\"section\">
+      <h2>2c. MycoSV call panorama &mdash; evidence tiers</h2>
+      {panorama_html}
+      <div class=\"grid\">{render_figure_cards(panorama_figs)}</div>
     </div>
 
     <div class=\"section\">
@@ -1593,6 +1857,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--novel", type=str, default=None,
                         help="novel_mycosv_calls.tsv from a benchmark run; "
                              "powers the three biological-question section.")
+    parser.add_argument("--evidence-tiers", type=str, default=None,
+                        help="mycosv_evidence_tiers.tsv from a benchmark run; "
+                             "powers the evidence-tier panorama panel that "
+                             "surfaces real-but-unvalidatable MycoSV calls.")
     parser.add_argument("--outdir", type=str, required=True, help="Output directory")
     parser.add_argument("--title", type=str, default="SV visualization report", help="Report title")
     return parser.parse_args()
@@ -1609,12 +1877,14 @@ def main() -> None:
     bio_df = read_table(args.biology)
     metadata_df = read_table(args.metadata)
     novel_df = read_table(args.novel)
+    tiers_df = read_table(args.evidence_tiers)
 
     sim_html, sim_figs, _ = build_simulated_section(sim_df, outdir)
     real_html, real_figs, _ = build_real_section(real_df, metadata_df, outdir)
     bio_html, bio_figs, _ = build_biology_section(bio_df, outdir)
     clade_html, clade_figs, _ = build_clade_te_hgt_section(real_df, bio_df, outdir)
     novel_html, novel_figs, _ = build_novel_questions_section(novel_df, bio_df, outdir)
+    panorama_html, panorama_figs, _ = build_evidence_panorama_section(tiers_df, outdir)
     # Wins matrix runs on the *raw* real_df (pre-harmonization) so the
     # `truth_label`, `svtype`, `method` columns survive.
     wins_html, wins_figs, _ = build_wins_matrix_section(real_df, outdir)
@@ -1628,6 +1898,7 @@ def main() -> None:
         clade_html, clade_figs,
         novel_html, novel_figs,
         wins_html, wins_figs,
+        panorama_html=panorama_html, panorama_figs=panorama_figs,
     )
 
     report_path = outdir / "sv_visualization_report.html"

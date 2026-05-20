@@ -246,6 +246,40 @@ def _pred_span_contains(truth_pos: int, pred: dict[str, Any], pad: int = 0) -> b
     return (pred_pos - pad) <= truth_pos <= (span_end + pad)
 
 
+_SPAN_CONTAIN_TYPES = {"INV", "TRA", "TRA_INTER", "TRA_INTRA", "DEL", "TDEL", "DUP"}
+
+
+def _span_contain_applies(truth: dict[str, Any], pred: dict[str, Any], tol: int) -> bool:
+    """Return True when the predicted call's span legitimately covers the truth
+    breakpoint AND the type group supports span-based matching.
+
+    MycoSV's MEM-chain caller emits coarse blocks spanning the genomic
+    interval between consecutive anchors — for INV/TRA always, and for DEL/DUP
+    whenever the chain gap aggregates several fine-grained events. Read-level
+    and assembly comparators emit the embedded per-event breakpoints. Allowing
+    span-containment lets one chain-level pred match a single fine-grained
+    truth nested inside it; the greedy truth-loop in match_truth_to_pred()
+    still consumes the pred after the first claim, so a coarse pred is credited
+    for at most one TP and cannot inflate recall.
+    """
+    t_type = truth["type"]
+    p_type = pred["type"]
+    if t_type not in _SPAN_CONTAIN_TYPES and p_type not in _SPAN_CONTAIN_TYPES:
+        return False
+    inv_or_tra = (
+        t_type in _TRA_TYPES or p_type in _TRA_TYPES
+        or t_type == "INV" or p_type == "INV"
+    )
+    if not inv_or_tra:
+        # DEL/DUP: only when pred is at least 2x the truth length. At the same
+        # scale the regular pos+length tolerance is the right gate and
+        # span-contain would silently relax length agreement on co-located
+        # but length-disagreeing same-scale calls.
+        if abs(pred.get("svlen", 0) or 0) < 2 * max(1, abs(truth.get("svlen", 0) or 0)):
+            return False
+    return _pred_span_contains(truth["pos"], pred, pad=tol)
+
+
 def compatible(truth: dict[str, Any], pred: dict[str, Any]) -> bool:
     if truth.get("qasm") and pred.get("qasm") and truth["qasm"] != pred["qasm"]:
         return False
@@ -278,7 +312,6 @@ def compatible(truth: dict[str, Any], pred: dict[str, Any]) -> bool:
     if truth["type"] != pred["type"]:
         if _group_of(truth["type"]) != _group_of(pred["type"]):
             return False
-    inv_group = {"INV", "TRA", "TRA_INTER", "TRA_INTRA"}
 
     pred_mode = pred.get("qmode", "") or "assembly"
     pred_locus = pred["chrom"]
@@ -290,19 +323,23 @@ def compatible(truth: dict[str, Any], pred: dict[str, Any]) -> bool:
     ins_group = {"INS", "TANDEM_DUP", "OFF_REF"}
     tol = truth["tol_bp"]
     both_positionless = truth["type"] in ins_group and pred["type"] in ins_group
-    inv_or_tra = truth["type"] in inv_group or pred["type"] in inv_group
+    span_match = _span_contain_applies(truth, pred, tol)
     if not both_positionless:
         pos_within_tol = abs(truth["pos"] - pred["pos"]) <= tol
-        # For INV/TRA the caller reports the whole chain block; the truth
-        # variant lives somewhere inside that block.  Accept span-containment
-        # as a valid local-pos match — otherwise large embedded variants
-        # (truth.pos ≫ pred.pos) are spuriously rejected.
-        pos_within_span = inv_or_tra and _pred_span_contains(truth["pos"], pred, pad=tol)
-        if not (pos_within_tol or pos_within_span):
+        # For INV/TRA the caller reports the whole chain block; for DEL/DUP it
+        # reports the whole chain gap. The truth variant lives somewhere inside
+        # that block. Accept span-containment as a valid local-pos match —
+        # otherwise large embedded variants (truth.pos ≫ pred.pos) are
+        # spuriously rejected.
+        if not (pos_within_tol or span_match):
             return False
 
     skip_len = {"INV", "TRA", "TRA_INTER", "TRA_INTRA", "TANDEM_DUP", "INS", "TDEL", "OFF_REF"}
-    if truth["type"] not in skip_len:
+    if truth["type"] not in skip_len and not span_match:
+        # Skip strict length agreement when the pred is a coarse chain-level
+        # block that span-contains the truth: by construction |pred.svlen| is
+        # much larger than |truth.svlen| there, and length disagreement is the
+        # expected signal rather than a mismatch.
         denom = max(abs(truth["svlen"]), 1)
         if abs(abs(truth["svlen"]) - abs(pred["svlen"])) / denom > truth["tol_len_frac"]:
             return False
@@ -325,20 +362,20 @@ def compatible(truth: dict[str, Any], pred: dict[str, Any]) -> bool:
 
 
 def distance(truth: dict[str, Any], pred: dict[str, Any]) -> int:
-    # For INV/TRA, the caller emits whole-block coordinates so the local pos
-    # can be far from the truth's embedded breakpoint; using raw pos_d would
-    # bias matching against well-aligned mates.  Prefer the span midpoint as
-    # the local-anchor distance and let the mate distance drive ranking for
-    # TRA.
-    inv_or_tra = truth["type"] in _TRA_TYPES or truth["type"] == "INV"
-    if inv_or_tra:
+    # For INV/TRA — and coarse DEL/DUP chain blocks — the caller emits
+    # whole-block coordinates so the local pos can be far from the truth's
+    # embedded breakpoint; using raw pos_d would bias matching against
+    # well-aligned mates. When the pred span legitimately contains the truth
+    # breakpoint, treat pos distance as 0; otherwise fall back to the span
+    # midpoint for INV/TRA and the raw delta for same-scale calls.
+    tol = truth.get("tol_bp", 0)
+    if _span_contain_applies(truth, pred, tol):
+        pos_d = 0
+    elif truth["type"] in _TRA_TYPES or truth["type"] == "INV":
         pred_pos = pred.get("pos", 0)
         pred_len = abs(pred.get("svlen", 0) or 0)
-        if _pred_span_contains(truth["pos"], pred, pad=truth.get("tol_bp", 0)):
-            pos_d = 0
-        else:
-            mid = pred_pos + pred_len // 2
-            pos_d = abs(truth["pos"] - mid)
+        mid = pred_pos + pred_len // 2
+        pos_d = abs(truth["pos"] - mid)
     else:
         pos_d = abs(truth["pos"] - pred["pos"])
     len_d = 0 if truth["type"] in _TRA_TYPES else abs(abs(truth["svlen"]) - abs(pred["svlen"]))
@@ -350,23 +387,35 @@ def distance(truth: dict[str, Any], pred: dict[str, Any]) -> int:
 
 def match_truth_to_pred(truth_list: list[dict[str, Any]],
                         pred_list: list[dict[str, Any]]) -> tuple[set[int], list[dict[str, Any]]]:
-    used: set[int] = set()
-    fn_list: list[dict[str, Any]] = []
-    for truth in truth_list:
-        best_idx: int | None = None
-        best_dist = math.inf
-        for idx, pred in enumerate(pred_list):
-            if idx in used or not compatible(truth, pred):
-                continue
-            dist = distance(truth, pred)
-            if dist < best_dist:
-                best_idx = idx
-                best_dist = dist
-        if best_idx is None:
-            fn_list.append(truth)
-        else:
-            used.add(best_idx)
+    matched_truth, used = _global_greedy_matches(truth_list, pred_list)
+    fn_list = [truth for idx, truth in enumerate(truth_list) if idx not in matched_truth]
     return used, fn_list
+
+
+def _global_greedy_matches(truth_list: list[dict[str, Any]],
+                           pred_list: list[dict[str, Any]]) -> tuple[dict[int, int], set[int]]:
+    """Return one-to-one compatible matches, prioritising nearest breakpoints.
+
+    The previous truth-order greedy walk could consume a shared prediction for
+    a looser match before a later truth row reached its best/only prediction.
+    Sorting all compatible pairs by distance gives deterministic, local-best
+    one-to-one assignments without making metrics depend on VCF row order.
+    """
+    pairs: list[tuple[float, int, int]] = []
+    for truth_idx, truth in enumerate(truth_list):
+        for pred_idx, pred in enumerate(pred_list):
+            if compatible(truth, pred):
+                pairs.append((distance(truth, pred), truth_idx, pred_idx))
+    pairs.sort()
+
+    matched_truth: dict[int, int] = {}
+    used_pred: set[int] = set()
+    for _dist, truth_idx, pred_idx in pairs:
+        if truth_idx in matched_truth or pred_idx in used_pred:
+            continue
+        matched_truth[truth_idx] = pred_idx
+        used_pred.add(pred_idx)
+    return matched_truth, used_pred
 
 
 def _collapse_off_ref_per_qasm(pred_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -552,22 +601,13 @@ def score_pr(truth_vcf: Path,
     stats: dict[str, list[int]] = defaultdict(lambda: [0, 0, 0])
     tp_records: list[tuple[dict[str, Any], dict[str, Any]]] = []
     fn_records: list[dict[str, Any]] = []
-    used_global: set[int] = set()
-    for truth_row in truth:
-        best_idx: int | None = None
-        best_dist = math.inf
-        for idx, pred_row in enumerate(algo_pred):
-            if idx in used_global or not compatible(truth_row, pred_row):
-                continue
-            dist = distance(truth_row, pred_row)
-            if dist < best_dist:
-                best_idx = idx
-                best_dist = dist
+    matched_global, used_global = _global_greedy_matches(truth, algo_pred)
+    for truth_idx, truth_row in enumerate(truth):
+        best_idx = matched_global.get(truth_idx)
         if best_idx is None:
             fn_records.append(truth_row)
             stats[truth_row["type"]][2] += 1
         else:
-            used_global.add(best_idx)
             tp_records.append((truth_row, algo_pred[best_idx]))
             stats[truth_row["type"]][0] += 1
 
@@ -583,22 +623,13 @@ def score_pr(truth_vcf: Path,
     tp_i = len(interior_truth) - len(fn_i)
 
     scen_stats: dict[str, dict[str, list[int]]] = defaultdict(lambda: defaultdict(lambda: [0, 0, 0]))
-    used_scen: set[int] = set()
-    for truth_row in truth:
-        best_idx: int | None = None
-        best_dist = math.inf
-        for idx, pred_row in enumerate(algo_pred):
-            if idx in used_scen or not compatible(truth_row, pred_row):
-                continue
-            dist = distance(truth_row, pred_row)
-            if dist < best_dist:
-                best_idx = idx
-                best_dist = dist
+    matched_scen, used_scen = _global_greedy_matches(truth, algo_pred)
+    for truth_idx, truth_row in enumerate(truth):
+        best_idx = matched_scen.get(truth_idx)
         scenario = truth_row.get("scenario", "unknown")
         if best_idx is None:
             scen_stats[scenario][truth_row["type"]][2] += 1
         else:
-            used_scen.add(best_idx)
             scen_stats[scenario][truth_row["type"]][0] += 1
     for idx, pred_row in enumerate(algo_pred):
         if idx not in used_scen:
@@ -765,6 +796,39 @@ def score_pr(truth_vcf: Path,
     return summary
 
 
+def _normalize_asm_token(raw: str) -> str:
+    """Collapse an asm name to alnum-only-with-underscores form.
+
+    Mirrors run_real_fungal_benchmark.normalize_name so a sanitized manifest
+    sample (``GCF_000512605_2``) and the raw QASM the binary writes
+    (``GCF_000512605.2_ASM51260v3_genomic.fna``) collapse to comparable
+    tokens — the latter normalizes to ``GCF_000512605_2_ASM51260v3_...``,
+    which startswith the former + "_".
+    """
+    cleaned = re.sub(r"[^0-9A-Za-z]+", "_", raw.strip()).strip("_")
+    return cleaned or "unknown"
+
+
+def _resolve_owner_sample(qasm: str, norm_samples: list[tuple[int, str]]) -> int:
+    """Return the index of the manifest sample that owns this QASM, or -1.
+
+    Match is exact-normalized first, then prefix either way — the same rule
+    run_real_fungal_benchmark.qasm_matches_observed uses — so the raw
+    filename-stem QASM resolves back to its sanitized manifest column
+    instead of being treated as a brand-new sample.
+    """
+    if not qasm:
+        return -1
+    q = _normalize_asm_token(qasm)
+    for idx, s in norm_samples:
+        if q == s:
+            return idx
+    for idx, s in norm_samples:
+        if q.startswith(s + "_") or s.startswith(q + "_"):
+            return idx
+    return -1
+
+
 def expand_to_multisample_vcf(
     src_vcf: Path,
     dst_vcf: Path,
@@ -778,6 +842,13 @@ def expand_to_multisample_vcf(
     per query asm with GT 1/1 only for the owning sample. This walks the
     file twice (cheap — VCFs here are small): pass 1 to enumerate sample
     names, pass 2 to rewrite rows. Returns the destination path.
+
+    When ``sample_names`` is supplied (the manifest sample list) it is the
+    authoritative column set: per-row QASM values are matched back to it by
+    normalized name rather than appended. The binary writes QASM as a raw
+    file stem (``GCF_x.y_ASMz_genomic.fna``) while the manifest carries the
+    sanitized form (``GCF_x_y``); treating the two as distinct samples is
+    what produced the doubled 10-column-for-5-sample VCF.
     """
     samples: list[str] = []
     seen: set[str] = set()
@@ -785,27 +856,38 @@ def expand_to_multisample_vcf(
         if asm and asm not in seen:
             seen.add(asm)
             samples.append(asm)
-    with src_vcf.open(encoding="utf-8") as fh:
-        for line in fh:
-            if line.startswith("#") or not line.strip():
-                continue
-            cols = line.rstrip("\n").split("\t")
-            if len(cols) < 8:
-                continue
-            info = parse_info_field(cols[7])
-            asm = info.get("QASM") or info.get("QUERY_ASM") or ""
-            if asm and asm not in seen:
-                seen.add(asm)
-                samples.append(asm)
+    have_manifest = bool(samples)
+    norm_samples = [(i, _normalize_asm_token(s)) for i, s in enumerate(samples)]
+    if not have_manifest:
+        # No manifest sample list — fall back to enumerating QASM values
+        # straight from the file (each distinct QASM is its own column).
+        with src_vcf.open(encoding="utf-8") as fh:
+            for line in fh:
+                if line.startswith("#") or not line.strip():
+                    continue
+                cols = line.rstrip("\n").split("\t")
+                if len(cols) < 8:
+                    continue
+                info = parse_info_field(cols[7])
+                asm = info.get("QASM") or info.get("QUERY_ASM") or ""
+                if asm and asm not in seen:
+                    seen.add(asm)
+                    samples.append(asm)
+        norm_samples = [(i, _normalize_asm_token(s)) for i, s in enumerate(samples)]
     if not samples:
         # Nothing to expand and no manifest sample list — copy through as-is.
         dst_vcf.write_text(src_vcf.read_text(encoding="utf-8"), encoding="utf-8")
         return dst_vcf
-    sample_index = {asm: i for i, asm in enumerate(samples)}
+    # Exact-name index covers the no-manifest path (QASM == column name);
+    # _resolve_owner_sample covers the normalized manifest match.
+    exact_index = {asm: i for i, asm in enumerate(samples)}
     dst_vcf.parent.mkdir(parents=True, exist_ok=True)
+    wrote_chrom_header = False
+    wrote_meta_header = False
     with src_vcf.open(encoding="utf-8") as fh, dst_vcf.open("w", encoding="utf-8") as out:
         for line in fh:
             if line.startswith("##"):
+                wrote_meta_header = True
                 out.write(line)
                 continue
             if line.startswith("#CHROM"):
@@ -814,6 +896,7 @@ def expand_to_multisample_vcf(
                     "QUAL", "FILTER", "INFO", "FORMAT",
                 ] + samples)
                 out.write(fixed + "\n")
+                wrote_chrom_header = True
                 continue
             if not line.strip():
                 continue
@@ -823,7 +906,9 @@ def expand_to_multisample_vcf(
                 continue
             info = parse_info_field(cols[7])
             asm = info.get("QASM") or info.get("QUERY_ASM") or ""
-            owner = sample_index.get(asm, -1)
+            owner = exact_index.get(asm, -1)
+            if owner < 0:
+                owner = _resolve_owner_sample(asm, norm_samples)
             # Preserve FORMAT but force GT to be the only key so the
             # multi-sample expansion is unambiguous; this matches the
             # truth VCF schema produced by test_amf.write_truth_vcf.
@@ -832,6 +917,15 @@ def expand_to_multisample_vcf(
             if 0 <= owner < len(gts):
                 gts[owner] = "1/1"
             out.write("\t".join(cols[:9] + gts) + "\n")
+        if not wrote_chrom_header:
+            if not wrote_meta_header:
+                out.write("##fileformat=VCFv4.3\n")
+            out.write(
+                "\t".join([
+                    "#CHROM", "POS", "ID", "REF", "ALT", "QUAL",
+                    "FILTER", "INFO", "FORMAT", *samples,
+                ]) + "\n"
+            )
     return dst_vcf
 
 
