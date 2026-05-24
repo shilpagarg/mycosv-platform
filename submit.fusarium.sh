@@ -184,6 +184,31 @@ if [[ -f "${VCF}" ]]; then
     | awk '{printf "    %-18s %s\n", $2, $1}'
 fi
 
+# HTML visualization report: benchmark panels + the five novel-SV biology
+# questions (HGT/Starship, two-speed/TE, expression, ecology, association).
+# Runs only when the core TSVs landed so a failed benchmark surfaces its own
+# error instead of a confusing report-generation failure.
+REPORT_OUT="${OUT_DIR}/report"
+if [[ -f "${OUT_DIR}/exact_benchmark_summary.tsv" && -f "${OUT_DIR}/novel_mycosv_calls.tsv" ]]; then
+  echo
+  echo "=== Visualization report for ${OUT_NAME} ==="
+  mkdir -p "${REPORT_OUT}"
+  REPORT_ARGS=(
+    --real "${OUT_DIR}/exact_benchmark_summary.tsv"
+    --novel "${OUT_DIR}/novel_mycosv_calls.tsv"
+    --outdir "${REPORT_OUT}"
+    --title "MycoSV ${OUT_NAME} — benchmark & novel-SV biology"
+  )
+  [[ -f "${OUT_DIR}/biology_findings.tsv" ]] \
+    && REPORT_ARGS+=(--biology "${OUT_DIR}/biology_findings.tsv")
+  [[ -f "${OUT_DIR}/mycosv_evidence_tiers.tsv" ]] \
+    && REPORT_ARGS+=(--evidence-tiers "${OUT_DIR}/mycosv_evidence_tiers.tsv")
+  python3 -u sv_visualization_report.py "${REPORT_ARGS[@]}" \
+    || echo "[warn] report generation failed (rc=$?)"
+else
+  echo "[skip] report: exact_benchmark_summary.tsv / novel_mycosv_calls.tsv missing under ${OUT_DIR}"
+fi
+
 echo
 echo "end: $(date)"
 exit "${RC}"

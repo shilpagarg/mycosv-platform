@@ -1745,6 +1745,28 @@ static bool try_mem_chain_call_single_ref_cached(
             default:
                 return out;
         }
+        if (res.type == T::INS || res.type == T::DUP || res.type == T::INV) {
+            const int seqS = std::max(0, res.qBreakStart);
+            const int seqE = (res.type == T::INS)
+                ? std::min(seqS + std::abs(res.svLen), static_cast<int>(qSeq.size()))
+                : std::min(std::max(seqS, res.qBreakEnd + 1), static_cast<int>(qSeq.size()));
+            if (seqE > seqS) {
+                set_variant_sequence_excerpt(
+                    out.call,
+                    std::string_view(qSeq.data() + seqS,
+                                     static_cast<size_t>(seqE - seqS)));
+            }
+        } else if (res.type == T::DEL && primaryRef.has_seq()) {
+            const auto& refSeq = primaryRef.seq();
+            const int seqS = std::max(0, res.rBreakStart);
+            const int seqE = std::min(static_cast<int>(refSeq.size()), res.rBreakEnd);
+            if (seqE > seqS) {
+                set_variant_sequence_excerpt(
+                    out.call,
+                    std::string_view(refSeq.data() + seqS,
+                                     static_cast<size_t>(seqE - seqS)));
+            }
+        }
         out.score = bestScore;
         out.anchors = static_cast<int>(chain.size());
         out.valid = true;
@@ -2096,6 +2118,28 @@ static bool try_mem_chain_call_single_ref_cached_multi(
                     break;
                 default:
                     continue;
+            }
+            if (res.type == T::INS || res.type == T::DUP || res.type == T::INV) {
+                const int seqS = std::max(0, res.qBreakStart);
+                const int seqE = (res.type == T::INS)
+                    ? std::min(seqS + std::abs(res.svLen), static_cast<int>(qSeq.size()))
+                    : std::min(std::max(seqS, res.qBreakEnd + 1), static_cast<int>(qSeq.size()));
+                if (seqE > seqS) {
+                    set_variant_sequence_excerpt(
+                        v,
+                        std::string_view(qSeq.data() + seqS,
+                                         static_cast<size_t>(seqE - seqS)));
+                }
+            } else if (res.type == T::DEL && primaryRef.has_seq()) {
+                const auto& refSeq = primaryRef.seq();
+                const int seqS = std::max(0, res.rBreakStart);
+                const int seqE = std::min(static_cast<int>(refSeq.size()), res.rBreakEnd);
+                if (seqE > seqS) {
+                    set_variant_sequence_excerpt(
+                        v,
+                        std::string_view(refSeq.data() + seqS,
+                                         static_cast<size_t>(seqE - seqS)));
+                }
             }
             out.calls.push_back(std::move(v));
         }
@@ -3104,6 +3148,47 @@ filter_low_coverage_read_artifacts(std::vector<VariantCallBridge> calls,
 }
 
 // ----------------------------------------------------------------------------
+// Oversized long-read rearrangement gate.
+//
+// A long-read pseudo-contig chain can jump a large reference gap on only a
+// handful of anchors, emitting an INV/DUP far larger than any single read can
+// represent (observed: 27–57 kb inversions from reads with N50 ~7 kb). An
+// inversion or interspersed duplication needs both breakpoints AND the body
+// adequately covered; a sparse chain spanning many read-lengths is almost
+// always a chimeric-chain artifact. We drop only the sparse oversized
+// rearrangements — a dense chain (>=8 anchors) over a large span is kept, and
+// DEL/INS are never gated here since a single read spanning either breakpoint
+// is sufficient evidence regardless of the event size.
+// ----------------------------------------------------------------------------
+static std::vector<VariantCallBridge>
+gate_oversized_long_read_events(std::vector<VariantCallBridge> calls,
+                                const query_input::CoverageReport& report) {
+    if (report.mode != query_input::QueryMode::LONG_READS || calls.empty())
+        return calls;
+    const double n50 = report.n50;
+    if (!(n50 > 0.0)) return calls;
+    const double maxSpan = 3.0 * n50;
+    std::vector<VariantCallBridge> out;
+    out.reserve(calls.size());
+    int dropped = 0;
+    for (auto& c : calls) {
+        const bool rearrangement = (c.type == "INV" || c.type == "DUP");
+        if (rearrangement &&
+            static_cast<double>(std::abs(c.svlen)) > maxSpan &&
+            c.anchors < 8) {
+            ++dropped;
+            continue;
+        }
+        out.push_back(std::move(c));
+    }
+    if (dropped > 0)
+        std::cerr << "[long-reads] gated " << dropped
+                  << " oversized sparse-chain INV/DUP call(s) (span > "
+                  << static_cast<long>(maxSpan) << " bp, anchors<8)\n";
+    return out;
+}
+
+// ----------------------------------------------------------------------------
 // Low-coverage cosine-similarity genotyper.
 //
 // Even at 1–2× depth, the *pattern* of evidence on the candidate haplotype
@@ -3243,8 +3328,21 @@ static tol::FederatedOptions make_fed_opts(const Options& o) {
 }
 
 static int normalized_svlen_for_output(const VariantCallBridge& v) {
-    if (v.type == "DEL") return -std::abs(v.svlen);
+    int len = std::abs(v.svlen);
+    // Reads-mode pseudo-contig coordinates are synthetic (one collapsed
+    // cluster), so the pos/end span is not the biological event size. For
+    // DEL/INV/DUP the true size is the reference anchor span; derive it from
+    // REFPOS/REFEND when the call carries a reference anchor. Assembly mode is
+    // left untouched — there the query span already equals the event size.
+    const bool readsMode =
+        (v.queryMode == "long-reads" || v.queryMode == "short-reads");
+    if (readsMode && (v.type == "DEL" || v.type == "INV" || v.type == "DUP")
+        && v.refPos > 0 && v.refEnd > v.refPos) {
+        len = v.refEnd - v.refPos;
+    }
+    if (v.type == "DEL") return -std::max(1, len);
     if (v.type == "OFF_REF") return std::max(1, std::abs(v.svlen));
+    if (v.type == "INV" || v.type == "DUP") return std::max(1, len);
     return v.svlen;
 }
 
@@ -3295,12 +3393,25 @@ static void write_vcf_header(std::ostream& out,
         << "##INFO=<ID=FUSED_LOGODDS,Number=1,Type=Float,Description=\"Log-odds for the alternative allele after evidence fusion\">\n"
         << "##INFO=<ID=FUSED_DEPTH,Number=1,Type=Float,Description=\"Effective depth used by evidence fusion\">\n"
         << "##INFO=<ID=FUSED_LAYERS,Number=1,Type=Integer,Description=\"Number of evidence observations fused for the chosen call\">\n"
+        << "##INFO=<ID=VARSEQ,Number=1,Type=String,Description=\"Variant allele or affected sequence excerpt: query sequence for INS/DUP/INV/OFF_REF and deleted reference sequence for DEL\">\n"
+        << "##INFO=<ID=VARSEQ_LEN,Number=1,Type=Integer,Description=\"Length of the emitted VARSEQ excerpt\">\n"
+        << "##INFO=<ID=VARSEQ_TRUNCATED,Number=0,Type=Flag,Description=\"VARSEQ is capped and may not contain the full event sequence\">\n"
         << "##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">\n"
         << "##FORMAT=<ID=GQ,Number=1,Type=Float,Description=\"GQ\">\n"
         << "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tSAMPLE\n";
 }
 
 static int effective_call_support(const VariantCallBridge& v) {
+    // Reads modes: readSupport is parsed from the pseudo-contig name
+    // (lr_pc0_n189726 -> 189726) and is the whole cluster's read count, so it
+    // is IDENTICAL for every call and carries no per-call signal. Report the
+    // per-call MEM-chain anchor count instead — that is the real per-event
+    // evidence the chain produced.
+    if (v.queryMode == "long-reads" || v.queryMode == "short-reads") {
+        if (v.anchors > 0) return v.anchors;
+        if (v.fusedLayersUsed > 0) return v.fusedLayersUsed;
+        return 0;
+    }
     if (v.readSupport >= 0) return v.readSupport;
     if (v.queryMode == "assembly") {
         if (v.anchors > 0) return v.anchors;
@@ -3345,6 +3456,12 @@ static void write_vcf_record(std::ostream& out,
         << ";FUSED_LAYERS=" << std::max(0, v.fusedLayersUsed);
     const int support = effective_call_support(v);
     if (support >= 0) out << ";SUPPORT=" << support;
+    if (!v.variantSeq.empty()) {
+        out << ";VARSEQ=" << v.variantSeq
+            << ";VARSEQ_LEN=" << v.variantSeq.size();
+        if (std::abs(svlen) > static_cast<int>(v.variantSeq.size()))
+            out << ";VARSEQ_TRUNCATED";
+    }
     if (v.refPos > 0) out << ";REFPOS=" << v.refPos;
     if (v.refEnd > 0) out << ";REFEND=" << v.refEnd;
     if (primaryOffRef) out << ";OFFREF";
@@ -3618,7 +3735,7 @@ process_query(const std::string& qAsmPath,
                     std::lock_guard<std::mutex> lk(*ckpt->mu);
                     for (const auto& c : contigCalls) {
                         VariantCallBridge cc = c;
-                        if (cc.queryMode.empty()) cc.queryMode = modeLabel;
+                        cc.queryMode = modeLabel;
                         write_tsv_record(*ckpt->hier_tsv, cc);
                         write_vcf_record(*ckpt->hier_vcf, cc, ckpt->sv_id->fetch_add(1));
                         ++per_contig_checkpoint_calls;
@@ -3653,7 +3770,7 @@ process_query(const std::string& qAsmPath,
             std::lock_guard<std::mutex> lk(*ckpt->mu);
             for (auto& c : hcalls) {
                 VariantCallBridge cc = c;
-                if (cc.queryMode.empty()) cc.queryMode = modeLabel;
+                cc.queryMode = modeLabel;
                 write_tsv_record(*ckpt->hier_tsv, cc);
                 write_vcf_record(*ckpt->hier_vcf, cc, ckpt->sv_id->fetch_add(1));
             }
@@ -3763,6 +3880,7 @@ process_query(const std::string& qAsmPath,
         if (prep.report.mode != query_input::QueryMode::ASSEMBLY) {
             qr.calls = deduplicate_read_mode_events(std::move(qr.calls));
             qr.calls = filter_low_coverage_read_artifacts(std::move(qr.calls), prep.report);
+            qr.calls = gate_oversized_long_read_events(std::move(qr.calls), prep.report);
             // Re-genotype low-coverage reads-mode calls using cosine
             // similarity over the (REF mass, ALT mass, support cardinality)
             // template patterns; no-op when coverageTier != LOW.
@@ -3830,6 +3948,20 @@ process_query(const std::string& qAsmPath,
                 if (overlaps) continue;
                 VariantCallBridge chosen = *sc.first;
                 chosen.queryMode = modeLabel;
+                // The hierarchical-only path skips select_best_call_per_contig,
+                // so without this the FUSED_* evidence fields stay at their
+                // inert defaults (FUSED_LAYERS=0, FUSED_POST=0.5). Run the same
+                // probabilistic evidence fusion here when the reference index
+                // is still loaded (skip_flat_due_to_hier does not free it).
+                if (refIdx != nullptr && seqIt != qr.contigs.end()) {
+                    const tol::FusedEvidenceScore fused = fuse_candidate_evidence(
+                        *sc.first, kv.second, seqIt->second,
+                        *refIdx, *refCache, qo, prep.report.mode, &prep.report);
+                    chosen.fusedPosteriorAlt   = fused.posteriorAlt;
+                    chosen.fusedLogOddsAlt     = fused.logOddsAlt;
+                    chosen.fusedEffectiveDepth = fused.effectiveDepth;
+                    chosen.fusedLayersUsed     = static_cast<int>(fused.layersUsed);
+                }
                 qr.calls.push_back(std::move(chosen));
                 kept.push_back({cs, ce, sc.first->svlen});
                 ++keptCount;
@@ -3838,6 +3970,7 @@ process_query(const std::string& qAsmPath,
         if (prep.report.mode != query_input::QueryMode::ASSEMBLY) {
             qr.calls = deduplicate_read_mode_events(std::move(qr.calls));
             qr.calls = filter_low_coverage_read_artifacts(std::move(qr.calls), prep.report);
+            qr.calls = gate_oversized_long_read_events(std::move(qr.calls), prep.report);
             // Re-genotype low-coverage reads-mode calls using cosine
             // similarity over the (REF mass, ALT mass, support cardinality)
             // template patterns; no-op when coverageTier != LOW.

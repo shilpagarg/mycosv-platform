@@ -269,17 +269,50 @@ def ecological_context(
         species_text = (meta_row.get('species') or '').lower()
         genus = (meta_row.get('genus') or '').lower()
         order = (meta_row.get('order') or '').lower()
+        family = (meta_row.get('family') or '').lower()
+        phylum = (meta_row.get('phylum') or '').lower()
+        clazz = (meta_row.get('class') or '').lower()
         scenario = (meta_row.get('scenario') or '').lower()
-        if 'arbuscular' in scenario or genus in {'rhizophagus', 'gigaspora'}:
+        # All Glomeromycota / Glomeromycotina are obligate arbuscular mycorrhizal
+        # symbionts. The phylum/class check ensures Diversispora, Glomus,
+        # Funneliformis, Claroideoglomus, Septoglomus, Acaulospora, Scutellospora,
+        # Paraglomus, Archaeospora, etc. are not silently misclassified as
+        # filamentous saprotrophs when FungalTraits has no species-level row.
+        amf_genera = {
+            'rhizophagus', 'gigaspora', 'glomus', 'diversispora',
+            'funneliformis', 'claroideoglomus', 'septoglomus',
+            'acaulospora', 'scutellospora', 'paraglomus', 'archaeospora',
+            'racocetra', 'cetraspora', 'dentiscutata', 'pacispora',
+            'redeckera', 'sclerocystis', 'entrophospora', 'ambispora',
+        }
+        amf_higher = {
+            'glomeromycota', 'glomeromycotina', 'glomeromycetes',
+            'glomerales', 'diversisporales', 'archaeosporales', 'paraglomerales',
+            'glomeraceae', 'diversisporaceae', 'gigasporaceae',
+            'claroideoglomeraceae', 'acaulosporaceae', 'paraglomeraceae',
+            'archaeosporaceae', 'ambisporaceae',
+        }
+        if (
+            'arbuscular' in scenario
+            or genus in amf_genera
+            or phylum in amf_higher
+            or clazz in amf_higher
+            or order in amf_higher
+            or family in amf_higher
+        ):
             return 'Symbiotroph_arbuscular_mycorrhizal'
         if any(x in species_text or x == genus for x in (
             'puccinia', 'ustilago', 'mycosarcoma', 'pyricularia', 'fusarium',
             'leptosphaeria', 'zymoseptoria'
         )):
             return 'Pathotroph_plant_pathogen'
-        if genus in {'candida', 'cryptococcus', 'nakaseomyces'}:
+        if genus in {'candida', 'cryptococcus', 'nakaseomyces'} or 'candida' in species_text:
             return 'Yeast_opportunistic_pathogen'
-        if genus in {'saccharomyces', 'lachancea', 'kluyveromyces'}:
+        if genus in {
+            'saccharomyces', 'lachancea', 'kluyveromyces',
+            'ogataea', 'pichia', 'komagataella', 'yarrowia',
+            'hanseniaspora', 'eremothecium', 'torulaspora', 'zygosaccharomyces',
+        }:
             return 'Saprotroph_yeast'
         if order in {'polyporales', 'agaricales', 'russulales'}:
             return 'Saprotroph_wood_decay'
@@ -978,9 +1011,365 @@ def choose_functional_example(
 
 
 
+# --- Cross-guild aggregation -------------------------------------------------
+# These functions read the per-shard biology_findings.tsv files produced by
+# the per-query analyzer and synthesize a guild-level view (AMF / EMF / yeast /
+# saprotrophic Pezizomycotina / endophyte / mushroom / truffle / etc.). They
+# explicitly stratify by *pangenome scope* — single-reference-equivalent vs
+# pangenome-only — so the "what would have been missed without a pangenome"
+# fraction is computed per guild, per candidate axis, and tied back to ecology
+# (lifestyle / ecological_trait / substrate_or_host) and gene-expression links
+# (expression_supported / affected_gene). Triggered by --cross-guild-shard-dir;
+# left out of the per-shard code path so existing single-shard invocations
+# stay unchanged.
+
+# Genus -> guild mapping. Same source-of-truth used by the augment + 165 panel
+# helpers. Genera that legitimately span guilds (e.g. Serendipita = orchid-MF
+# *or* endophyte; Lactarius = EMF) are mapped to their most common guild here;
+# fine-grained re-classification can be done downstream by reading lifestyle.
+GUILD_BY_GENUS = {
+    # AMF (Glomeromycotina)
+    **{g: 'AMF' for g in (
+        'Rhizophagus','Rhizoglomus','Diversispora','Acaulospora','Funneliformis',
+        'Gigaspora','Glomus','Paraglomus','Scutellospora','Claroideoglomus',
+        'Entrophospora','Ambispora','Septoglomus','Sieverdingia','Simiglomus',
+        'Archaeospora','Pacispora','Racocetra','Dentiscutata','Cetraspora',
+        'Albahypha','Dominikia','Blaszkowskia','Sclerocystis','Redeckera',
+        'Pervetustus',
+    )},
+    # EMF (Basidiomycota mostly, plus a few Ascomycota)
+    **{g: 'EMF' for g in (
+        'Suillus','Pisolithus','Laccaria','Cenococcum','Paxillus','Trichophaea',
+        'Sphaerosporella','Geastrum','Scleroderma','Chroogomphus','Gomphidius',
+        'Hebeloma','Helvella','Amanita','Boletus','Lactarius','Xerocomus',
+        'Tylopilus','Leccinum','Clavulina','Austroboletus','Sparassis','Hydnum',
+        'Cantharellus','Rhizopogon','Russula','Thelephora','Cortinarius',
+        'Hydnellum','Gyroporus','Geopora','Hygrophorus','Tricholoma','Lanmaoa',
+        'Butyriboletus','Pseudosperma','Inocybe','Suillellus',
+    )},
+    # Yeast (model)
+    **{g: 'Yeast' for g in ('Saccharomyces','Yarrowia')},
+    # Edible mushrooms
+    **{g: 'Mushroom' for g in ('Pleurotus','Lentinula','Agaricus')},
+    # Truffles
+    **{g: 'Truffle' for g in ('Tuber',)},
+    # Endophytes (incl. orchid- and ericoid-MF that aren't single-guild)
+    **{g: 'Endophyte' for g in (
+        'Serendipita','Piriformospora','Beauveria','Paecilomyces',
+        'Colletotrichum','Oidiodendron','Meliniomyces','Rhizoscyphus',
+        'Tulasnella','Alternaria',
+    )},
+    # Filamentous Ascomycota saprotrophs / pathogens
+    **{g: 'Filamentous' for g in (
+        'Aspergillus','Penicillium','Talaromyces','Fusarium','Trichoderma',
+        'Neurospora','Monascus','Cladosporium','Acremonium','Rhizoctonia',
+        'Rhizopus','Mucor','Eremothecium','Ustilago','Mycosarcoma','Candida',
+        'Blumeria',
+    )},
+}
+
+
+def classify_guild(genus: str, species: str = '', lifestyle: str = '') -> str:
+    """Return the guild label for a species. Defaults to 'Other' so callers
+    can surface unmapped genera without dropping their rows."""
+    if genus:
+        g = genus.split()[0].lstrip('[').rstrip(']')
+        if g in GUILD_BY_GENUS:
+            return GUILD_BY_GENUS[g]
+    if species:
+        first = species.split()[0].lstrip('[').rstrip(']')
+        if first in GUILD_BY_GENUS:
+            return GUILD_BY_GENUS[first]
+    if lifestyle and lifestyle != '.':
+        ll = lifestyle.lower()
+        if 'mycorrhiz' in ll:
+            return 'AMF' if 'arbusc' in ll else 'EMF'
+        if 'endophyt' in ll:
+            return 'Endophyte'
+        if 'sapro' in ll:
+            return 'Filamentous'
+        if 'pathotroph' in ll or 'patho' in ll:
+            return 'Filamentous'
+    return 'Other'
+
+
+def _fisher_one_tailed_right(a: int, b: int, c: int, d: int) -> float:
+    """Right-tailed Fisher's exact P(X>=a) for a 2x2 contingency table:
+        [[a, b], [c, d]]. Uses log-space hypergeometric tail sum to stay
+    well-behaved at large N."""
+    n = a + b + c + d
+    if n == 0:
+        return 1.0
+    row1 = a + b
+    col1 = a + c
+    a_min = max(0, col1 - (n - row1))
+    a_max = min(row1, col1)
+
+    def logC(n_, k_):
+        return math.lgamma(n_ + 1) - math.lgamma(k_ + 1) - math.lgamma(n_ - k_ + 1)
+
+    log_denom = logC(n, col1)
+    log_tail = []
+    for k in range(a, a_max + 1):
+        logp = logC(row1, k) + logC(n - row1, col1 - k) - log_denom
+        log_tail.append(logp)
+    if not log_tail:
+        return 1.0
+    m = max(log_tail)
+    p = math.exp(m) * sum(math.exp(x - m) for x in log_tail)
+    return min(1.0, max(0.0, p))
+
+
+def _truthy(value: str) -> bool:
+    return value.strip().lower() in {'yes', 'true', '1', 'y'}
+
+
+def _is_te_class(ec: str) -> bool:
+    return ec.upper() in TE_CLASSES
+
+
+def _shard_iter(shard_dir: Path):
+    """Yield (query_asm, biology_findings_path) for shards that have one."""
+    for q in sorted(p for p in shard_dir.iterdir() if p.is_dir()):
+        bf = q / 'biology_findings.tsv'
+        if bf.exists() and bf.stat().st_size > 0:
+            yield q.name, bf
+
+
+def run_cross_guild(shard_dir: Path, out_dir: Path) -> int:
+    """Aggregate biology_findings.tsv across shards, stratify by guild AND by
+    pangenome scope, and emit cross-guild summary + enrichment + pangenome-lift
+    tables that connect SV biology to ecology and gene-expression context."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    rows: list[dict[str, str]] = []
+    n_shards = 0
+    for qname, bf in _shard_iter(shard_dir):
+        n_shards += 1
+        with bf.open(newline='') as fh:
+            reader = csv.DictReader(fh, delimiter='\t')
+            for r in reader:
+                r['_query_asm'] = qname
+                rows.append(r)
+    if not rows:
+        print(f'[cross-guild] no biology_findings.tsv shards found under {shard_dir}')
+        return 1
+    print(f'[cross-guild] read {len(rows)} biology rows across {n_shards} shards', flush=True)
+
+    # Classify each row by guild + pangenome scope.
+    for r in rows:
+        r['_guild'] = classify_guild(
+            r.get('genus', '') or '',
+            r.get('species', '') or '',
+            r.get('lifestyle', '') or '',
+        )
+        # pangenome scope: mycosv_unique=yes means the call was NOT recovered by
+        # any single-reference comparator; single_reference_equivalent=yes means
+        # it would be (so single-ref methods would also find it).
+        r['_pangenome_only'] = _truthy(r.get('mycosv_unique', '') or '')
+        r['_single_ref_eq'] = _truthy(r.get('single_reference_equivalent', '') or '')
+        r['_has_eco'] = any(
+            (r.get(k, '') or '').strip() not in ('.', '')
+            for k in ('lifestyle','ecological_trait','substrate_or_host','trophic_mode')
+        )
+        r['_has_expr'] = _truthy(r.get('expression_supported', '') or '')
+        r['_has_gene'] = (r.get('affected_gene', '.') or '.') not in ('.', '')
+        r['_is_hgt'] = (r.get('candidate_type', '') or '').strip() == 'hgt_candidate' \
+            or (r.get('element_class', '').upper() in ('HGT','STARSHIP'))
+        r['_is_rip'] = r.get('element_class', '').upper() == 'RIP'
+        r['_is_te'] = _is_te_class(r.get('element_class', '') or '')
+
+    # ---- Per-guild summary -------------------------------------------------
+    per_guild = defaultdict(lambda: {
+        'n_shards': set(), 'n_candidates': 0,
+        'n_hgt': 0, 'n_rip': 0, 'n_te': 0,
+        'pangenome_only': 0, 'single_ref_eq': 0,
+        'hgt_pangenome_only': 0, 'rip_pangenome_only': 0, 'te_pangenome_only': 0,
+        'with_ecology': 0, 'with_expression': 0, 'with_gene': 0,
+        'genera': Counter(),
+        'svtypes': Counter(),
+        'priorities': [],
+    })
+    for r in rows:
+        g = r['_guild']
+        b = per_guild[g]
+        b['n_shards'].add(r['_query_asm'])
+        b['n_candidates'] += 1
+        if r['_is_hgt']: b['n_hgt'] += 1
+        if r['_is_rip']: b['n_rip'] += 1
+        if r['_is_te']: b['n_te'] += 1
+        if r['_pangenome_only']: b['pangenome_only'] += 1
+        if r['_single_ref_eq']: b['single_ref_eq'] += 1
+        if r['_is_hgt'] and r['_pangenome_only']: b['hgt_pangenome_only'] += 1
+        if r['_is_rip'] and r['_pangenome_only']: b['rip_pangenome_only'] += 1
+        if r['_is_te'] and r['_pangenome_only']: b['te_pangenome_only'] += 1
+        if r['_has_eco']: b['with_ecology'] += 1
+        if r['_has_expr']: b['with_expression'] += 1
+        if r['_has_gene']: b['with_gene'] += 1
+        g_first = (r.get('genus','') or r.get('species','')).split()[0:1]
+        if g_first:
+            b['genera'][g_first[0]] += 1
+        b['svtypes'][r.get('svtype','.')] += 1
+        try:
+            b['priorities'].append(int(r.get('priority','0')))
+        except ValueError:
+            pass
+
+    summary_path = out_dir / 'cross_guild_summary.tsv'
+    with summary_path.open('w', newline='') as fh:
+        fields = ['guild','n_shards','n_candidates','n_hgt','n_rip','n_te',
+                  'pangenome_only','single_ref_eq','pangenome_only_fraction',
+                  'hgt_pangenome_only','rip_pangenome_only','te_pangenome_only',
+                  'hgt_pangenome_only_fraction','rip_pangenome_only_fraction',
+                  'with_ecology','with_expression','with_gene',
+                  'mean_priority','top_svtypes','top_genera']
+        w = csv.DictWriter(fh, fieldnames=fields, delimiter='\t')
+        w.writeheader()
+        for g, b in sorted(per_guild.items()):
+            n = max(1, b['n_candidates'])
+            w.writerow({
+                'guild': g,
+                'n_shards': len(b['n_shards']),
+                'n_candidates': b['n_candidates'],
+                'n_hgt': b['n_hgt'],
+                'n_rip': b['n_rip'],
+                'n_te': b['n_te'],
+                'pangenome_only': b['pangenome_only'],
+                'single_ref_eq': b['single_ref_eq'],
+                'pangenome_only_fraction': f'{b["pangenome_only"]/n:.3f}',
+                'hgt_pangenome_only': b['hgt_pangenome_only'],
+                'rip_pangenome_only': b['rip_pangenome_only'],
+                'te_pangenome_only': b['te_pangenome_only'],
+                'hgt_pangenome_only_fraction': (f'{b["hgt_pangenome_only"]/b["n_hgt"]:.3f}' if b['n_hgt'] else '.'),
+                'rip_pangenome_only_fraction': (f'{b["rip_pangenome_only"]/b["n_rip"]:.3f}' if b['n_rip'] else '.'),
+                'with_ecology': b['with_ecology'],
+                'with_expression': b['with_expression'],
+                'with_gene': b['with_gene'],
+                'mean_priority': (f'{sum(b["priorities"])/len(b["priorities"]):.2f}' if b['priorities'] else '.'),
+                'top_svtypes': ';'.join(f'{k}:{v}' for k,v in b['svtypes'].most_common(4)),
+                'top_genera': ';'.join(f'{k}:{v}' for k,v in b['genera'].most_common(4)),
+            })
+    print(f'[cross-guild] wrote {summary_path}', flush=True)
+
+    # ---- Per-guild × feature Fisher enrichment -----------------------------
+    # For each (guild, feature), test whether the feature is enriched in this
+    # guild vs the rest of the panel (2x2 right-tailed Fisher).
+    features = [
+        ('hgt_candidate',           lambda r: r['_is_hgt']),
+        ('rip_candidate',           lambda r: r['_is_rip']),
+        ('te_or_repeat',            lambda r: r['_is_te']),
+        ('pangenome_only',          lambda r: r['_pangenome_only']),
+        ('single_ref_equiv',        lambda r: r['_single_ref_eq']),
+        ('ecology_linked',          lambda r: r['_has_eco']),
+        ('expression_supported',    lambda r: r['_has_expr']),
+        ('gene_proximal',           lambda r: r['_has_gene']),
+        ('hgt_AND_pangenome_only',  lambda r: r['_is_hgt'] and r['_pangenome_only']),
+        ('hgt_AND_ecology_linked',  lambda r: r['_is_hgt'] and r['_has_eco']),
+        ('hgt_AND_expression',      lambda r: r['_is_hgt'] and r['_has_expr']),
+        ('pangenome_AND_expression',lambda r: r['_pangenome_only'] and r['_has_expr']),
+        ('pangenome_AND_ecology',   lambda r: r['_pangenome_only'] and r['_has_eco']),
+    ]
+    enrichment_path = out_dir / 'cross_guild_enrichment.tsv'
+    n_tests = len(features) * len(per_guild)
+    with enrichment_path.open('w', newline='') as fh:
+        fields = ['guild','feature','in_guild_yes','in_guild_no','out_guild_yes','out_guild_no','odds_ratio','fisher_p','bonferroni_p','interpretation']
+        w = csv.DictWriter(fh, fieldnames=fields, delimiter='\t')
+        w.writeheader()
+        for guild_name in sorted(per_guild.keys()):
+            for feat_name, pred in features:
+                in_yes = sum(1 for r in rows if r['_guild'] == guild_name and pred(r))
+                in_no  = sum(1 for r in rows if r['_guild'] == guild_name and not pred(r))
+                out_yes= sum(1 for r in rows if r['_guild'] != guild_name and pred(r))
+                out_no = sum(1 for r in rows if r['_guild'] != guild_name and not pred(r))
+                # odds ratio (Haldane-Anscombe corrected)
+                a, b, c, d = in_yes + 0.5, in_no + 0.5, out_yes + 0.5, out_no + 0.5
+                or_val = (a * d) / (b * c)
+                p = _fisher_one_tailed_right(in_yes, in_no, out_yes, out_no)
+                bonf = min(1.0, p * n_tests)
+                interp = '.'
+                if in_yes > 0 and bonf < 0.05 and or_val > 1.0:
+                    interp = f'enriched_in_{guild_name}'
+                elif in_yes > 0 and bonf < 0.05 and or_val < 1.0:
+                    interp = f'depleted_in_{guild_name}'
+                w.writerow({
+                    'guild': guild_name, 'feature': feat_name,
+                    'in_guild_yes': in_yes, 'in_guild_no': in_no,
+                    'out_guild_yes': out_yes, 'out_guild_no': out_no,
+                    'odds_ratio': f'{or_val:.4g}',
+                    'fisher_p': f'{p:.4g}',
+                    'bonferroni_p': f'{bonf:.4g}',
+                    'interpretation': interp,
+                })
+    print(f'[cross-guild] wrote {enrichment_path}', flush=True)
+
+    # ---- Pangenome lift per guild × candidate axis -------------------------
+    # The headline number for the writeup: "X% of HGT (RIP, TE, off-ref) in
+    # guild Y would have been MISSED by single-reference methods."
+    lift_path = out_dir / 'cross_guild_pangenome_lift.tsv'
+    with lift_path.open('w', newline='') as fh:
+        fields = ['guild','candidate_axis','pangenome_only','single_ref_eq','total','pangenome_lift_fraction','interpretation']
+        w = csv.DictWriter(fh, fieldnames=fields, delimiter='\t')
+        w.writeheader()
+        axes = [
+            ('all_candidates', lambda r: True),
+            ('hgt_candidate',  lambda r: r['_is_hgt']),
+            ('rip_candidate',  lambda r: r['_is_rip']),
+            ('te_or_repeat',   lambda r: r['_is_te']),
+            ('ecology_linked', lambda r: r['_has_eco']),
+            ('expression_supported', lambda r: r['_has_expr']),
+            ('gene_proximal',  lambda r: r['_has_gene']),
+        ]
+        for guild_name in sorted(per_guild.keys()):
+            for ax_name, pred in axes:
+                pan = sum(1 for r in rows if r['_guild']==guild_name and pred(r) and r['_pangenome_only'])
+                sre = sum(1 for r in rows if r['_guild']==guild_name and pred(r) and r['_single_ref_eq'])
+                tot = sum(1 for r in rows if r['_guild']==guild_name and pred(r))
+                lift = (pan / tot) if tot else 0.0
+                interp = '.'
+                if tot >= 20 and lift >= 0.5:
+                    interp = f'{guild_name}/{ax_name}_{lift*100:.0f}pct_pangenome_only'
+                w.writerow({
+                    'guild': guild_name, 'candidate_axis': ax_name,
+                    'pangenome_only': pan, 'single_ref_eq': sre, 'total': tot,
+                    'pangenome_lift_fraction': f'{lift:.3f}',
+                    'interpretation': interp,
+                })
+    print(f'[cross-guild] wrote {lift_path}', flush=True)
+
+    # ---- Brief textual summary JSON ----------------------------------------
+    summary_json_path = out_dir / 'cross_guild_summary.json'
+    with summary_json_path.open('w') as fh:
+        json.dump({
+            'n_shards': n_shards,
+            'n_rows': len(rows),
+            'guilds': {
+                g: {
+                    'n_candidates': b['n_candidates'],
+                    'pangenome_only_fraction': (b['pangenome_only']/max(1,b['n_candidates'])),
+                    'hgt_n': b['n_hgt'], 'rip_n': b['n_rip'], 'te_n': b['n_te'],
+                    'with_ecology_fraction': (b['with_ecology']/max(1,b['n_candidates'])),
+                    'with_expression_fraction': (b['with_expression']/max(1,b['n_candidates'])),
+                    'top_svtypes': dict(b['svtypes'].most_common(5)),
+                    'top_genera': dict(b['genera'].most_common(5)),
+                }
+                for g, b in per_guild.items()
+            },
+        }, fh, indent=2, sort_keys=True, default=str)
+    print(f'[cross-guild] wrote {summary_json_path}', flush=True)
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description='Summarize new-biology candidate signals from fungi_graphsv_tol outputs.')
-    ap.add_argument('--vcf', type=Path, required=True)
+    # Cross-guild aggregation mode (replaces --vcf / --hits / --out-tsv when set).
+    ap.add_argument('--cross-guild-shard-dir', type=Path,
+                    help='Aggregate biology_findings.tsv across all per-query shards under this directory '
+                         '(e.g. .../assembly/by_query/). Stratifies by guild AND by pangenome scope, '
+                         'and ties results back to ecology + gene-expression context. Writes '
+                         'cross_guild_{summary,enrichment,pangenome_lift}.tsv into --cross-guild-out-dir.')
+    ap.add_argument('--cross-guild-out-dir', type=Path,
+                    help='Output directory for the cross-guild tables. Defaults to '
+                         '<cross-guild-shard-dir>/../combined/cross_guild/.')
+    ap.add_argument('--vcf', type=Path)
     ap.add_argument('--hits', type=Path)
     ap.add_argument('--ancestral', type=Path)
     ap.add_argument('--expression-tsv', type=Path)
@@ -1000,11 +1389,30 @@ def main() -> int:
     ap.add_argument('--expression-min-reps', type=int, default=2)
     ap.add_argument('--expression-pseudocount', type=float, default=1.0)
     ap.add_argument('--query-metadata', type=Path)
-    ap.add_argument('--out-tsv', type=Path, required=True)
-    ap.add_argument('--summary-json', type=Path, required=True)
+    ap.add_argument('--out-tsv', type=Path)
+    ap.add_argument('--summary-json', type=Path)
     ap.add_argument('--phylum', default='unknown')
     ap.add_argument('--top-n', type=int, default=50)
     args = ap.parse_args()
+
+    # Cross-guild mode short-circuits the per-shard pipeline. Used by the
+    # combine phase to synthesize the panel-wide story; works for any number
+    # of shards (15-query and 165-query runs alike — just point it at the
+    # by_query/ directory).
+    if args.cross_guild_shard_dir is not None:
+        shard_dir = args.cross_guild_shard_dir.resolve()
+        if not shard_dir.is_dir():
+            ap.error(f'--cross-guild-shard-dir not a directory: {shard_dir}')
+        out_dir = (args.cross_guild_out_dir
+                   or (shard_dir.parent / 'combined' / 'cross_guild')).resolve()
+        return run_cross_guild(shard_dir, out_dir)
+
+    # Per-shard mode: --vcf / --out-tsv / --summary-json are all required.
+    missing = [name for name, val in (
+        ('--vcf', args.vcf), ('--out-tsv', args.out_tsv), ('--summary-json', args.summary_json),
+    ) if val is None]
+    if missing:
+        ap.error(f'per-shard mode requires: {", ".join(missing)}')
 
     # gene_annotations alone is now valid: it powers the nearest-gene fallback
     # so expression_gene / expression_distance_bp populate without an RNA-seq
@@ -1071,25 +1479,26 @@ def main() -> int:
         # expression_log2_fc / expression_padj as '.' since we have no measurement.
         nearest = None
         affected_locus = chrom
-        gene_contig = chrom
-        gene_pos = pos
-        gene_end = end
         ref_contig = hit.get('ref_contig') or info.get('REFCONTIG') or '.'
         ref_pos = hit.get('ref_pos') or info.get('REFPOS') or ''
         ref_end = hit.get('ref_end') or info.get('REFEND') or ref_pos
         ref_asm = hit.get('ref_asm') or info.get('CLADE') or info.get('CL') or '.'
-        if ref_contig not in {'', '.'} and ref_pos not in {'', '.', '0'}:
-            gene_contig = ref_contig
-            gene_pos = ref_pos
-            gene_end = ref_end or ref_pos
-            affected_locus = f"{ref_contig}:{gene_pos}-{gene_end}"
         if expr is None or not expr.get('best_gene'):
             nearest = nearest_gene_for_locus(
                 gene_annotations_lookup,
+                [qasm],
+                chrom,
+                pos,
+                end,
+            )
+        if nearest is None and ref_contig not in {'', '.'} and ref_pos not in {'', '.', '0'}:
+            affected_locus = f"{ref_contig}:{ref_pos}-{ref_end or ref_pos}"
+            nearest = nearest_gene_for_locus(
+                gene_annotations_lookup,
                 [qasm, meta_row.get('benchmark_ref_asm', ''), ref_asm, meta_row.get('benchmark_ref_fasta', '')],
-                gene_contig,
-                gene_pos,
-                gene_end,
+                ref_contig,
+                ref_pos,
+                ref_end or ref_pos,
             )
         candidate_type, priority, rationale = classify_candidate(svtype, ec, annot, anc, expr)
         if candidate_type == 'other':

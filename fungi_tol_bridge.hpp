@@ -143,7 +143,24 @@ struct VariantCallBridge {
     //   long-reads  → cluster size (_n<N> in contig name), exact read count
     //   short-reads → min k-mer frequency along unitig path (_mf<N>), coverage proxy
     int         readSupport         = -1;
+    // Sequence carried by the variant allele/affected segment when compact
+    // enough for VCF INFO output. For INS/DUP/INV/OFF_REF this is query
+    // sequence; for DEL it is the deleted reference sequence.
+    std::string variantSeq;
 };
+
+inline void set_variant_sequence_excerpt(VariantCallBridge& v,
+                                         std::string_view seq,
+                                         size_t maxLen = 5000) {
+    if (seq.empty()) return;
+    const size_t n = std::min(seq.size(), maxLen);
+    v.variantSeq.assign(seq.substr(0, n));
+    for (char& ch : v.variantSeq) {
+        ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
+        if (ch != 'A' && ch != 'C' && ch != 'G' && ch != 'T' && ch != 'N')
+            ch = 'N';
+    }
+}
 
 namespace tol {
 
@@ -2184,6 +2201,7 @@ inline VariantCallBridge make_offref_window_call(const std::string& qAsm,
     v.svlen = static_cast<int>(std::max<size_t>(1, safeEnd - safeStart));
     v.alignmentMode = "graph_native_offref_window";
     if (!ow.elementClass.empty()) v.elementClass = ow.elementClass;
+    set_variant_sequence_excerpt(v, sub);
     return v;
 }
 
@@ -2498,6 +2516,10 @@ static bool try_mem_chain_call(
                 ? std::min(teS + res.svLen, static_cast<int>(qSeq.size()))
                 : std::min(res.qBreakEnd + 1, static_cast<int>(qSeq.size()));
             if (teE > teS && teS >= 0) {
+                set_variant_sequence_excerpt(
+                    out.call,
+                    std::string_view(qSeq.data() + teS,
+                                     static_cast<size_t>(teE - teS)));
                 const ElementClass ec = classify_repeat_element(
                     std::string_view(qSeq.data() + teS,
                                      static_cast<size_t>(teE - teS)),
@@ -2516,6 +2538,10 @@ static bool try_mem_chain_call(
             const int safeS = std::max(0, rS);
             const int safeE = std::min(static_cast<int>(refSeq.size()), rE);
             if (safeE > safeS) {
+                set_variant_sequence_excerpt(
+                    out.call,
+                    std::string_view(refSeq.data() + safeS,
+                                     static_cast<size_t>(safeE - safeS)));
                 const ElementClass ec = classify_repeat_element(
                     std::string_view(refSeq.data() + safeS,
                                      static_cast<size_t>(safeE - safeS)),
@@ -2948,16 +2974,16 @@ static bool try_mem_chain_call_multi(
                 if (s < iv.second && e > iv.first) return true;
             return false;
         };
-        // Algorithmic fix: the previous 12-chain cap throttled recall on
-        // chromosome-sized fungal contigs where 50+ legitimate local chains
-        // (one per accessory locus / TE burst) are routinely required to
-        // reach the per-isolate SV burden documented in the literature
-        // (Toomajian 2024 Fg, Hartmann 2020 Zt). Scale the cap with query
-        // length at ~one chain per 50 kb of contig, capped at 512 to keep
-        // worst-case effort bounded.
+        // Keep extra local-chain mining bounded. The primary chain plus
+        // per-reference passes carry the benchmarkable SV signal; mining one
+        // extra chain per 50 kb across a multi-reference bundle caused
+        // chromosome-sized fungal contigs to spend most of their runtime in
+        // repetitive local chains and inflated raw pangenome observations.
+        // One extra chain per 250 kb preserves accessory/TE-burst rescue while
+        // keeping the multi-ref pangenome rescue path from dominating runtime.
         const int kMaxExtraChains = std::max(
             12,
-            std::min(512, static_cast<int>(qSeq.size() / 50000)));
+            std::min(128, static_cast<int>(qSeq.size() / 250000)));
         for (int extra = 0; extra < kMaxExtraChains; ++extra) {
             std::vector<int> extraOrder;
             extraOrder.reserve(order.size());
@@ -3231,6 +3257,10 @@ static bool try_mem_chain_call_multi(
                     ? std::min(teS + res.svLen, static_cast<int>(qSeq.size()))
                     : std::min(res.qBreakEnd + 1, static_cast<int>(qSeq.size()));
                 if (teE > teS && teS >= 0) {
+                    set_variant_sequence_excerpt(
+                        v,
+                        std::string_view(qSeq.data() + teS,
+                                         static_cast<size_t>(teE - teS)));
                     const ElementClass ec = classify_repeat_element(
                         std::string_view(qSeq.data() + teS,
                                          static_cast<size_t>(teE - teS)),
@@ -3247,6 +3277,10 @@ static bool try_mem_chain_call_multi(
                 const int safeS = std::max(0, rS);
                 const int safeE = std::min(static_cast<int>(refSeq.size()), rE);
                 if (safeE > safeS) {
+                    set_variant_sequence_excerpt(
+                        v,
+                        std::string_view(refSeq.data() + safeS,
+                                         static_cast<size_t>(safeE - safeS)));
                     const ElementClass ec = classify_repeat_element(
                         std::string_view(refSeq.data() + safeS,
                                          static_cast<size_t>(safeE - safeS)),

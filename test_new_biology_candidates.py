@@ -282,3 +282,44 @@ def test_new_biology_candidate_report_quantifies_expression_from_sample_level_ta
     assert derived_rows, 'expected derived expression support output'
     assert derived_rows[0]['gene_name'] == 'EFF1'
     assert derived_rows[0]['condition'] == 'stress_vs_control'
+
+
+def test_new_biology_candidate_report_prefers_query_gene_for_ref_anchored_asm_call(tmp_path: Path) -> None:
+    vcf = tmp_path / 'calls.vcf'
+    vcf.write_text(
+        '##fileformat=VCFv4.3\n'
+        '#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tSAMPLE\n'
+        'ctgA\t100\t.\tN\t<INS>\t60\tPASS\t'
+        'SVTYPE=INS;END=140;ANNOT=NONE;EC=HGT;QASM=asm1;REFCONTIG=refC;REFPOS=900;REFEND=940\tGT\t0/1\n'
+    )
+    hits = tmp_path / 'calls.hits.tsv'
+    hits.write_text(
+        'query_asm\tquery_contig\ttype\tref_asm\tref_contig\tpos\tend\tsvlen\tblock_score\tanchors\tgenotype\tgq\tannotation\talignment_mode\tquery_mode\n'
+        'asm1\tctgA\tINS\tref1\trefC\t100\t140\t40\t18\t4\t0/1\t40\tNONE\tmem_chain\tassembly\n'
+    )
+    meta = tmp_path / 'query_metadata.tsv'
+    meta.write_text('query_asm\tscenario\tlifestyle\tarchitecture\nasm1\tpathogenic\tplant_pathogen\tte_rich\n')
+    genes = tmp_path / 'genes.tsv'
+    genes.write_text(
+        'query_asm\tquery_contig\tgene_id\tgene_name\tstart\tend\tstrand\tbiotype\tproduct\n'
+        'asm1\tctgA\tgene_q\tQUERYGENE\t120\t220\t+\tprotein_coding\tsecreted protein\n',
+    )
+    out_tsv = tmp_path / 'new_biology.tsv'
+    out_json = tmp_path / 'new_biology.json'
+    run([
+        'python3', str(SCRIPT),
+        '--vcf', str(vcf),
+        '--hits', str(hits),
+        '--query-metadata', str(meta),
+        '--gene-annotations', str(genes),
+        '--out-tsv', str(out_tsv),
+        '--summary-json', str(out_json),
+        '--phylum', 'Ascomycota',
+        '--top-n', '10',
+    ])
+    rows = list(csv.DictReader(out_tsv.open(), delimiter='\t'))
+    assert rows
+    assert rows[0]['candidate_type'] == 'hgt_candidate'
+    assert rows[0]['affected_gene_id'] == 'gene_q'
+    assert rows[0]['affected_gene'] == 'QUERYGENE'
+    assert rows[0]['affected_gene_distance_bp'] == '0'

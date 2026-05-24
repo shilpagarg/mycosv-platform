@@ -66,6 +66,7 @@ import base64
 import io
 import math
 import os
+import re
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -489,7 +490,11 @@ def plot_box(df: pd.DataFrame, x: str, y: str, title: str, rotate_xticks: bool =
 
 
 def plot_stacked_counts(df: pd.DataFrame, index_col: str, stack_col: str, title: str, normalize: bool = False) -> plt.Figure:
-    counts = pd.crosstab(df[index_col].fillna("NA"), df[stack_col].fillna("NA"), normalize="index" if normalize else False)
+    # reset_index so a non-unique frame index (common after merges/concats
+    # upstream) cannot break pd.crosstab's internal index alignment.
+    idx = df[index_col].fillna("NA").reset_index(drop=True)
+    stack = df[stack_col].fillna("NA").reset_index(drop=True)
+    counts = pd.crosstab(idx, stack, normalize="index" if normalize else False)
     counts = counts[[c for c in SVTYPE_ORDER if c in counts.columns] + [c for c in counts.columns if c not in SVTYPE_ORDER]]
     counts.index = [short_sample_label(v) for v in counts.index]
     fig, ax = plt.subplots(figsize=(max(10, 0.34 * len(counts.index) + 3), 5.5))
@@ -1277,6 +1282,23 @@ _TE_ELEMENT_CLASSES = {
 }
 _HGT_ELEMENT_CLASSES = {"HGT", "STARSHIP"}
 
+_ASM_ACCESSION_RE = re.compile(r"(GC[AF])[._]?(\d+)\.?_?(\d+)?", re.IGNORECASE)
+
+
+def _canonical_asm_key(value: object) -> str:
+    """Canonical assembly key tolerant of the two query_asm spellings.
+
+    novel_mycosv_calls.tsv carries the normalized "GCF_026873545_1" while
+    biology_findings.tsv carries the raw FASTA filename
+    "GCF_026873545.1_ASM2687354v1_genomic.fna"; a raw equality join on
+    query_asm therefore never matches. Both collapse to "GCF_026873545.1".
+    """
+    s = str(value or "").strip()
+    m = _ASM_ACCESSION_RE.search(s)
+    if m:
+        return f"{m.group(1).upper()}_{m.group(2)}.{m.group(3) or '0'}"
+    return s.lower()
+
 
 def _join_novel_to_biology(
     novel_df: pd.DataFrame,
@@ -1310,13 +1332,23 @@ def _join_novel_to_biology(
     join_cols = [c for c in join_cols if not (c in seen or seen.add(c))]
     if not join_cols:
         return novel_only
+    # query_asm is spelled differently in the two tables, so replace it with a
+    # canonical accession key derived on both sides — otherwise every row's
+    # assembly key mismatches and the left join yields all-NaN biology columns.
+    asm_cols = [c for c in ("query_asm", "sample") if c in join_cols]
+    if asm_cols:
+        src = asm_cols[0]
+        novel_only["_asm_key"] = novel_only[src].map(_canonical_asm_key)
+        bio["_asm_key"] = bio[src].map(_canonical_asm_key)
+        join_cols = ["_asm_key"] + [c for c in join_cols if c not in asm_cols]
     # Coerce numeric join keys to consistent types so the merge is order-stable.
     for col in ("pos", "start", "end"):
         if col in novel_only.columns:
             novel_only[col] = pd.to_numeric(novel_only[col], errors="coerce").astype("Int64")
         if col in bio.columns:
             bio[col] = pd.to_numeric(bio[col], errors="coerce").astype("Int64")
-    return novel_only.merge(bio, on=join_cols, how="left", suffixes=("", "_bio"))
+    merged = novel_only.merge(bio, on=join_cols, how="left", suffixes=("", "_bio"))
+    return merged.drop(columns=["_asm_key"], errors="ignore")
 
 
 def _novel_q1_hgt(joined: pd.DataFrame, outdir: Path) -> Optional[FigureRecord]:
@@ -1489,6 +1521,258 @@ def _novel_q3_expression(joined: pd.DataFrame, outdir: Path) -> Optional[FigureR
     )
 
 
+_TROPHIC_CANONICAL = ("pathotroph", "saprotroph", "symbiotroph")
+# Genuine host-ecology fields from biology_findings.tsv. "phenotype" is
+# deliberately excluded: harmonize_columns aliases scenario/architecture into
+# it, which would leak non-ecology tokens (e.g. "million_real") into Q4/Q5.
+_ECOLOGY_COLS = (
+    "trophic_mode", "ecological_trait", "secondary_lifestyle",
+    "lifestyle", "substrate_or_host",
+)
+
+
+def _split_ecology_tokens(value: object) -> List[str]:
+    """Split a (possibly concatenated) trophic/ecology string into tokens.
+
+    Upstream sources mash several trophic modes into one field
+    (e.g. "Pathotroph-Saprotroph-Symbiotroph"); a per-mode count needs each
+    component separately.
+    """
+    s = str(value or "").strip().lower()
+    if not s or s in (".", "nan", "none", "unknown", "na", ""):
+        return []
+    for d in (";", ",", "/", "|", "+", " and "):
+        s = s.replace(d, "-")
+    return [t.strip() for t in s.split("-") if t.strip() and t.strip() != "."]
+
+
+def _genome_biology_category(
+    element_class: object, annotation: object, svtype: object,
+) -> str:
+    """Bucket a novel SV into a genome-biology class for the Q5 synthesis."""
+    ec = str(element_class or "").strip().upper()
+    if ec in _HGT_ELEMENT_CLASSES:
+        return "HGT / Starship"
+    if ec == "RIP":
+        return "RIP / genome defense"
+    if ec in _TE_ELEMENT_CLASSES:
+        return "TE / repeat"
+    ann = str(annotation or "").strip().upper()
+    if str(svtype or "").strip().upper() in {"TRA", "OFF_REF"} \
+            or ann in {"NOVEL", "NOVEL_WEAK", "DIVERGED"}:
+        return "Novel / off-reference"
+    return "Structural (other)"
+
+
+def _ecology_tokens_with_fallback(df: pd.DataFrame) -> List[List[str]]:
+    """Per-row trophic-mode token lists, with a per-query_asm fallback.
+
+    Ecology is annotated per species, so only the biology-candidate rows of a
+    query carry it after the novel<->biology join. Broadcasting the first
+    non-empty token list across every novel SV of the same query keeps Q4/Q5
+    from collapsing to just the ~200 annotated candidates.
+    """
+    eco_cols = [c for c in _ECOLOGY_COLS if c in df.columns]
+    if not eco_cols or len(df) == 0:
+        return [[] for _ in range(len(df))]
+
+    def _column_values(name: str) -> list:
+        col = df[name]
+        if hasattr(col, "columns"):  # duplicate-named column after a merge
+            col = col.iloc[:, 0]
+        return col.tolist()
+
+    # Split each ecology column separately, then union per row. Tokenising
+    # per column (instead of concatenating all columns first) keeps a
+    # "Pathotroph-Saprotroph-Symbiotroph" field clean and avoids mixing in
+    # neighbouring "." / NaN fields.
+    per_col = [
+        [_split_ecology_tokens(v) for v in _column_values(c)]
+        for c in eco_cols
+    ]
+    tokens: List[List[str]] = []
+    for i in range(len(df)):
+        merged: List[str] = []
+        for col_tokens in per_col:
+            for t in col_tokens[i]:
+                if t not in merged:
+                    merged.append(t)
+        tokens.append(merged)
+    key_col = next((c for c in ("query_asm", "sample") if c in df.columns), None)
+    if key_col is None:
+        return tokens
+    keys = _column_values(key_col)
+    by_key: Dict[object, List[str]] = {}
+    for k, toks in zip(keys, tokens):
+        if toks and k not in by_key:
+            by_key[k] = toks
+    return [
+        toks if toks else by_key.get(k, [])
+        for toks, k in zip(tokens, keys)
+    ]
+
+
+def _novel_q4_ecology(joined: pd.DataFrame, outdir: Path) -> Optional[FigureRecord]:
+    """Q4: ecological context (saprotroph / symbiotroph / pathotroph) of novel SVs."""
+    if joined.empty:
+        return None
+    if not any(c in joined.columns for c in _ECOLOGY_COLS):
+        return None
+    df = joined.copy()
+    ec_col = next(
+        (c for c in ("element_class", "effect", "element_class_bio", "effect_bio")
+         if c in df.columns),
+        None,
+    )
+    sv_col = "sv_type" if "sv_type" in df.columns else (
+        "svtype" if "svtype" in df.columns else None)
+    annot_col = "annotation" if "annotation" in df.columns else (
+        "pathway" if "pathway" in df.columns else None)
+    tokens = _ecology_tokens_with_fallback(df)
+    rows: List[dict] = []
+    for (_, r), toks in zip(df.iterrows(), tokens):
+        if not toks:
+            continue
+        cat = _genome_biology_category(
+            r.get(ec_col) if ec_col else "",
+            r.get(annot_col) if annot_col else "",
+            r.get(sv_col) if sv_col else "",
+        )
+        for tok in sorted(set(toks)):
+            rows.append({"trophic_mode": tok, "genome_biology": cat})
+    if not rows:
+        return None
+    mdf = pd.DataFrame(rows)
+    pivot = mdf.pivot_table(
+        index="trophic_mode", columns="genome_biology",
+        aggfunc="size", fill_value=0,
+    )
+    order = [m for m in _TROPHIC_CANONICAL if m in pivot.index]
+    order += [m for m in pivot.index if m not in order]
+    pivot = pivot.reindex(order)
+    fig, ax = plt.subplots(figsize=(max(8, 0.7 * len(pivot) + 5), 5.5))
+    pivot.plot(kind="bar", stacked=True, ax=ax, colormap="viridis")
+    ax.set_title("Q4. Novel MycoSV-only SVs by ecological (trophic) context")
+    ax.set_xlabel("Trophic mode of the host fungal species")
+    ax.set_ylabel("Novel SV count")
+    ax.tick_params(axis="x", rotation=30)
+    ax.legend(title="genome biology", fontsize=8)
+    fig.tight_layout()
+    encoded = write_figure(fig, outdir / "novel_q4_ecology.png")
+    mdf.to_csv(outdir / "novel_q4_ecology.tsv", sep="\t", index=False)
+    return FigureRecord(
+        title="Q4. Ecological context of novel SVs",
+        filename="novel_q4_ecology.png",
+        encoded_png=encoded,
+        caption=(
+            "Novel MycoSV-only SVs counted against the trophic mode "
+            "(saprotroph / symbiotroph / pathotroph, …) of the host species, "
+            "stacked by genome-biology class. A species can carry several "
+            "trophic modes, so one SV may contribute to more than one bar. "
+            "Per-row table: novel_q4_ecology.tsv."
+        ),
+    )
+
+
+def _novel_q5_association(joined: pd.DataFrame, outdir: Path) -> Optional[FigureRecord]:
+    """Q5: overall association of novel MycoSV-only SVs with ecology + genome biology."""
+    if joined.empty:
+        return None
+    df = joined.copy()
+    ec_col = next(
+        (c for c in ("element_class", "effect", "element_class_bio", "effect_bio")
+         if c in df.columns),
+        None,
+    )
+    sv_col = "sv_type" if "sv_type" in df.columns else (
+        "svtype" if "svtype" in df.columns else None)
+    annot_col = "annotation" if "annotation" in df.columns else (
+        "pathway" if "pathway" in df.columns else None)
+    df["_genome_biology"] = [
+        _genome_biology_category(
+            r.get(ec_col) if ec_col else "",
+            r.get(annot_col) if annot_col else "",
+            r.get(sv_col) if sv_col else "",
+        )
+        for _, r in df.iterrows()
+    ]
+    fig, axes = plt.subplots(1, 2, figsize=(15, 5.5))
+
+    # Panel A: genome-biology class x evidence tier.
+    tier_col = next(
+        (c for c in ("evidence_tier", "evidence_tier_bio") if c in df.columns),
+        None,
+    )
+    if tier_col is not None:
+        tier_order = ["strong", "moderate", "intrinsic_only", "weak"]
+        tier_colors = ["#1b7837", "#7fbf7b", "#f1a340", "#998ec3"]
+        pv = df.pivot_table(
+            index="_genome_biology", columns=tier_col,
+            aggfunc="size", fill_value=0,
+        )
+        present = [t for t in tier_order if t in pv.columns]
+        if present:
+            pv = pv[present]
+            pv.plot(kind="bar", stacked=True, ax=axes[0],
+                    color=[tier_colors[tier_order.index(t)] for t in present])
+        else:
+            df["_genome_biology"].value_counts().plot(
+                kind="bar", ax=axes[0], color="#3a6db0")
+        axes[0].set_title("Q5a. Novel SVs by genome-biology class x evidence tier")
+        axes[0].legend(title="evidence", fontsize=8)
+    else:
+        df["_genome_biology"].value_counts().plot(
+            kind="bar", ax=axes[0], color="#3a6db0")
+        axes[0].set_title("Q5a. Novel SVs by genome-biology class")
+    axes[0].set_xlabel("genome-biology class")
+    axes[0].set_ylabel("novel SV count")
+    axes[0].tick_params(axis="x", rotation=25)
+
+    # Panel B: genome-biology class x trophic mode contingency.
+    tokens = _ecology_tokens_with_fallback(df)
+    pair_rows: List[dict] = []
+    for cat, toks in zip(df["_genome_biology"], tokens):
+        for tok in sorted(set(toks)):
+            pair_rows.append({"genome_biology": cat, "trophic_mode": tok})
+    contingency = pd.DataFrame()
+    if pair_rows:
+        contingency = pd.DataFrame(pair_rows).pivot_table(
+            index="genome_biology", columns="trophic_mode",
+            aggfunc="size", fill_value=0,
+        )
+        contingency.plot(kind="bar", stacked=True, ax=axes[1], colormap="cividis")
+        axes[1].set_title("Q5b. Genome biology x fungal ecology")
+        axes[1].set_xlabel("genome-biology class")
+        axes[1].set_ylabel("novel SV count")
+        axes[1].tick_params(axis="x", rotation=25)
+        axes[1].legend(title="trophic mode", fontsize=8)
+    else:
+        axes[1].axis("off")
+        axes[1].set_title("Q5b. No ecology annotation available")
+    fig.tight_layout()
+    encoded = write_figure(fig, outdir / "novel_q5_association.png")
+    summary = df[["_genome_biology"]].copy()
+    summary["trophic_modes"] = [";".join(sorted(set(t))) for t in tokens]
+    summary.to_csv(outdir / "novel_q5_association.tsv", sep="\t", index=False)
+    if not contingency.empty:
+        contingency.to_csv(outdir / "novel_q5_contingency.tsv", sep="\t")
+    return FigureRecord(
+        title="Q5. Novel SVs vs fungal ecology & genome biology",
+        filename="novel_q5_association.png",
+        encoded_png=encoded,
+        caption=(
+            "Synthesis for the MycoSV-only novel SV set. Left: how novel SVs "
+            "distribute across genome-biology classes (HGT/Starship, "
+            "TE/repeat, RIP, novel/off-reference, structural), split by "
+            "evidence tier so the reader sees how well-supported each class "
+            "is. Right: the joint genome-biology x trophic-mode distribution "
+            "— the direct read on whether novel SVs are associated with "
+            "fungal ecology and genome architecture. Tables: "
+            "novel_q5_association.tsv, novel_q5_contingency.tsv."
+        ),
+    )
+
+
 def build_evidence_panorama_section(
     tiers_df: Optional[pd.DataFrame],
     outdir: Path,
@@ -1650,7 +1934,10 @@ def build_novel_questions_section(
         )
 
     figs: List[FigureRecord] = []
-    for builder in (_novel_q1_hgt, _novel_q2_two_speed, _novel_q3_expression):
+    for builder in (
+        _novel_q1_hgt, _novel_q2_two_speed, _novel_q3_expression,
+        _novel_q4_ecology, _novel_q5_association,
+    ):
         try:
             rec = builder(joined, outdir)
         except Exception as exc:
@@ -1663,17 +1950,20 @@ def build_novel_questions_section(
             figs.append(rec)
 
     html_intro = (
-        "<p>Three biological questions over the MycoSV-unique (novel) SV set, "
+        "<p>Five biological questions over the MycoSV-unique (novel) SV set, "
         "joined to <code>biology_findings.tsv</code> for element_class, "
-        "phylum / scenario / architecture metadata, and expression evidence:</p>"
+        "phylum / scenario / architecture metadata, expression evidence, and "
+        "host-species ecology:</p>"
         "<ol>"
         "<li><b>Q1.</b> Which novel SVs are HGT / Starship cargo crossing clade boundaries?</li>"
         "<li><b>Q2.</b> Which novel SVs sit in two-speed accessory / TE-rich architecture?</li>"
         "<li><b>Q3.</b> Which novel SVs have direct nearby-gene expression support?</li>"
+        "<li><b>Q4.</b> Do novel SVs occur in saprotroph / symbiotroph / pathotroph contexts?</li>"
+        "<li><b>Q5.</b> Are MycoSV-only novel SVs associated with fungal ecology and genome biology?</li>"
         "</ol>"
     )
     if not figs:
-        html_intro += "<p><i>No rows matched any of the three questions; nothing to plot.</i></p>"
+        html_intro += "<p><i>No rows matched any of the five questions; nothing to plot.</i></p>"
     return html_intro, figs, []
 
 
@@ -1833,7 +2123,7 @@ def build_html_report(
     </div>
 
     <div class=\"section\">
-      <h2>5. Novel SVs &mdash; three biological questions</h2>
+      <h2>5. Novel SVs &mdash; five biological questions</h2>
       {novel_html}
       <div class=\"grid\">{render_figure_cards(novel_figs)}</div>
     </div>
