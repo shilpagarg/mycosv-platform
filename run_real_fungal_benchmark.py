@@ -6084,11 +6084,134 @@ def validation_basis_for_label(label: str) -> str:
         return "raw_read_validated"
     if label.endswith("_read_supported"):
         return "comparator_agreement_read_supported"
+    if label.endswith("_query_projected"):
+        return "comparator_baseline_query_projected"
     if label.startswith("consensus_"):
         return "comparator_agreement"
     if label == "no_comparator":
         return "no_independent_validation"
     return "comparator_baseline"
+
+
+def _parse_paf_alignments(paf_path: Path) -> list[dict[str, Any]]:
+    """Parse a minimap2 PAF, retaining cs/cg strings for ref->query lift.
+
+    Each row -> {q_name, q_start, q_end, strand, t_name, t_start, t_end, cs}.
+    The cs string (--cs flag, present on the q2r.srt.paf the anchorwave
+    runner writes) lets us walk the alignment to translate a target-coord
+    position back to a query-coord position; in its absence we fall back to
+    a linear interpolation across t_start..t_end which is good enough for
+    contig-level SV breakpoint context.
+    """
+    if not paf_path.exists():
+        return []
+    out: list[dict[str, Any]] = []
+    try:
+        with paf_path.open() as fh:
+            for line in fh:
+                parts = line.rstrip("\n").split("\t")
+                if len(parts) < 12:
+                    continue
+                try:
+                    rec = {
+                        "q_name": parts[0],
+                        "q_len": int(parts[1]),
+                        "q_start": int(parts[2]),
+                        "q_end": int(parts[3]),
+                        "strand": parts[4],
+                        "t_name": parts[5],
+                        "t_len": int(parts[6]),
+                        "t_start": int(parts[7]),
+                        "t_end": int(parts[8]),
+                        "cs": "",
+                    }
+                except ValueError:
+                    continue
+                for tag in parts[12:]:
+                    if tag.startswith("cs:Z:"):
+                        rec["cs"] = tag[5:]
+                        break
+                out.append(rec)
+    except OSError:
+        return []
+    return out
+
+
+def _project_ref_pos_to_query(ref_contig: str, ref_pos: int,
+                              paf_alignments: list[dict[str, Any]]) -> tuple[str, int] | None:
+    """Return (query_contig, query_pos) for a ref position, or None.
+
+    Uses linear interpolation across the spanning PAF alignment. Strand-aware:
+    on minus-strand alignments the query coordinate is mirrored.
+    """
+    for aln in paf_alignments:
+        if aln["t_name"] != ref_contig:
+            continue
+        if not (aln["t_start"] <= ref_pos < aln["t_end"]):
+            continue
+        t_span = max(1, aln["t_end"] - aln["t_start"])
+        q_span = max(1, aln["q_end"] - aln["q_start"])
+        frac = (ref_pos - aln["t_start"]) / t_span
+        if aln["strand"] == "-":
+            q_off = int(round((1.0 - frac) * q_span))
+        else:
+            q_off = int(round(frac * q_span))
+        q_pos = aln["q_start"] + q_off
+        return aln["q_name"], max(0, q_pos)
+    return None
+
+
+def project_ref_calls_to_query(
+    ref_calls: list[NormalizedCall],
+    paf_path: Path,
+) -> list[NormalizedCall]:
+    """Project comparator ref-coord calls back to query coordinates via PAF.
+
+    Comparators (anchorwave, svim_asm, minigraph) emit truth in the benchmark
+    reference's coordinate space. MycoSV pangenome calls live in query
+    coordinates by design — the ref-coord projection in calls.vcf is a
+    secondary annotation. Scoring mycosv in ref space alone biases against
+    pangenome calls whose anchor chain projects to a slightly different ref
+    contig than the comparator's alignment chose (the dominant
+    contig_mismatch reason in match_failures.tsv). This helper builds the
+    matching query-coord truth so scoring can happen in the pangenome's
+    native yardstick.
+    """
+    alns = _parse_paf_alignments(paf_path)
+    if not alns:
+        return []
+    projected: list[NormalizedCall] = []
+    for c in ref_calls:
+        ref_contig = c.ref_contig or ""
+        if not ref_contig or ref_contig in {".", ""}:
+            continue
+        start = _project_ref_pos_to_query(ref_contig, c.pos, alns)
+        end = _project_ref_pos_to_query(ref_contig, max(c.pos, c.end), alns)
+        if start is None:
+            continue
+        q_contig, q_pos = start
+        q_end = end[1] if end is not None and end[0] == q_contig else q_pos + abs(c.svlen)
+        if q_end < q_pos:
+            q_pos, q_end = q_end, q_pos
+        projected.append(NormalizedCall(
+            query_asm=c.query_asm,
+            query_contig=q_contig,
+            pos=q_pos,
+            end=q_end,
+            svtype=c.svtype,
+            svlen=c.svlen,
+            source=c.source,
+            coord_space="query",
+            annotation=c.annotation,
+            element_class=c.element_class,
+            ref_asm=c.ref_asm,
+            ref_contig=".",
+            read_support=c.read_support,
+            mate_contig=c.mate_contig,
+            mate_pos=c.mate_pos,
+            mate_end=c.mate_end,
+        ))
+    return projected
 
 
 def _emit_per_svtype_rows(
@@ -6768,6 +6891,129 @@ def _lift_pos(
                 return tname, ts + offset
             return tname, te - offset
     return None
+
+
+def _ensure_query_to_bench_paf(
+    query_fasta: Path,
+    benchmark_ref_fasta: Path,
+    cache_dir: Path,
+    threads: int,
+) -> Path | None:
+    """Build (or reuse) a query→benchmark_ref PAF for direct mycosv projection.
+
+    Unlike _ensure_clade_to_bench_paf (which goes pangenome-clade→bench), this
+    aligns the QUERY assembly directly to the benchmark reference — the same
+    alignment svim_asm and anchorwave use internally. We then project mycosv's
+    query-coord calls through this PAF, putting mycosv into the SAME coordinate
+    space as every single-reference comparator. Result: no coord-space leak,
+    no cross-clade lift failures, no contig_mismatch artifacts in the bench.
+    """
+    if not tool_path("minimap2"):
+        return None
+    if not query_fasta.exists() or not benchmark_ref_fasta.exists():
+        return None
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    qstem = query_fasta.name.replace(".gz", "").replace(".fna", "").replace(".fasta", "")
+    rstem = benchmark_ref_fasta.name.replace(".gz", "").replace(".fna", "").replace(".fasta", "")
+    paf_path = cache_dir / f"query__{qstem}__to__bench__{rstem}.paf"
+    if paf_path.exists() and paf_path.stat().st_size > 0:
+        return paf_path
+    tmp_path = paf_path.with_suffix(".paf.part")
+    try:
+        with tmp_path.open("wb") as out:
+            subprocess.run(
+                ["minimap2", "-cx", "asm20", "--secondary=no", "-t", str(threads),
+                 str(benchmark_ref_fasta), str(query_fasta)],
+                stdout=out, stderr=subprocess.PIPE, check=True,
+                timeout=_TOOL_TIMEOUT,
+            )
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
+        tmp_path.unlink(missing_ok=True)
+        return None
+    tmp_path.rename(paf_path)
+    return paf_path
+
+
+def project_mycosv_to_benchmark_ref(
+    query_calls: list[NormalizedCall],
+    query_fasta: Path,
+    benchmark_ref_fasta: Path,
+    cache_dir: Path,
+    threads: int,
+    *,
+    return_source: bool = False,
+) -> list[NormalizedCall] | list[tuple[NormalizedCall, NormalizedCall]]:
+    """Project mycosv QUERY-coord calls into benchmark-ref space.
+
+    This is the canonical fix for the coordinate-space leak that gave 95%
+    `contig_mismatch` in match_failures.tsv: every mycosv call lives on a
+    query contig (e.g. PQFF01000002.1), every comparator lives on a benchmark-
+    ref contig (e.g. QKWP01000306.1). Without a query→ref projection, the two
+    sides never intersect.
+
+    Returns one NormalizedCall per input that successfully lifts; calls whose
+    breakpoints fall outside any minimap2 asm20 syntenic block are dropped
+    here (rather than retained on the query contig, which would look like FPs
+    on the wrong-named contig downstream). When `return_source=True`, returns
+    (projected_call, source_query_call) tuples so callers that need to map
+    back to the query-coord call_key can do so without re-zipping.
+    """
+    if not query_calls:
+        return []
+    bench_contigs = fasta_contig_names(benchmark_ref_fasta)
+    if not bench_contigs:
+        return []
+    paf_path = _ensure_query_to_bench_paf(
+        query_fasta, benchmark_ref_fasta, cache_dir, threads
+    )
+    if paf_path is None:
+        return []
+    table = _load_lift_table(paf_path)
+    if not table:
+        return []
+    out: list[NormalizedCall] = []
+    sources: list[NormalizedCall] = []
+    for call in query_calls:
+        lifted_start = _lift_pos(table, call.query_contig, call.pos)
+        if lifted_start is None:
+            continue
+        lifted_end = _lift_pos(table, call.query_contig, call.end) or lifted_start
+        new_contig, new_pos = lifted_start
+        _, new_end = lifted_end
+        if new_end < new_pos:
+            new_pos, new_end = new_end, new_pos
+        if new_contig not in bench_contigs:
+            continue
+        mate_contig = call.mate_contig
+        mate_pos = call.mate_pos
+        mate_end = call.mate_end
+        if _has_mate(call):
+            lifted_mate = _lift_pos(table, call.mate_contig, call.mate_pos)
+            if lifted_mate is None:
+                continue
+            lifted_mate_end = _lift_pos(
+                table, call.mate_contig, call.mate_end or call.mate_pos
+            ) or lifted_mate
+            mate_contig, mate_pos = lifted_mate
+            _, mate_end = lifted_mate_end
+            if mate_end < mate_pos:
+                mate_pos, mate_end = mate_end, mate_pos
+            if mate_contig not in bench_contigs:
+                continue
+        out.append(replace(
+            call,
+            pos=new_pos,
+            end=new_end,
+            coord_space="reference",
+            ref_contig=new_contig,
+            mate_contig=mate_contig,
+            mate_pos=mate_pos,
+            mate_end=mate_end,
+        ))
+        sources.append(call)
+    if return_source:
+        return list(zip(out, sources))
+    return out
 
 
 def _lift_calls_to_benchmark_ref(
@@ -8927,6 +9173,65 @@ def write_mycosv_validation_followup(
     return followup_rows, bucket_rows
 
 
+def _annotate_comparator_truth_quality(rows: list[dict[str, Any]]) -> None:
+    """Stamp each row with a comparator_truth_quality flag.
+
+    Comparators disagree wildly on some queries — e.g. minigraph emits 7295
+    "truth" SVs on a Trichoderma genome where svim_asm sees 784 and
+    anchorwave 97 (bubble over-segmentation). Computing F1 against any
+    single comparator in that situation is misleading: the F1 is dominated
+    by the comparator's call density, not mycosv quality. This adds a
+    per-(query, coordinate_space, svtype, method) annotation by comparing
+    truth_calls to the median across comparator_baseline rows for the same
+    cell. Downstream readers can filter on this flag instead of treating
+    every row as equally informative.
+    """
+    BASELINE_BASIS = 'comparator_baseline'
+    keyfn = lambda r: (
+        r.get('query_asm', ''),
+        r.get('coordinate_space', ''),
+        r.get('svtype', ''),
+        r.get('method', ''),
+    )
+    truth_counts: dict[tuple[str, str, str, str], list[int]] = {}
+    for r in rows:
+        if r.get('validation_basis') != BASELINE_BASIS:
+            continue
+        if r.get('status') == 'no_truth':
+            continue
+        try:
+            t = int(r.get('truth_calls', 0) or 0)
+        except (TypeError, ValueError):
+            continue
+        if t <= 0:
+            continue
+        truth_counts.setdefault(keyfn(r), []).append(t)
+    medians: dict[tuple[str, str, str, str], float] = {}
+    for k, counts in truth_counts.items():
+        s = sorted(counts)
+        n = len(s)
+        medians[k] = s[n // 2] if n % 2 else (s[n // 2 - 1] + s[n // 2]) / 2.0
+    for r in rows:
+        if r.get('validation_basis') != BASELINE_BASIS:
+            r.setdefault('comparator_truth_quality', '.')
+            continue
+        try:
+            t = int(r.get('truth_calls', 0) or 0)
+        except (TypeError, ValueError):
+            t = 0
+        med = medians.get(keyfn(r))
+        if med is None or med <= 0 or t <= 0:
+            r['comparator_truth_quality'] = '.'
+            continue
+        ratio = t / med
+        if ratio >= 5.0:
+            r['comparator_truth_quality'] = 'discordant_overcalled'
+        elif ratio <= 0.2:
+            r['comparator_truth_quality'] = 'discordant_undercalled'
+        else:
+            r['comparator_truth_quality'] = 'concordant'
+
+
 def write_agreement_summary(path: Path, rows: list[dict[str, Any]]) -> None:
     # svtype column: "ALL" for the aggregate row that already existed, plus
     # one row per canonical SV type for downstream "MycoSV vs comparator
@@ -8934,6 +9239,7 @@ def write_agreement_summary(path: Path, rows: list[dict[str, Any]]) -> None:
     # validation_basis makes the semantics explicit: comparator outputs are
     # baselines/agreement signals, while read_level_union rows are independently
     # anchored in raw FASTQ/read evidence.
+    _annotate_comparator_truth_quality(rows)
     numeric_fields = {
         "truth_calls", "pred_calls", "tp", "fp", "fn",
         "precision", "recall", "f1",
@@ -8961,6 +9267,7 @@ def write_agreement_summary(path: Path, rows: list[dict[str, Any]]) -> None:
             "truth_calls", "pred_calls",
             "tp", "fp", "fn", "precision", "recall", "f1",
             "prec_lo95", "prec_hi95", "rec_lo95", "rec_hi95", "status",
+            "comparator_truth_quality",
         ],
     )
 
@@ -9908,6 +10215,40 @@ def benchmark_real_data(args: argparse.Namespace) -> int:
                 lift_cache_dir / query_asm,
                 threads=args.threads,
             )
+            # Coordinate-space-leak fix: directly project mycosv QUERY-coord
+            # calls into benchmark-ref space using a query→benchmark_ref PAF.
+            # This catches the (large) population of mycosv calls that have no
+            # REFCONTIG (so the cross-clade lift above could not touch them)
+            # but DO have a syntenic mapping to the benchmark reference. Without
+            # this, single-ref benchmark recall was structurally capped near
+            # 0.1 because most pangenome-only calls never reached the matcher.
+            try:
+                projected_pairs = project_mycosv_to_benchmark_ref(
+                    mycosv_query_calls,
+                    Path(query_row.get("path") or "."),
+                    Path(bench_ref),
+                    lift_cache_dir / query_asm,
+                    threads=args.threads,
+                    return_source=True,
+                )
+            except Exception as exc:
+                sys.stderr.write(
+                    f"[projection] {query_asm}: query→bench projection failed "
+                    f"({type(exc).__name__}: {exc}); using PAF-lift output alone\n"
+                )
+                projected_pairs = []
+            if projected_pairs:
+                # Union by call_key — never duplicates an existing ref-space call.
+                existing_keys = {call_key(c) for c in mycosv_ref_calls_all}
+                added_keys: list[tuple[str, str, int, int, str]] = []
+                for proj_call, src_query in projected_pairs:
+                    k = call_key(proj_call)
+                    if k in existing_keys:
+                        continue
+                    existing_keys.add(k)
+                    mycosv_ref_calls_all.append(proj_call)
+                    added_keys.append(call_key(src_query))
+                mycosv_ref_to_query_keys.extend(added_keys)
         if bench_contigs:
             paired_keep = [
                 (c, mycosv_ref_to_query_keys[i] if i < len(mycosv_ref_to_query_keys) else None)
@@ -10128,6 +10469,41 @@ def benchmark_real_data(args: argparse.Namespace) -> int:
                 pred_calls=mycosv_ref_calls_all,
             ))
             summary_json["queries"][query_asm]["exact_benchmarks"]["reference_any_clade"][label] = score_callsets(truth_calls, mycosv_ref_calls_all)
+
+        # Pangenome-native yardstick: project comparator ref-coord truth back
+        # to query coordinates via the q2r.srt.paf anchorwave writes and
+        # re-score mycosv's query-coord predictions. This addresses the
+        # contig_mismatch dominance in match_failures.tsv that arises when
+        # mycosv's pangenome-anchor projection lands on a different ref
+        # contig than the comparator's minimap2 chose. Comparators that have
+        # no PAF/BAM trace (minigraph bubbles, pggb graph) are skipped here —
+        # the projection requires query↔ref alignment evidence.
+        q2r_paf = out_dir / "comparators" / "anchorwave" / query_asm / "q2r.srt.paf"
+        if q2r_paf.exists() and mycosv_query_calls:
+            for (coord_space, label), truth_calls in list(truth_for_query.items()):
+                if coord_space != "reference":
+                    continue
+                if label.endswith(("_read_supported", "_query_projected")):
+                    continue
+                projected_truth = project_ref_calls_to_query(truth_calls, q2r_paf)
+                if not projected_truth:
+                    continue
+                qp_label = f"{label}_query_projected"
+                agreement_rows.extend(_emit_per_svtype_rows(
+                    query_asm=query_asm,
+                    coord_space="query",
+                    truth_label=qp_label,
+                    method="mycosv",
+                    truth_calls=projected_truth,
+                    pred_calls=mycosv_query_calls,
+                ))
+                summary_json["queries"][query_asm]["exact_benchmarks"]["query"][qp_label] = {
+                    **score_callsets(projected_truth, mycosv_query_calls),
+                    "comparator": label,
+                    "comparator_calls_ref": len(truth_calls),
+                    "comparator_calls_projected": len(projected_truth),
+                    "projection_source": "anchorwave_q2r_paf",
+                }
 
         # Comparator consensus per coord_space — a candidate call is in the
         # consensus iff it is supported by >=2 comparators (calls_compatible

@@ -33,6 +33,31 @@ MGE_TRANSPOSABLE = {"TE", "LTR_GYPSY", "LTR_COPIA", "DNA_TIR", "HELITRON", "MITE
                     "TE_LTR", "TE_TIR", "LINE", "SINE"}
 MGE_REPEAT_BASED = {"REPEAT", "RIP"}     # repeat/RIP elements (not strictly MGE)
 
+# Pezizomycotina classes — the only fungal subphylum where RIP (Repeat-Induced
+# Point mutation) operates. Outside this set the sequence-only RIP detector in
+# layer1_clade_graph.hpp can still fire on AT-rich / TpA-enriched repeats, but
+# the RIP label is biologically wrong (Saccharomycotina yeasts, Glomeromycota
+# AMF, Basidiomycota, early-diverging fungi lack the meiotic RIP machinery).
+RIP_SUPPORTING_CLASSES = {
+    'sordariomycetes', 'eurotiomycetes', 'dothideomycetes', 'leotiomycetes',
+    'pezizomycetes', 'orbiliomycetes', 'lecanoromycetes', 'xylonomycetes',
+    'lichinomycetes', 'coniocybomycetes', 'geoglossomycetes', 'arthoniomycetes',
+}
+
+
+def rip_supported_by_clade(meta_row: dict[str, str]) -> bool:
+    """True if the host clade is in Pezizomycotina (RIP-supporting).
+
+    Returns True when class is unknown so we don't silently drop labels on
+    panels without taxonomic metadata; the per-shard caller is responsible
+    for supplying class via query_manifest.tsv.
+    """
+    clazz = (meta_row.get('class') or '').strip().lower()
+    if not clazz or clazz == '.':
+        return True
+    return clazz in RIP_SUPPORTING_CLASSES
+
+
 ASM_EXT_STRIP = (
     ".fasta.gz", ".fastq.gz", ".fna.gz", ".fa.gz", ".fq.gz",
     ".fasta", ".fastq", ".fna", ".fa", ".fq",
@@ -1071,7 +1096,13 @@ GUILD_BY_GENUS = {
 
 def classify_guild(genus: str, species: str = '', lifestyle: str = '') -> str:
     """Return the guild label for a species. Defaults to 'Other' so callers
-    can surface unmapped genera without dropping their rows."""
+    can surface unmapped genera without dropping their rows.
+
+    Kept for backward compatibility with code that doesn't have phylum/class
+    in hand. New callers should prefer classify_guild_taxonomic() which uses
+    phylum + class for a phylogeny-aware 4-way bucketing
+    (AMF / Filamentous / Basidio / Yeast).
+    """
     if genus:
         g = genus.split()[0].lstrip('[').rstrip(']')
         if g in GUILD_BY_GENUS:
@@ -1091,6 +1122,62 @@ def classify_guild(genus: str, species: str = '', lifestyle: str = '') -> str:
         if 'pathotroph' in ll or 'patho' in ll:
             return 'Filamentous'
     return 'Other'
+
+
+# Class-based 4-way taxonomy used by the cross-guild biology figure (manuscript
+# Fig 2A). Resolution gates on subphylum/class, not phylum alone, because
+# Ascomycota contains both Pezizomycotina (filamentous, RIP-active) and
+# Saccharomycotina (yeasts, no RIP) — collapsing them loses the architectural
+# distinction the volcano is designed to surface.
+YEAST_CLASSES = {
+    'saccharomycetes', 'pichiomycetes', 'dipodascomycetes',
+    'schizosaccharomycetes', 'taphrinomycetes',
+}
+# Pezizomycotina classes — same set used by RIP_SUPPORTING_CLASSES, kept
+# separate so the two gates can evolve independently if needed.
+FILAMENTOUS_ASCO_CLASSES = {
+    'sordariomycetes', 'eurotiomycetes', 'dothideomycetes', 'leotiomycetes',
+    'pezizomycetes', 'orbiliomycetes', 'lecanoromycetes', 'xylonomycetes',
+    'lichinomycetes', 'coniocybomycetes', 'geoglossomycetes', 'arthoniomycetes',
+}
+
+
+def classify_guild_taxonomic(
+    phylum: str = '',
+    clazz: str = '',
+    genus: str = '',
+    species: str = '',
+    lifestyle: str = '',
+) -> str:
+    """4-way phylogeny-aware guild label: AMF / Filamentous / Basidio / Yeast.
+
+    Resolution priority:
+      1. Glomeromycota phylum (or AMF genus list) -> AMF
+      2. Saccharomycotina/Schizosaccharomycotina classes -> Yeast
+      3. Pezizomycotina classes -> Filamentous
+      4. Basidiomycota phylum -> Basidio
+      5. Fall through to legacy genus/lifestyle table for 'Other'/edge cases.
+
+    The 13-sample panel resolves cleanly into AMF + Filamentous + Yeast; the
+    165-sample panel adds the dominant Basidio (74/165) bucket.
+    """
+    p = (phylum or '').strip().lower()
+    c = (clazz or '').strip().lower()
+    if p == 'glomeromycota':
+        return 'AMF'
+    if c in YEAST_CLASSES:
+        return 'Yeast'
+    if c in FILAMENTOUS_ASCO_CLASSES:
+        return 'Filamentous'
+    if p == 'basidiomycota':
+        return 'Basidio'
+    # Genus list still catches AMF genera even when phylum/class were not
+    # populated upstream (some hierarchy_manifest rows have '.' for class).
+    if genus:
+        g = genus.split()[0].lstrip('[').rstrip(']')
+        if GUILD_BY_GENUS.get(g) == 'AMF':
+            return 'AMF'
+    return classify_guild(genus, species, lifestyle)
 
 
 def _fisher_one_tailed_right(a: int, b: int, c: int, d: int) -> float:
@@ -1129,11 +1216,61 @@ def _is_te_class(ec: str) -> bool:
 
 
 def _shard_iter(shard_dir: Path):
-    """Yield (query_asm, biology_findings_path) for shards that have one."""
+    """Yield (query_asm, biology_findings_path) for shards that have one.
+
+    Skips shards where the mycosv binary failed mid-run (MYCOSV_FAILED.txt
+    marker) — those produce a near-empty checkpoint that pollutes panel
+    aggregates with no_truth/zero-precision rows.
+    """
     for q in sorted(p for p in shard_dir.iterdir() if p.is_dir()):
+        if (q / 'MYCOSV_FAILED.txt').exists():
+            print(f'[cross-guild] skipping failed shard {q.name} (MYCOSV_FAILED.txt present)',
+                  flush=True)
+            continue
         bf = q / 'biology_findings.tsv'
         if bf.exists() and bf.stat().st_size > 0:
             yield q.name, bf
+
+
+def _locate_query_manifest(shard_dir: Path) -> Path | None:
+    """Find the query_manifest.tsv that produced this by_query/ directory.
+
+    Conventional layout:
+        <run>/prepared/query_manifest.tsv
+        <run>/<mode>/by_query/      <-- shard_dir is here
+    so the prepared/ sibling lives at shard_dir.parent.parent / 'prepared'.
+    Falls back to scanning ancestors for prepared/query_manifest.tsv.
+    """
+    for ancestor in [shard_dir, shard_dir.parent, shard_dir.parent.parent]:
+        candidate = ancestor / 'prepared' / 'query_manifest.tsv'
+        if candidate.exists():
+            return candidate
+    for ancestor in shard_dir.parents:
+        candidate = ancestor / 'prepared' / 'query_manifest.tsv'
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def _load_query_class_map(manifest_path: Path | None) -> dict[str, dict[str, str]]:
+    """query_asm -> {phylum, class, ...} from prepared/query_manifest.tsv.
+
+    Falls back to {} when the manifest is missing; classify_guild_taxonomic
+    then degrades to its genus-list / lifestyle fallback (the legacy
+    behavior). With the manifest in place the 165-sample run resolves into
+    4 guilds (AMF / Filamentous / Basidio / Yeast) instead of 2.
+    """
+    out: dict[str, dict[str, str]] = {}
+    if manifest_path is None or not manifest_path.exists():
+        return out
+    with manifest_path.open() as fh:
+        for row in csv.DictReader(fh, delimiter='\t'):
+            asm = (row.get('query_asm') or '').strip()
+            if not asm:
+                continue
+            for alias in query_asm_aliases(asm):
+                out.setdefault(alias, row)
+    return out
 
 
 def run_cross_guild(shard_dir: Path, out_dir: Path) -> int:
@@ -1141,6 +1278,15 @@ def run_cross_guild(shard_dir: Path, out_dir: Path) -> int:
     pangenome scope, and emit cross-guild summary + enrichment + pangenome-lift
     tables that connect SV biology to ecology and gene-expression context."""
     out_dir.mkdir(parents=True, exist_ok=True)
+    manifest_path = _locate_query_manifest(shard_dir)
+    class_map = _load_query_class_map(manifest_path)
+    if class_map:
+        print(f'[cross-guild] taxonomy lookup loaded from {manifest_path} '
+              f'({len(class_map)} query rows)', flush=True)
+    else:
+        print('[cross-guild] no query_manifest.tsv found; guild classifier '
+              'will degrade to genus-list fallback (2-way bucketing)', flush=True)
+
     rows: list[dict[str, str]] = []
     n_shards = 0
     for qname, bf in _shard_iter(shard_dir):
@@ -1157,10 +1303,18 @@ def run_cross_guild(shard_dir: Path, out_dir: Path) -> int:
 
     # Classify each row by guild + pangenome scope.
     for r in rows:
-        r['_guild'] = classify_guild(
-            r.get('genus', '') or '',
-            r.get('species', '') or '',
-            r.get('lifestyle', '') or '',
+        qasm = r.get('_query_asm') or r.get('query_asm') or ''
+        manifest_row = {}
+        for alias in query_asm_aliases(qasm):
+            if alias in class_map:
+                manifest_row = class_map[alias]
+                break
+        r['_guild'] = classify_guild_taxonomic(
+            phylum=manifest_row.get('phylum') or r.get('phylum') or '',
+            clazz=manifest_row.get('class') or '',
+            genus=r.get('genus', '') or manifest_row.get('genus') or '',
+            species=r.get('species', '') or manifest_row.get('species') or '',
+            lifestyle=r.get('lifestyle', '') or manifest_row.get('lifestyle') or '',
         )
         # pangenome scope: mycosv_unique=yes means the call was NOT recovered by
         # any single-reference comparator; single_reference_equivalent=yes means
@@ -1467,6 +1621,13 @@ def main() -> int:
             if alias in meta:
                 meta_row = meta[alias]
                 break
+        # RIP is a Pezizomycotina-restricted defense mechanism. The cpp
+        # detector fires on TpA-enriched / CpA-depleted sequence which can
+        # also arise in yeast / AMF / Basidiomycota for non-RIP reasons, so
+        # relabel to REPEAT outside RIP-supporting classes.
+        if ec == 'RIP' and not rip_supported_by_clade(meta_row):
+            raw_ec = 'REPEAT'
+            ec = 'REPEAT'
         scenario = meta_row.get('scenario', '.') if meta_row else '.'
         architecture = meta_row.get('architecture', '.') if meta_row else '.'
         lifestyle = meta_row.get('lifestyle', '.') if meta_row else '.'

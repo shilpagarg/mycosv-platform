@@ -145,24 +145,6 @@ PY
     fi
   fi
 fi
-if [[ "${BOOTSTRAP_ONLY:-0}" == "1" ]]; then
-  echo "[bootstrap] BOOTSTRAP_ONLY=1; binary ready at ${MYCOSV_BIN}; building read-validation manifest if absent"
-  READ_MANIFEST_OUT="${READ_VALIDATION_MANIFEST:-${PROJECT_DIR}/${OUT_ROOT}/prepared/read_validation_manifest.tsv}"
-  if [[ ! -s "${READ_MANIFEST_OUT}" ]]; then
-    mkdir -p "$(dirname "${READ_MANIFEST_OUT}")"
-    python3 -u "${PROJECT_DIR}/build_read_validation_manifest.py" \
-      --query-manifest "${PROJECT_DIR}/${PREPARED_DIR}/query_manifest.tsv" \
-      --reads-cache "${DATA_CACHE_DIR}/raw_reads" \
-      --max-bases "${READ_VALIDATION_MAX_BASES:-300000000}" \
-      --out-tsv "${READ_MANIFEST_OUT}" \
-      || echo "[bootstrap] read-manifest build returned non-zero; the manifest may have partial entries" >&2
-  else
-    echo "[bootstrap] read-validation manifest already present at ${READ_MANIFEST_OUT}"
-  fi
-  echo "[bootstrap] done at $(date)"
-  exit 0
-fi
-
 if [[ -n "${SLURM_ARRAY_TASK_ID:-}" && "${FORCE_ARRAY_PREPARE:-0}" != "1" && -s "${PREPARED_DIR}/prepare_million_real_summary.json" ]]; then
   echo "[array] using existing prepared/index; set FORCE_ARRAY_PREPARE=1 only if you really want each task to prepare"
 elif [[ -n "${SLURM_ARRAY_TASK_ID:-}" && "${FORCE_ARRAY_PREPARE:-0}" != "1" ]]; then
@@ -218,6 +200,28 @@ print(f"[query-check] assembly_queries={len(asm)} expected={expected} groups={gr
 if len(asm) < expected:
     raise SystemExit(f"expected at least {expected} assembly queries, found {len(asm)}")
 PY
+
+# BOOTSTRAP_ONLY=1 short-circuit: the prepare + index/manifest-check above
+# is everything a bootstrap-phase job needs to do. The read-validation
+# manifest is then built (idempotent if already populated by prepare) and the
+# script exits before launching the benchmark, so the bootstrap slot doesn't
+# accidentally start running mycosv on the head node of a 165-task array.
+if [[ "${BOOTSTRAP_ONLY:-0}" == "1" ]]; then
+  READ_MANIFEST_OUT="${READ_VALIDATION_MANIFEST:-${PROJECT_DIR}/${OUT_ROOT}/prepared/read_validation_manifest.tsv}"
+  if [[ ! -s "${READ_MANIFEST_OUT}" ]]; then
+    mkdir -p "$(dirname "${READ_MANIFEST_OUT}")"
+    python3 -u "${PROJECT_DIR}/build_read_validation_manifest.py" \
+      --query-manifest "${PROJECT_DIR}/${PREPARED_DIR}/query_manifest.tsv" \
+      --reads-cache "${DATA_CACHE_DIR}/raw_reads" \
+      --max-bases "${READ_VALIDATION_MAX_BASES:-300000000}" \
+      --out-tsv "${READ_MANIFEST_OUT}" \
+      || echo "[bootstrap] read-manifest build returned non-zero; manifest may have partial entries" >&2
+  else
+    echo "[bootstrap] read-validation manifest already present at ${READ_MANIFEST_OUT}"
+  fi
+  echo "[bootstrap] done at $(date) — prepared/ ready for array tasks"
+  exit 0
+fi
 
 run_benchmark_dir() {
   local out_dir="$1"

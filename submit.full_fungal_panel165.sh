@@ -62,10 +62,13 @@ submit() {
   fi
 }
 
-# Phase A — bootstrap: prepare-million-real (panel-165 needs a fresh index),
-# binary prebuild, read-validation manifest. Extra time because prepare
-# downloads gene annotations and builds the routing index for 165 queries.
-BOOTSTRAP_OVERRIDES="BOOTSTRAP_ONLY=1,SKIP_PREPARE=0,FORCE_ARRAY_PREPARE=1"
+# Phase A — bootstrap: runs prepare-million-real (downloads + indexes 165
+# queries, writes prepared/query_manifest.tsv + routing index + read-
+# validation manifest), then BOOTSTRAP_ONLY=1 exits before the benchmark
+# launches. The submit.full_fungal_assembly.sh script was reordered so the
+# BOOTSTRAP_ONLY exit happens AFTER prepare, not before — that fixes the
+# earlier "bootstrap exited in 4s without preparing anything" failure.
+BOOTSTRAP_OVERRIDES="BOOTSTRAP_ONLY=1,SKIP_PREPARE=0"
 BS=$(submit \
   --job-name=panel165-bootstrap \
   -p multicore -c 8 --mem=32G --time=24:00:00 \
@@ -75,6 +78,8 @@ BS=$(submit \
 echo "bootstrap_jobid=${BS}"
 
 # Phase B — 165-way array, throttled to ARRAY_CONCURRENCY parallel tasks.
+# SKIP_PREPARE=1 reuses prepared/ from bootstrap; FORCE_RERUN_SHARDS=1 starts
+# each shard from scratch (matters when bug fixes change call semantics).
 ARRAY_OVERRIDES="FORCE_RERUN_SHARDS=1,SKIP_PREPARE=1"
 AR=$(submit \
   --dependency=afterok:${BS} \
