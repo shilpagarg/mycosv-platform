@@ -237,6 +237,28 @@ run_benchmark_dir() {
       --raw-read-validation-max-reads "${RAW_READ_VALIDATION_MAX_READS}"
     )
   fi
+  # Comparator selection. minigraph / svim-asm / anchorwave are always on
+  # (cheap, fast, reliable). PGGB and Cactus are heavier and were originally
+  # gated behind explicit env vars in run_all_experiments.sh, but for the
+  # manuscript benchmark we need the full graph-builder comparator set since
+  # reviewers (NM, NB) expect head-to-head against modern pangenome graph
+  # callers (Liao 2023 HPRC, Hickey 2024 Minigraph-Cactus, Garrison 2018 vg).
+  # Both tools ARE installed in the comparator env and the per-query runners
+  # exist (run_pggb_for_query / run_cactus_for_query); enabling them here
+  # populates the comparator truth sets in exact_benchmark_summary.tsv.
+  # Disable explicitly with RUN_PGGB=0 or RUN_CACTUS=0 if a particular host
+  # can't fit them.
+  local comparator_flags=(--run-minigraph --run-svim-asm --run-anchorwave)
+  if [[ "${RUN_PGGB:-1}" == "1" ]]; then
+    comparator_flags+=(--run-pggb)
+  fi
+  if [[ "${RUN_CACTUS:-1}" == "1" ]]; then
+    comparator_flags+=(--run-cactus)
+  fi
+  if [[ "${RUN_SYRI:-0}" == "1" ]]; then
+    comparator_flags+=(--run-syri)
+  fi
+  echo "[comparators] enabled: ${comparator_flags[*]}"
   python3 -u run_real_fungal_benchmark.py benchmark \
     --prepared-dir "${PREPARED_DIR}" \
     --out-dir "${out_dir}" \
@@ -247,9 +269,7 @@ run_benchmark_dir() {
     --reuse-registry-dir "${BENCHMARK_REGISTRY_DIR}" \
     --benchmark-ref-cap "${BENCHMARK_REF_CAP}" \
     --read-validation-min-support "${READVAL_SUPPORT}" \
-    --run-minigraph \
-    --run-svim-asm \
-    --run-anchorwave \
+    "${comparator_flags[@]}" \
     "${query_args[@]}" \
     "${raw_read_args[@]}" \
     --mycosv-arg=--max-calls-per-contig --mycosv-arg="${MAX_CALLS_PER_CONTIG:-2000}" \
