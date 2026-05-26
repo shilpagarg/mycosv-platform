@@ -14,6 +14,7 @@ import csv
 import html
 import math
 import os
+import re
 import sys
 from collections import Counter, defaultdict
 from pathlib import Path
@@ -1576,6 +1577,307 @@ def build_manuscript_method_comparison_table(
     return rows
 
 
+def build_manuscript_table2_longread(
+    by_query_dir: Path,
+    rv_rows: list[dict[str, object]],
+    meta_by_asm: dict[str, dict[str, str]],
+    out_tsv: Path,
+    out_md: Path,
+) -> list[dict[str, object]]:
+    """Manuscript Table 2 — long-read SV recovery: MycoSV-pangenome vs
+    canonical long-read callers (Sniffles2, cuteSV, SVIM).
+
+    Companion to Table 1. Table 1 measures assembly-vs-pangenome SV recovery
+    at full-genome scale. Table 2 measures read-level SV calling at the same
+    signal as the canonical PB/ONT comparators — same FASTQ in, same single
+    benchmark reference for the comparator coordinate space. Two evaluation
+    axes per the manuscript scoping:
+      1. Independent read-level validation — split-read support % column.
+      2. Same single-reference coordinate space — the F1 vs <caller>
+         columns are computed against each comparator's call set on the
+         shared benchmark reference, so all four tools are directly
+         comparable on the same axis.
+
+    Column choice follows Liao 2023 HPRC Table 2, Hickey 2024
+    Minigraph-Cactus Table 3, and Heller & Vingron 2022 Sniffles2 Table 1.
+
+    Per-sample columns:
+      Sample / species / class / platform / coverage
+      MycoSV calls            — pangenome-routed long-read SV calls
+      Sniffles2 calls         — canonical ONT/PacBio SV caller
+      cuteSV calls            — canonical long-read SV caller
+      SVIM calls              — canonical long-read SV caller
+      MycoSV ∩ ≥2 LR callers  — consensus_2of_3 vs MycoSV agreement (intersection size)
+      MycoSV F1 vs sniffles   — exact-match F1 against sniffles truth
+      MycoSV F1 vs cuteSV     — exact-match F1 against cuteSV truth
+      MycoSV F1 vs SVIM       — exact-match F1 against SVIM truth
+      MycoSV read-valid. (%)  — split-read support fraction
+      OFF_REF novel (MycoSV)  — insertions with no homologous reference anchor
+
+    Plus a panel-aggregate row at the bottom.
+    """
+    by_asm_rv: dict[str, dict[str, dict[str, int]]] = defaultdict(dict)
+    for r in rv_rows:
+        by_asm_rv[str(r["query_asm"])][str(r["source"])] = {
+            "yes": int(r["yes"]), "total": int(r["total"])
+        }
+
+    LR_LABELS = ("sniffles", "cutesv", "svim")  # exact truth_label values
+
+    # Per-shard: per-comparator truth_calls (= that caller's own callset size)
+    # + MycoSV-vs-comparator F1, plus the consensus_2of_3 agreement count.
+    per_sample: dict[str, dict[str, object]] = {}
+    coverage_by_asm: dict[str, str] = {}
+    platform_by_asm: dict[str, str] = {}
+    off_ref_by_asm: dict[str, int] = {}
+
+    for qname, shard in _iter_shards(by_query_dir):
+        if (shard / "MYCOSV_FAILED.txt").exists():
+            continue
+        eb = shard / "exact_benchmark_summary.tsv"
+        if not eb.exists() or eb.stat().st_size == 0:
+            continue
+        comp_calls: dict[str, int] = {}
+        comp_f1: dict[str, float] = {}
+        consensus_count = 0
+        mycosv_calls = 0
+        with eb.open() as fh:
+            for r in csv.DictReader(fh, delimiter="\t"):
+                if (r.get("coordinate_space") or "") != "reference":
+                    continue
+                if (r.get("validation_basis") or "") != "comparator_baseline":
+                    continue
+                if (r.get("svtype") or "") != "ALL":
+                    continue
+                if (r.get("status") or "") != "ok":
+                    continue
+                label = (r.get("truth_label") or "").lower()
+                try:
+                    truth_n = int(r.get("truth_calls") or 0)
+                    pred_n = int(r.get("pred_calls") or 0)
+                    f1 = float(r.get("f1") or 0)
+                except ValueError:
+                    continue
+                if label in LR_LABELS:
+                    comp_calls[label] = truth_n
+                    comp_f1[label] = f1
+                    if mycosv_calls == 0 and pred_n > 0:
+                        mycosv_calls = pred_n
+                elif label == "consensus_2of_3":
+                    consensus_count = max(consensus_count, truth_n)
+
+        # MycoSV's own VCF row count (split-read fallback if comparator rows absent)
+        my_vcf = shard / "mycosv" / "calls.vcf"
+        if mycosv_calls == 0 and my_vcf.exists():
+            try:
+                with my_vcf.open() as fh:
+                    mycosv_calls = sum(
+                        1 for ln in fh if ln and not ln.startswith("#")
+                    )
+            except OSError:
+                pass
+
+        # OFF_REF novel-sequence count from MycoSV's INFO=SVTYPE=OFF_REF rows.
+        off_ref = 0
+        if my_vcf.exists():
+            try:
+                with my_vcf.open() as fh:
+                    for ln in fh:
+                        if ln.startswith("#") or not ln.strip():
+                            continue
+                        if "SVTYPE=OFF_REF" in ln or "\tOFF_REF\t" in ln:
+                            off_ref += 1
+            except OSError:
+                pass
+        off_ref_by_asm[qname] = off_ref
+
+        # Coverage + platform: pulled from the MycoSV stderr auto-tune line
+        # (single source of truth for the actual effective coverage MycoSV used).
+        cov_str = ""
+        platform = ""
+        my_stderr = shard / "mycosv" / "calls.stderr.log"
+        if my_stderr.exists():
+            try:
+                with my_stderr.open(errors="replace") as fh:
+                    for ln in fh:
+                        if "cov~" in ln and ("auto-tuning" in ln or "cov_tier=" in ln):
+                            m = re.search(r"cov~([0-9.]+)x", ln)
+                            if m:
+                                cov_str = f"{float(m.group(1)):.1f}x"
+                                break
+            except OSError:
+                pass
+        coverage_by_asm[qname] = cov_str
+        # Platform from meta if present.
+        meta = meta_by_asm.get(qname, {})
+        ip = (meta.get("instrument_platform") or "").strip()
+        if ip:
+            short = {
+                "OXFORD_NANOPORE": "ONT",
+                "PACBIO_SMRT": "PacBio",
+                "ILLUMINA": "Illumina",
+                "DNBSEQ": "DNBSEQ",
+            }
+            platform = short.get(ip, ip)
+        platform_by_asm[qname] = platform
+
+        per_sample[qname] = {
+            "mycosv_calls": mycosv_calls,
+            "sniffles_calls": comp_calls.get("sniffles", 0),
+            "cutesv_calls": comp_calls.get("cutesv", 0),
+            "svim_calls": comp_calls.get("svim", 0),
+            "mycosv_vs_2of3_consensus": consensus_count,
+            "f1_vs_sniffles": comp_f1.get("sniffles", 0.0),
+            "f1_vs_cutesv": comp_f1.get("cutesv", 0.0),
+            "f1_vs_svim": comp_f1.get("svim", 0.0),
+            "off_ref_novel": off_ref,
+        }
+
+    queries = sorted(per_sample,
+                     key=lambda q: _phylogeny_sort_key(meta_by_asm.get(q, {"query_asm": q})))
+    rows: list[dict[str, object]] = []
+    for q in queries:
+        s = per_sample[q]
+        meta = meta_by_asm.get(q, {})
+        rv = by_asm_rv.get(q, {}).get("mycosv", {"yes": 0, "total": 0})
+        rows.append({
+            "sample": q,
+            "species": meta.get("species") or ".",
+            "class": meta.get("class") or ".",
+            "platform": platform_by_asm.get(q, ""),
+            "coverage": coverage_by_asm.get(q, ""),
+            "mycosv_calls": s["mycosv_calls"],
+            "sniffles_calls": s["sniffles_calls"],
+            "cutesv_calls": s["cutesv_calls"],
+            "svim_calls": s["svim_calls"],
+            "mycosv_vs_2of3_consensus": s["mycosv_vs_2of3_consensus"],
+            "f1_vs_sniffles": f"{s['f1_vs_sniffles']:.3f}",
+            "f1_vs_cutesv":   f"{s['f1_vs_cutesv']:.3f}",
+            "f1_vs_svim":     f"{s['f1_vs_svim']:.3f}",
+            "mycosv_read_validated_pct": (
+                f"{(rv['yes'] / rv['total'] * 100):.1f}" if rv["total"] else "."
+            ),
+            "off_ref_novel": s["off_ref_novel"],
+        })
+
+    # Panel-aggregate row.
+    if rows:
+        def _avg_f1(field: str) -> str:
+            vals = [per_sample[q][field] for q in queries
+                    if isinstance(per_sample[q][field], (int, float))
+                    and per_sample[q][field] > 0]
+            return f"{(sum(vals) / len(vals)):.3f}" if vals else "."
+        rv_all_yes = sum(by_asm_rv.get(q, {}).get("mycosv", {}).get("yes", 0)
+                         for q in queries)
+        rv_all_tot = sum(by_asm_rv.get(q, {}).get("mycosv", {}).get("total", 0)
+                         for q in queries)
+        rows.append({
+            "sample": f"Panel ({len(queries)} samples)",
+            "species": ".", "class": ".", "platform": ".", "coverage": ".",
+            "mycosv_calls": sum(per_sample[q]["mycosv_calls"] for q in queries),
+            "sniffles_calls": sum(per_sample[q]["sniffles_calls"] for q in queries),
+            "cutesv_calls": sum(per_sample[q]["cutesv_calls"] for q in queries),
+            "svim_calls": sum(per_sample[q]["svim_calls"] for q in queries),
+            "mycosv_vs_2of3_consensus": sum(
+                per_sample[q]["mycosv_vs_2of3_consensus"] for q in queries),
+            "f1_vs_sniffles": _avg_f1("f1_vs_sniffles"),
+            "f1_vs_cutesv": _avg_f1("f1_vs_cutesv"),
+            "f1_vs_svim": _avg_f1("f1_vs_svim"),
+            "mycosv_read_validated_pct": (
+                f"{(rv_all_yes / rv_all_tot * 100):.1f}" if rv_all_tot else "."
+            ),
+            "off_ref_novel": sum(off_ref_by_asm.get(q, 0) for q in queries),
+        })
+
+    columns = [
+        "sample", "species", "class", "platform", "coverage",
+        "mycosv_calls", "sniffles_calls", "cutesv_calls", "svim_calls",
+        "mycosv_vs_2of3_consensus",
+        "f1_vs_sniffles", "f1_vs_cutesv", "f1_vs_svim",
+        "mycosv_read_validated_pct", "off_ref_novel",
+    ]
+    write_tsv(out_tsv, rows, columns)
+
+    display = {
+        "sample": "Sample",
+        "species": "Species",
+        "class": "Class",
+        "platform": "Platform",
+        "coverage": "Cov",
+        "mycosv_calls": "MycoSV calls",
+        "sniffles_calls": "Sniffles2 calls",
+        "cutesv_calls": "cuteSV calls",
+        "svim_calls": "SVIM calls",
+        "mycosv_vs_2of3_consensus": "MycoSV ∩ ≥2 LR callers",
+        "f1_vs_sniffles": "F1 vs Sniffles2",
+        "f1_vs_cutesv":   "F1 vs cuteSV",
+        "f1_vs_svim":     "F1 vs SVIM",
+        "mycosv_read_validated_pct": "MycoSV split-read support (%)",
+        "off_ref_novel": "OFF_REF novel (MycoSV)",
+    }
+    header = "| " + " | ".join(display[c] for c in columns) + " |"
+    sep    = "| " + " | ".join("---" for _ in columns) + " |"
+    caption = (
+        "**Table 2.** Long-read structural variant recovery: MycoSV-pangenome"
+        " versus canonical long-read callers (Sniffles2, cuteSV, SVIM) on the"
+        " same PB/ONT FASTQ input. Per-sample rows ordered by phylogeny."
+        " *Coverage* is the auto-tuner's effective coverage estimate from the"
+        " MycoSV preprocessing log (mean read length × read count / genome bp)."
+        " *MycoSV ∩ ≥2 LR callers* is the count of MycoSV calls supported by"
+        " the consensus_2of_3 long-read truth set (Sniffles2 ∩ cuteSV ∪ SVIM"
+        " pairwise majority). *F1 vs <caller>* is the exact-match F1 of"
+        " MycoSV's predictions against that caller's truth set on the same"
+        " single benchmark reference. *Split-read support (%)* is the fraction"
+        " of MycoSV calls independently confirmed by raw split-read"
+        " alignments. *OFF_REF novel* counts MycoSV insertions whose alt"
+        " allele has no homologous anchor on the reference — a category only"
+        " the pangenome graph routes calls into. Column choice follows Liao"
+        " et al. (2023, Nature, HPRC Table 2), Hickey et al. (2024, Nat"
+        " Biotechnol, Minigraph-Cactus Table 3), and Heller & Vingron"
+        " (2022, Bioinformatics, Sniffles2 Table 1)."
+    )
+    md_lines = [caption, "", header, sep]
+    for r in rows:
+        cells = []
+        for c in columns:
+            v = r.get(c, "")
+            if isinstance(v, int):
+                cells.append(f"{v:,}")
+            elif isinstance(v, float):
+                cells.append(f"{v:g}")
+            else:
+                cells.append(str(v).replace("|", "\\|"))
+        md_lines.append("| " + " | ".join(cells) + " |")
+    out_md.write_text("\n".join(md_lines) + "\n", encoding="utf-8")
+    return rows
+
+
+def run_longread_panel_mode(by_query_dir: Path, out_dir: Path) -> int:
+    """Long-read companion to run_panel_mode: emits manuscript Table 2 only.
+
+    Does not regenerate Figure 1A/1B (those are assembly-mode aggregates).
+    Reads the same `by_query/<asm>/` tree but expects long-read comparator
+    truth labels (sniffles / cutesv / svim) in exact_benchmark_summary.tsv.
+    """
+    if not by_query_dir.is_dir():
+        print(f"[longread-panel] not a directory: {by_query_dir}")
+        return 1
+    out_dir.mkdir(parents=True, exist_ok=True)
+    meta_by_asm = _load_query_meta_map(by_query_dir)
+    rv_rows = aggregate_panel_read_validation(
+        by_query_dir, out_dir / "panel_read_validation_rate_longreads.tsv",
+    )
+    build_manuscript_table2_longread(
+        by_query_dir,
+        rv_rows,
+        meta_by_asm,
+        out_dir / "table2_longread_caller_comparison.tsv",
+        out_dir / "table2_longread_caller_comparison.md",
+    )
+    print(f"[longread-panel] wrote Table 2 -> {out_dir}/table2_longread_caller_comparison.{{tsv,md}}")
+    return 0
+
+
 def run_panel_mode(by_query_dir: Path, out_dir: Path) -> int:
     """Build Figure 1 panel-fold aggregates and plots from a by_query/ tree."""
     if not by_query_dir.is_dir():
@@ -1828,18 +2130,27 @@ def main(argv: list[str] | None = None) -> int:
                              "shard. Produces manuscript Figure 1A/1B panel-level aggregates "
                              "(per-sample read-validation rate + pangenome-lift bars). Also "
                              "writes the manuscript Table 1 (pangenome vs single-reference).")
+    parser.add_argument("--longread-panel-dir", type=Path, default=None,
+                        help="Long-read companion: a by_query/ directory holding one subdir per "
+                             "long-read shard. Writes manuscript Table 2 (MycoSV vs Sniffles2 / "
+                             "cuteSV / SVIM on the same PB/ONT input). Does NOT regenerate "
+                             "Figure 1; that is assembly-mode only.")
     parser.add_argument("--outdir", type=Path, default=None,
                         help="Output directory. Per-shard mode defaults to <benchmark-dir>/"
                              "pangenome_plots; panel mode defaults to <panel-dir>/../"
-                             "manuscript_figure1.")
+                             "manuscript_figure1; long-read panel mode defaults to "
+                             "<longread-panel-dir>/../manuscript_table2.")
     parser.add_argument("--title", default="MycoSV pangenome call biology plots")
     args = parser.parse_args(argv)
 
+    if args.longread_panel_dir is not None:
+        out = args.outdir or (args.longread_panel_dir.parent / "manuscript_table2")
+        return run_longread_panel_mode(args.longread_panel_dir, out)
     if args.panel_dir is not None:
         out = args.outdir or (args.panel_dir.parent / "manuscript_figure1")
         return run_panel_mode(args.panel_dir, out)
     if args.benchmark_dir is None:
-        parser.error("either --benchmark-dir (per-shard) or --panel-dir (panel-fold) is required")
+        parser.error("either --benchmark-dir, --panel-dir, or --longread-panel-dir is required")
 
     bench = args.benchmark_dir
     outdir = args.outdir or (bench / "pangenome_plots")

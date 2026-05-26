@@ -185,7 +185,7 @@ else
   exit 2
 fi
 
-python3 - <<'PY' "${PREPARED_DIR}" "${QUERY_COUNT}" "${QUERY_GROUPS}"
+python3 - <<'PY' "${PREPARED_DIR}" "${QUERY_COUNT}" "${QUERY_GROUPS}" "${MODE:-assembly}"
 import csv
 import sys
 from pathlib import Path
@@ -193,12 +193,13 @@ from pathlib import Path
 prepared = Path(sys.argv[1])
 expected = int(sys.argv[2])
 groups = sys.argv[3]
+mode = sys.argv[4]
 manifest = prepared / "query_manifest.tsv"
 rows = list(csv.DictReader(manifest.open(), delimiter="\t"))
-asm = [r for r in rows if r.get("query_mode") == "assembly"]
-print(f"[query-check] assembly_queries={len(asm)} expected={expected} groups={groups}")
-if len(asm) < expected:
-    raise SystemExit(f"expected at least {expected} assembly queries, found {len(asm)}")
+sel = [r for r in rows if (r.get("query_mode") or "assembly") == mode]
+print(f"[query-check] mode={mode} queries={len(sel)} expected={expected} groups={groups}")
+if len(sel) < expected:
+    raise SystemExit(f"expected at least {expected} {mode} queries, found {len(sel)}")
 PY
 
 # BOOTSTRAP_ONLY=1 short-circuit: the prepare + index/manifest-check above
@@ -237,32 +238,50 @@ run_benchmark_dir() {
       --raw-read-validation-max-reads "${RAW_READ_VALIDATION_MAX_READS}"
     )
   fi
-  # Comparator selection. minigraph / svim-asm / anchorwave are always on
-  # (cheap, fast, reliable). PGGB and Cactus are heavier and were originally
-  # gated behind explicit env vars in run_all_experiments.sh, but for the
-  # manuscript benchmark we need the full graph-builder comparator set since
-  # reviewers (NM, NB) expect head-to-head against modern pangenome graph
-  # callers (Liao 2023 HPRC, Hickey 2024 Minigraph-Cactus, Garrison 2018 vg).
-  # Both tools ARE installed in the comparator env and the per-query runners
-  # exist (run_pggb_for_query / run_cactus_for_query); enabling them here
-  # populates the comparator truth sets in exact_benchmark_summary.tsv.
-  # Disable explicitly with RUN_PGGB=0 or RUN_CACTUS=0 if a particular host
-  # can't fit them.
-  local comparator_flags=(--run-minigraph --run-svim-asm --run-anchorwave)
-  if [[ "${RUN_PGGB:-1}" == "1" ]]; then
-    comparator_flags+=(--run-pggb)
-  fi
-  if [[ "${RUN_CACTUS:-1}" == "1" ]]; then
-    comparator_flags+=(--run-cactus)
-  fi
-  if [[ "${RUN_SYRI:-0}" == "1" ]]; then
-    comparator_flags+=(--run-syri)
-  fi
+  # Comparator selection per benchmark mode.
+  #   assembly    : minigraph / svim-asm / anchorwave (always on); PGGB + Cactus
+  #                 optional via RUN_PGGB / RUN_CACTUS. Reviewers (NM, NB)
+  #                 expect head-to-head against modern pangenome graph callers
+  #                 (Liao 2023 HPRC, Hickey 2024 Minigraph-Cactus, Garrison 2018 vg).
+  #   long-reads  : Sniffles2 / cuteSV / SVIM — the canonical PB/ONT SV callers
+  #                 (Heller 2022 Genome Biol, Jiang 2020 GB, Heller 2019 Bioinf).
+  #   short-reads : Delly / Manta — canonical Illumina SV callers (Rausch 2012,
+  #                 Chen 2016 Bioinf). Off by default; opt in with MODE=short-reads.
+  # MODE is an env var so the same launcher handles assembly + reads modes
+  # without forking the script — per the project policy of editing existing
+  # pipeline + heredocs rather than spawning new shell scripts.
+  local mode="${MODE:-assembly}"
+  local comparator_flags=()
+  case "${mode}" in
+    assembly)
+      comparator_flags=(--run-minigraph --run-svim-asm --run-anchorwave)
+      if [[ "${RUN_PGGB:-1}" == "1" ]]; then
+        comparator_flags+=(--run-pggb)
+      fi
+      if [[ "${RUN_CACTUS:-1}" == "1" ]]; then
+        comparator_flags+=(--run-cactus)
+      fi
+      if [[ "${RUN_SYRI:-0}" == "1" ]]; then
+        comparator_flags+=(--run-syri)
+      fi
+      ;;
+    long-reads)
+      comparator_flags=(--run-sniffles --run-cutesv --run-svim)
+      ;;
+    short-reads)
+      comparator_flags=(--run-delly --run-manta)
+      ;;
+    *)
+      echo "[error] unsupported MODE=${mode} (expected: assembly|long-reads|short-reads)" >&2
+      return 2
+      ;;
+  esac
+  echo "[mode] ${mode}"
   echo "[comparators] enabled: ${comparator_flags[*]}"
   python3 -u run_real_fungal_benchmark.py benchmark \
     --prepared-dir "${PREPARED_DIR}" \
     --out-dir "${out_dir}" \
-    --mode assembly \
+    --mode "${mode}" \
     --threads "${THREADS}" \
     --max-clade-genomes "${MAX_CLADE_GENOMES}" \
     --reuse-index-dir "${BENCHMARK_INDEX_DIR}" \
@@ -466,14 +485,16 @@ if [[ "${FULL_ASSEMBLY_SHARDS}" == "1" ]]; then
   mkdir -p "${ASM_OUT}"
   SHARD_ROOT="${ASM_OUT}/by_query"
   mkdir -p "${SHARD_ROOT}"
-  mapfile -t QUERY_ASMS < <(python3 - <<'PY' "${PREPARED_DIR}"
+  mapfile -t QUERY_ASMS < <(python3 - <<'PY' "${PREPARED_DIR}" "${MODE:-assembly}"
 import csv
 import sys
 from pathlib import Path
 
-rows = list(csv.DictReader((Path(sys.argv[1]) / "query_manifest.tsv").open(), delimiter="\t"))
+prepared = Path(sys.argv[1])
+mode = sys.argv[2]
+rows = list(csv.DictReader((prepared / "query_manifest.tsv").open(), delimiter="\t"))
 for row in rows:
-    if row.get("query_mode") == "assembly":
+    if (row.get("query_mode") or "assembly") == mode:
         print(row["query_asm"])
 PY
 )

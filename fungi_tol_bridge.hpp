@@ -333,6 +333,42 @@ read_fasta_local(const std::string& path) {
     return out;
 }
 
+// ── for_each_fasta_record ────────────────────────────────────────────────
+// Streaming variant of read_fasta_local: hands each (name, seq) pair to
+// `fn` one at a time, reusing the same buffers between records. Callers
+// that do not need every contig held in memory at once (e.g. the full-base
+// graph builder, which slices each contig into segments and never reuses
+// it) should prefer this over read_fasta_local to halve transient RSS.
+// Returns true if at least one record was emitted.
+template <class Fn>
+inline bool for_each_fasta_record(const std::string& path, Fn&& fn) {
+    FastaStream fs(path);
+    std::istream& in = fs.get();
+    std::string name, seq, line;
+    bool any = false;
+    auto emit = [&]() {
+        if (name.empty() || seq.empty()) return;
+        fn(static_cast<const std::string&>(name),
+           static_cast<const std::string&>(seq));
+        any = true;
+    };
+    while (std::getline(in, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        if (line.empty()) continue;
+        if (line[0] == '>') {
+            emit();
+            name.assign(line, 1, std::string::npos);
+            auto sp = name.find_first_of(" \t");
+            if (sp != std::string::npos) name.resize(sp);
+            seq.clear();
+        } else {
+            seq += line;
+        }
+    }
+    emit();
+    return any;
+}
+
 // ── FIX-B1: rolling-hash k-mer overlap ───────────────────────────────────
 // Uses FNV-1a rolling hash so the unordered_set<string> allocation is
 // eliminated.  Build: O(N).  Lookup: O(k) per query k-mer.
@@ -881,6 +917,72 @@ inline std::string cached_seed_sequence_for_build(
     return seq;
 }
 
+// ── BuilderFastaHashCache ────────────────────────────────────────────────
+// Process-global, thread-safe map FASTA-path -> minimizer hashes of the
+// FASTA's leading 512 bp seed. Each FASTA is opened (and gzip-decoded)
+// exactly once across the whole multi-rank index build. Upper-rank shards
+// (genus / family / order / class / phylum) that exceed the full-base cap
+// reuse the species-level hashes instead of re-opening every constituent
+// FASTA. Save: 5x I/O on average (1 read per FASTA vs ~6 across ranks),
+// which is the single largest wall-clock contributor for runs with deep
+// taxonomic redundancy like panel200 (24k FASTAs).
+struct BuilderFastaHashCache {
+    static BuilderFastaHashCache& instance() {
+        static BuilderFastaHashCache inst;
+        return inst;
+    }
+
+    // Returns ≤`limit` minimizer hashes computed over the FASTA's first
+    // 512 bp seed using FNV-1a k-mer hashing (matches the inline hashing
+    // in build_compact_manifest_graph). Recomputes on every call only if
+    // the per-(path, k, limit) tuple was never cached; otherwise O(1) +
+    // a vector copy of ≤limit uint64.
+    std::vector<uint64_t> hashes_for(const std::string& path, int k, size_t limit) {
+        const Key key{path, static_cast<int32_t>(std::max(3, k)),
+                      static_cast<uint32_t>(std::max<size_t>(1, limit))};
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            auto it = cache_.find(key);
+            if (it != cache_.end()) return it->second;
+        }
+        const std::string seed = read_fasta_seed_sequence(path, 512);
+        std::vector<uint64_t> h;
+        if (!seed.empty() && seed != "N") {
+            const int kk = std::min<int>(key.k, static_cast<int>(seed.size()));
+            h = minimizer_hashes_for_sequence(seed, kk, limit);
+        }
+        std::lock_guard<std::mutex> lk(mu_);
+        // bounded cache: 200k entries × ~120 B/entry + ≤64×8B hashes ≈ 100 MB max
+        if (cache_.size() < 200000) cache_.emplace(key, h);
+        return h;
+    }
+
+    void clear() {
+        std::lock_guard<std::mutex> lk(mu_);
+        cache_.clear();
+    }
+
+private:
+    struct Key {
+        std::string path;
+        int32_t k;
+        uint32_t limit;
+        bool operator==(const Key& o) const {
+            return k == o.k && limit == o.limit && path == o.path;
+        }
+    };
+    struct KeyHash {
+        size_t operator()(const Key& key) const noexcept {
+            size_t h = std::hash<std::string>{}(key.path);
+            h ^= static_cast<size_t>(key.k) * 0x9e3779b97f4a7c15ULL;
+            h ^= static_cast<size_t>(key.limit) * 0xbf58476d1ce4e5b9ULL + (h << 6) + (h >> 2);
+            return h;
+        }
+    };
+    std::unordered_map<Key, std::vector<uint64_t>, KeyHash> cache_;
+    std::mutex mu_;
+};
+
 inline CladeGraph build_compact_manifest_graph(const CladeGraphDescriptor& d,
                                                const std::string& shardPath,
                                                const SyncmerParams& sp,
@@ -900,24 +1002,48 @@ inline CladeGraph build_compact_manifest_graph(const CladeGraphDescriptor& d,
     size_t seen = 0;
     size_t contributing = 0;
 
+    // Centroid roll-up: reuse minimizer hashes already computed for this
+    // FASTA at any lower rank (BuilderFastaHashCache is process-global).
+    // Seed sequences are only fetched for the reservoir-sampled `samples`
+    // that need a node payload (≤sampleLimit per shard, typically 64).
+    const int kBase = std::max(3, sp.k);
+    auto& hashCache = BuilderFastaHashCache::instance();
+
     for_each_manifest_row(shardPath, [&](const ManifestRow& r) {
         ++seen;
+        if (r.fastaPath.empty()) return;
+        auto cachedHashes = hashCache.hashes_for(r.fastaPath, kBase, 64);
+        if (cachedHashes.empty()) return;  // FASTA missing / empty
+        ++contributing;
+        for (uint64_t h : cachedHashes) centroidAcc.insert(h);
+
+        // Materialize the seed sequence only if this row is going to be
+        // retained in the reservoir sample (most rows in a large shard
+        // are evicted by the reservoir without ever needing the seed).
+        bool willKeep = false;
+        size_t replaceIdx = sampleLimit;
+        if (samples.size() < sampleLimit) {
+            willKeep = true;
+        } else {
+            std::uniform_int_distribution<size_t> dist(0, seen - 1);
+            const size_t pick = dist(rng);
+            if (pick < sampleLimit) {
+                willKeep = true;
+                replaceIdx = pick;
+            }
+        }
+        if (!willKeep) return;
+
         const std::string seed =
             cached_seed_sequence_for_build(r.fastaPath, 512, seedCache);
         if (seed.empty() || seed == "N") return;
-        ++contributing;
-        const int k = std::min<int>(std::max(3, sp.k), static_cast<int>(seed.size()));
-        for (uint64_t h : minimizer_hashes_for_sequence(seed, k, 64))
-            centroidAcc.insert(h);
 
         CompactGraphSample sample{resolve_manifest_row_asm_name(r), seed};
         if (samples.size() < sampleLimit) {
             samples.push_back(std::move(sample));
-            return;
+        } else {
+            samples[replaceIdx] = std::move(sample);
         }
-        std::uniform_int_distribution<size_t> dist(0, seen - 1);
-        const size_t pick = dist(rng);
-        if (pick < sampleLimit) samples[pick] = std::move(sample);
     });
 
     std::unordered_map<std::string, int> nodeBySeq;
@@ -1120,27 +1246,27 @@ inline CladeGraph build_manifest_backed_graph_from_rows(const CladeGraphDescript
     int addedGenomes = 0;
     for (const auto& r : rowsForClade) {
         if (r.fastaPath.empty() || !fs::exists(r.fastaPath)) continue;
+        const std::string asmLabel =
+            r.asmName.empty() ? fs::path(r.fastaPath).stem().string() : r.asmName;
+        bool any = false;
         try {
-            auto contigs = read_fasta_local(r.fastaPath);
-            if (contigs.empty()) continue;
-            for (const auto& kv : contigs) {
-                const std::string& contigName = kv.first;
-                const std::string& seq = kv.second;
-                if (seq.empty()) continue;
-                builder.add_genome(
-                    r.asmName.empty() ? fs::path(r.fastaPath).stem().string() : r.asmName,
-                    contigName,
-                    seq,
-                    "NONE",
-                    false,
-                    false,
-                    10000,
-                    1000);
-            }
-            ++addedGenomes;
+            // Stream contigs one at a time instead of materializing the
+            // whole genome as an unordered_map<string,string>. For a 30 MB
+            // fungal genome this cuts transient RSS by ~30 MB per worker
+            // and avoids the unordered_map's ~1.5x overhead — important
+            // when up to 32 genomes pass through per full-base shard and
+            // up to 4 such shards run concurrently (tiered worker pool).
+            any = for_each_fasta_record(
+                r.fastaPath,
+                [&](const std::string& contigName, const std::string& seq) {
+                    if (seq.empty()) return;
+                    builder.add_genome(asmLabel, contigName, seq,
+                                       "NONE", false, false, 10000, 1000);
+                });
         } catch (...) {
             // Keep index builds resilient to individual malformed FASTA rows.
         }
+        if (any) ++addedGenomes;
     }
     CladeGraph g = builder.build(true, true, kMinBubbleFreqDef);
     g.cladeName = d.cladeName;
@@ -1281,6 +1407,42 @@ inline BuiltShardArtifacts build_single_manifest_shard(
     return built;
 }
 
+// ── rank ordering helper ─────────────────────────────────────────────────
+// Sort shards so lower ranks (species first) build before upper ranks
+// (phylum last). This populates BuilderFastaHashCache during species/genus
+// processing, so upper-rank compact shards reuse cached hashes instead of
+// re-reading FASTAs — the biggest wall-clock win for runs with deep
+// taxonomic redundancy.
+inline int shard_rank_order(const std::string& rank) {
+    if (rank == "species") return 0;
+    if (rank == "genus") return 1;
+    if (rank == "family") return 2;
+    if (rank == "order") return 3;
+    if (rank == "class") return 4;
+    if (rank == "phylum") return 5;
+    return 6;  // unknown / root — process last
+}
+
+// True if this shard will use full-base-graph mode (rowCount ≤ cap AND
+// baseGraphBuild requested). Full-base shards are the memory-heavy ones
+// (~1–2 GB peak per shard with 30 MB fungal genomes); they get scheduled
+// onto a separate worker lane with limited concurrency.
+inline bool shard_is_heavy(const ManifestShardInfo& s,
+                           size_t maxCladeGenomes,
+                           bool baseGraphBuild) {
+    return baseGraphBuild && s.rowCount <= maxCladeGenomes && s.rowCount >= 2;
+}
+
+// ── build_partitioned_shards (tiered worker pool) ───────────────────────
+// Two-lane scheduler that bounds peak RSS:
+//   • heavy lane: at most max(1, indexThreads/4) workers; runs the
+//     full-base-graph shards (≤cap genomes, reads each FASTA in full,
+//     ~1 GB peak per shard).
+//   • light lane: the remaining workers; runs compact-mode shards
+//     (>cap genomes; only the 512 bp seed per FASTA is read, ≤50 MB
+//     peak per shard).
+// Shards are also rank-sorted so species/genus process before phylum
+// (warms the BuilderFastaHashCache for centroid roll-up at upper ranks).
 inline std::vector<BuiltShardArtifacts> build_partitioned_shards(
         const std::vector<ManifestShardInfo>& shards,
         const fs::path& indexDir,
@@ -1293,35 +1455,89 @@ inline std::vector<BuiltShardArtifacts> build_partitioned_shards(
         bool baseGraphBuild,
         bool verbose) {
     std::vector<BuiltShardArtifacts> results(shards.size());
-    std::atomic<size_t> next{0};
+
+    // Build heavy / light index lists in rank order (species first).
+    std::vector<size_t> heavyIdx, lightIdx;
+    heavyIdx.reserve(shards.size());
+    lightIdx.reserve(shards.size());
+    for (size_t i = 0; i < shards.size(); ++i) {
+        if (shard_is_heavy(shards[i], maxCladeGenomes, baseGraphBuild))
+            heavyIdx.push_back(i);
+        else
+            lightIdx.push_back(i);
+    }
+    auto byRank = [&](size_t a, size_t b) {
+        const int ra = shard_rank_order(shards[a].cladeRank);
+        const int rb = shard_rank_order(shards[b].cladeRank);
+        if (ra != rb) return ra < rb;
+        // Within a rank, smaller shards first → keeps memory steady and
+        // gets centroids into the cache quickly.
+        if (shards[a].rowCount != shards[b].rowCount)
+            return shards[a].rowCount < shards[b].rowCount;
+        return a < b;
+    };
+    std::sort(heavyIdx.begin(), heavyIdx.end(), byRank);
+    std::sort(lightIdx.begin(), lightIdx.end(), byRank);
+
     std::mutex errMu;
     std::string firstError;
+    auto record_error = [&](const std::string& msg) {
+        std::lock_guard<std::mutex> lk(errMu);
+        if (firstError.empty()) firstError = msg;
+    };
+    auto have_error = [&]() {
+        std::lock_guard<std::mutex> lk(errMu);
+        return !firstError.empty();
+    };
 
-    const size_t workerCount = std::max<size_t>(1, std::min(indexThreads, shards.size()));
-    std::vector<std::thread> workers;
-    workers.reserve(workerCount);
-    for (size_t ti = 0; ti < workerCount; ++ti) {
-        workers.emplace_back([&]() {
-            for (;;) {
-                const size_t idx = next.fetch_add(1, std::memory_order_relaxed);
-                if (idx >= shards.size()) break;
-                {
-                    std::lock_guard<std::mutex> lk(errMu);
-                    if (!firstError.empty()) break;
-                }
-                try {
-                    results[idx] = build_single_manifest_shard(
-                        shards[idx], indexDir, registryDir, sp, routingDensity, fb,
-                        maxCladeGenomes, baseGraphBuild, verbose);
-                } catch (const std::exception& e) {
-                    std::lock_guard<std::mutex> lk(errMu);
-                    if (firstError.empty()) firstError = e.what();
-                    break;
-                }
+    auto run_lane = [&](const std::vector<size_t>& laneIdx,
+                        std::atomic<size_t>& cursor,
+                        const char* /*laneName*/) {
+        for (;;) {
+            const size_t pos = cursor.fetch_add(1, std::memory_order_relaxed);
+            if (pos >= laneIdx.size()) break;
+            if (have_error()) break;
+            const size_t shardIdx = laneIdx[pos];
+            try {
+                results[shardIdx] = build_single_manifest_shard(
+                    shards[shardIdx], indexDir, registryDir, sp, routingDensity, fb,
+                    maxCladeGenomes, baseGraphBuild, verbose);
+            } catch (const std::exception& e) {
+                record_error(e.what());
+                break;
             }
-        });
+        }
+    };
+
+    // Lane sizing: full-base shards can hold ~1 GB per worker, compact
+    // shards ~50 MB. With 16 threads + 256 GB cap, allow at most 4 heavy
+    // workers (~4 GB peak) so the other 12 can rip through compact shards.
+    const size_t totalThreads = std::max<size_t>(1, indexThreads);
+    size_t heavyWorkers = std::max<size_t>(1, totalThreads / 4);
+    if (heavyIdx.empty()) heavyWorkers = 0;
+    if (heavyWorkers > heavyIdx.size()) heavyWorkers = heavyIdx.size();
+    size_t lightWorkers = totalThreads > heavyWorkers ? totalThreads - heavyWorkers : 1;
+    if (lightIdx.empty()) lightWorkers = 0;
+    if (lightWorkers > lightIdx.size()) lightWorkers = lightIdx.size();
+    if (heavyWorkers + lightWorkers == 0) heavyWorkers = std::max<size_t>(1, totalThreads);
+
+    if (verbose) {
+        std::cerr << "[tol] build_partitioned_shards: " << shards.size()
+                  << " shards (" << heavyIdx.size() << " heavy / "
+                  << lightIdx.size() << " light), workers="
+                  << heavyWorkers << " heavy + " << lightWorkers << " light\n";
     }
+
+    std::atomic<size_t> heavyCursor{0};
+    std::atomic<size_t> lightCursor{0};
+    std::vector<std::thread> workers;
+    workers.reserve(heavyWorkers + lightWorkers);
+    for (size_t i = 0; i < heavyWorkers; ++i)
+        workers.emplace_back([&]() { run_lane(heavyIdx, heavyCursor, "heavy"); });
+    for (size_t i = 0; i < lightWorkers; ++i)
+        workers.emplace_back([&]() { run_lane(lightIdx, lightCursor, "light"); });
     for (auto& t : workers) t.join();
+
     if (!firstError.empty()) throw std::runtime_error(firstError);
     return results;
 }

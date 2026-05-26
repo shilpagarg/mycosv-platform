@@ -4772,18 +4772,34 @@ def sequence_bp_and_records(path: Path | None) -> tuple[int, int]:
     if sequence_kind_from_name(path.name) == "fastq":
         total_bp = 0
         records = 0
-        with open_text_auto(path) as fh:
-            while True:
-                header = fh.readline()
-                if not header:
-                    break
-                seq = fh.readline()
-                plus = fh.readline()
-                qual = fh.readline()
-                if not qual:
-                    break
-                total_bp += len(seq.strip())
-                records += 1
+        # Tolerate truncated gzip streams: ENA bulk downloads capped by
+        # READ_VALIDATION_MAX_BASES often end mid-record without the gzip
+        # end-of-stream marker, which makes gzip.GzipFile raise EOFError on
+        # the final read. The downstream callers (sniffles/cuteSV/SVIM/
+        # MycoSV) tolerate the truncation themselves — they just stop at
+        # the last complete record — so we should too. Without this guard
+        # the whole shard fails in write_sv_volume_audit even though all
+        # callers succeeded.
+        try:
+            with open_text_auto(path) as fh:
+                while True:
+                    header = fh.readline()
+                    if not header:
+                        break
+                    seq = fh.readline()
+                    plus = fh.readline()
+                    qual = fh.readline()
+                    if not qual:
+                        break
+                    total_bp += len(seq.strip())
+                    records += 1
+        except (EOFError, OSError) as exc:
+            sys.stderr.write(
+                f"[sv-volume] {path}: gzip stream truncated after "
+                f"{records} record(s) / {total_bp} bp ({exc.__class__.__name__}: "
+                f"{exc}); returning partial counts. Likely caused by a "
+                f"download capped at READ_VALIDATION_MAX_BASES.\n"
+            )
         return total_bp, records
     return fasta_bp_and_contigs(path)
 
@@ -11912,6 +11928,52 @@ def prepare_million_real(args: argparse.Namespace) -> int:
                     f"{gene_annotations_path} ({gene_annotations_count} rows)",
                     flush=True,
                 )
+            else:
+                # Soft cache hit: the cached TSV is valid for the gene-content
+                # fields (source / max_assemblies / min_assembly_level /
+                # latest_only / gff_sources) but the holdout-dependent fields
+                # (held_out_asm_names, million_real_query_genera) differ.
+                # held_out_asm_names only affects per-query alias duplication
+                # in the writer (each ref-owner gene row gets duplicated to
+                # the query asms it's mapped to via the benchmark map). The
+                # underlying gene-record content (start/end/gene_id/biotype)
+                # is identical, so downstream call-annotation lookups still
+                # work for the ref-asm rows; only the *query-aliased* lookups
+                # for samples whose holdout assignment changed are stale.
+                # That's a graceful degradation: missing rows just leave a
+                # call's gene context blank instead of producing wrong output.
+                # Avoids the 5–6 h re-stream cost of 24 k GFF/GBFF sources.
+                immutable_keys = (
+                    "source",
+                    "max_assemblies_requested",
+                    "min_assembly_level",
+                    "latest_only",
+                    "gff_sources",
+                )
+                if all(
+                    marker_payload.get(k) == gene_cache_payload.get(k)
+                    for k in immutable_keys
+                ) and int(marker_payload.get("rows_written", 0) or 0) > 0:
+                    cache_reused = True
+                    gene_annotations_count = int(marker_payload.get("rows_written", 0))
+                    stale_query_set = set(marker_payload.get("held_out_asm_names") or [])
+                    current_query_set = set(gene_cache_payload.get("held_out_asm_names") or [])
+                    added = sorted(current_query_set - stale_query_set)
+                    dropped = sorted(stale_query_set - current_query_set)
+                    print(
+                        f"      gene_annotations: soft cache hit on {gene_annotations_path} "
+                        f"({gene_annotations_count} rows; immutable fields match). "
+                        f"Holdout drift: +{len(added)} / -{len(dropped)} query asms — "
+                        f"per-query alias rows may be stale for the changed samples; "
+                        f"gene records themselves are unchanged.",
+                        flush=True,
+                    )
+                    if added:
+                        sys.stderr.write(
+                            f"[gene-annot] soft cache: {len(added)} new query asm(s) "
+                            f"will have empty per-query gene rows in the cached TSV; "
+                            f"first 5: {added[:5]}\n"
+                        )
         if not cache_reused:
             print(
                 f"      gene_annotations: streaming {len(gff_pairs)} GFF/GBFF sources "

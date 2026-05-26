@@ -111,16 +111,29 @@ submit() {
 # + read-validation manifest), then BOOTSTRAP_ONLY=1 exits before the
 # benchmark launches.
 #
-# Memory: 128G. panel-165 attempt 1 crashed at 44.15G MaxRSS on 32G;
-# panel-200 adds ~21% scope, so 128G keeps the same ~3x safety margin.
-# The C++ index builder is resumption-safe (skips clades whose .gbz
-# already exists). multicore caps memory at 8192 MB/core, so 128G needs
-# >=16 cores — the 8 cores beyond the C++ build's 8 threads are SLURM
-# memory-budget headroom, not parallelism.
-BOOTSTRAP_OVERRIDES="BOOTSTRAP_ONLY=1,SKIP_PREPARE=0"
+# Memory: 256G. Panel-200 job 15448995 crashed at 116G MaxRSS / 128G cap
+# during routing-index build (std::bad_alloc) because the C++ builder
+# launched 16 parallel workers each holding up to ~1.5 GB of full-base
+# graph state, plus glibc per-arena fragmentation across ~9k full-base
+# shards. 256G fits well inside `multicore` (1.5 TB/node, MaxMemPerNode
+# UNLIMITED) — no himem node needed. Algorithmic fixes (tiered worker
+# pool + streaming FASTA reads + centroid roll-up) also landed in
+# fungi_tol_bridge.hpp to cut peak RSS further.
+#
+# MALLOC_ARENA_MAX / MALLOC_TRIM_THRESHOLD_: tame glibc malloc per-thread
+# arenas (default = 8 × CPU_COUNT, so 16 cores × 8 = 128 arenas, each
+# retaining freed pages). Capping at 2 arenas and a tight trim threshold
+# returns memory to the kernel more aggressively — cheap substitute for
+# jemalloc on a node that doesn't have it installed.
+#
+# Cores=32 not 16: multicore enforces 8192 MB/CPU, so 256G needs ≥32
+# cores. The C++ index builder still uses --tol-index-threads=16 (see
+# submit.full_fungal_assembly.sh); the extra 16 cores are pure memory
+# headroom, not extra parallelism.
+BOOTSTRAP_OVERRIDES="BOOTSTRAP_ONLY=1,SKIP_PREPARE=0,MALLOC_ARENA_MAX=2,MALLOC_TRIM_THRESHOLD_=131072"
 BS=$(submit \
   --job-name="${JOB_PREFIX}-bootstrap" \
-  -p multicore -c 16 --mem=128G --time=24:00:00 \
+  -p multicore -c 32 --mem=256G --time=24:00:00 \
   --output="${LOG_PREFIX}-bootstrap-%j.out" \
   --export=ALL,${BOOTSTRAP_OVERRIDES} \
   submit.full_fungal_assembly.sh)
