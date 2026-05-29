@@ -2329,3 +2329,116 @@ def test_benchmark_mycosv_only_validates_mycosv_reference_calls(tmp_path: Path, 
     assert (args.out_dir / "biology_findings.tsv").exists()
     summary = json.loads((args.out_dir / "benchmark_summary.json").read_text(encoding="utf-8"))
     assert summary["queries"]["q1"]["read_validation"]["mycosv_reference"]["read_validated"] == 1
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# Reference-free read-level validation (validate_calls_reference_free).
+#
+# These tests monkeypatch tool_path / _extract_query_window /
+# _align_reads_to_junction_fasta / _samtools_count_breakpoint_support so they
+# exercise the dispatch logic + per-call return rows without needing real
+# minimap2 or samtools binaries on the test host.
+# ────────────────────────────────────────────────────────────────────────────
+
+
+def test_reference_free_validation_emits_status_when_tools_missing(tmp_path: Path, monkeypatch):
+    query_fa = tmp_path / "query.fa"
+    query_fa.write_text(">ctg\n" + ("A" * 500) + "\n", encoding="utf-8")
+    raw_reads = tmp_path / "reads.fq"
+    raw_reads.write_text("@r\nACGT\n+\n!!!!\n", encoding="utf-8")
+    query_row = {"query_asm": "q1", "query_mode": "long-reads",
+                 "path": str(query_fa), "platform_model": "PromethION"}
+    call = NormalizedCall("q1", "ctg", 100, 200, "DEL", -100, "mycosv",
+                          coord_space="query")
+    monkeypatch.setattr(rrfb, "tool_path", lambda _name: None)
+    kept, rows = rrfb.validate_calls_reference_free(
+        [call], query_row, raw_reads, tmp_path / "refree",
+        mode="long-reads", threads=1, min_support=2,
+    )
+    assert kept == []
+    assert rows[0]["status"] == "tools_unavailable"
+    assert rows[0]["support_source"] == "reference_free_junction_kmer_alignment"
+    assert rows[0]["read_validated"] == "unknown"
+
+
+def test_reference_free_validation_marks_raw_reads_unavailable(tmp_path: Path, monkeypatch):
+    query_fa = tmp_path / "query.fa"
+    query_fa.write_text(">ctg\n" + ("A" * 500) + "\n", encoding="utf-8")
+    missing_reads = tmp_path / "nope.fq"
+    query_row = {"query_asm": "q1", "query_mode": "long-reads",
+                 "path": str(query_fa)}
+    call = NormalizedCall("q1", "ctg", 100, 200, "DEL", -100, "mycosv",
+                          coord_space="query")
+    monkeypatch.setattr(rrfb, "tool_path", lambda name: "/bin/true")
+    kept, rows = rrfb.validate_calls_reference_free(
+        [call], query_row, missing_reads, tmp_path / "refree",
+        mode="long-reads", threads=1, min_support=2,
+    )
+    assert kept == []
+    assert rows[0]["status"] == "raw_reads_unavailable"
+
+
+def test_reference_free_validation_validates_all_sv_types(tmp_path: Path, monkeypatch):
+    """End-to-end smoke: with the heavy tools stubbed, every SV type
+    (DEL/INS/DUP/INV) gets one junction window built, surveyed in the
+    fake BAM, and validated when support >= min_support."""
+    query_fa = tmp_path / "query.fa"
+    query_fa.write_text(">ctg\n" + ("A" * 2000) + "\n", encoding="utf-8")
+    raw_reads = tmp_path / "reads.fq"
+    raw_reads.write_text("@r\nACGT\n+\n!!!!\n", encoding="utf-8")
+    query_row = {"query_asm": "q1", "query_mode": "long-reads",
+                 "path": str(query_fa), "platform_model": "PromethION"}
+    calls = [
+        NormalizedCall("q1", "ctg", 200, 300, "DEL", -100, "mycosv",
+                       coord_space="query"),
+        NormalizedCall("q1", "ctg", 400, 401, "INS",  50, "mycosv",
+                       coord_space="query"),
+        NormalizedCall("q1", "ctg", 600, 700, "DUP",  100, "mycosv",
+                       coord_space="query"),
+        NormalizedCall("q1", "ctg", 800, 900, "INV",  100, "mycosv",
+                       coord_space="query"),
+    ]
+
+    monkeypatch.setattr(rrfb, "tool_path", lambda name: "/bin/true")
+    monkeypatch.setattr(rrfb, "_ensure_query_fasta_indexed",
+                        lambda fa, wd: fa)
+    monkeypatch.setattr(rrfb, "_extract_query_window",
+                        lambda fa, contig, pos, end, flank: ("A" * 200, max(1, pos - flank), flank + 1))
+    # Pretend the junction fasta build wrote one record per call.
+    def fake_build(calls_arg, _query, out_fa, _flank):
+        with out_fa.open("w") as out:
+            mapping = {}
+            for idx, c in enumerate(calls_arg):
+                name = rrfb._refree_record_name(idx, "a")
+                out.write(f">{name}\n{'A' * 200}\n")
+                mapping[idx] = [(name, 100)]
+        return mapping
+    monkeypatch.setattr(rrfb, "_build_junction_window_fasta", fake_build)
+    bam_path = tmp_path / "fake.sorted.bam"
+    bam_path.write_bytes(b"")
+    monkeypatch.setattr(rrfb, "_align_reads_to_junction_fasta",
+                        lambda jf, rp, bp, **kw: bam_path)
+    # Force the BAM-contig check inside validate_calls_reference_free to see
+    # every call's window as present.
+    monkeypatch.setattr(rrfb.subprocess, "run",
+                        lambda *a, **k: type("R", (), {"stdout":
+                            "\n".join(
+                                f"@SQ\tSN:{rrfb._refree_record_name(i, 'a')}\tLN:200"
+                                for i in range(len(calls))
+                            ),
+                            "stderr": ""})())
+    # Pretend every breakpoint clears min_support.
+    monkeypatch.setattr(rrfb, "_samtools_count_breakpoint_support",
+                        lambda *a, **k: 5)
+
+    kept, rows = rrfb.validate_calls_reference_free(
+        calls, query_row, raw_reads, tmp_path / "refree",
+        mode="long-reads", threads=1, min_support=2,
+    )
+    assert len(kept) == 4
+    by_svtype = {r["svtype"]: r for r in rows}
+    for svt in ("DEL", "INS", "DUP", "INV"):
+        assert by_svtype[svt]["status"] == "validated"
+        assert by_svtype[svt]["read_validated"] == "yes"
+        assert by_svtype[svt]["support_source"] == "reference_free_junction_kmer_alignment"
+        assert by_svtype[svt]["validation_support"] == 5

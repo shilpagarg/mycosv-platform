@@ -2827,7 +2827,27 @@ struct MultiRefSaCache {
     // benchmark access pattern (consecutive query contigs of one genome route
     // to the same ref set) means even a handful of entries gives a high hit
     // rate.
-    static constexpr size_t kMaxBytes = static_cast<size_t>(2048) * 1024 * 1024;
+    //
+    // Runtime-overridable via MYCOSV_SA_CACHE_MB (default 2048). Read-mode
+    // pangenome passes iterate up to N benchmark refs PER pseudo-contig; with
+    // thousands of pseudo-contigs and a ~455 MB SA per ~35 Mbp genome, a 2 GiB
+    // budget holds only ~4 SAs and thrashes (rebuilding ~all of them every
+    // contig — this was the ~7.6 min/contig wall). Sizing the cache to hold all
+    // benchmark-ref SAs makes per-contig cost a cache hit. Pure cache sizing:
+    // identical calls, just fewer rebuilds; benefits assembly mode too.
+    static size_t max_bytes() {
+        static const size_t v = [] {
+            size_t mb = 2048;
+            if (const char* e = std::getenv("MYCOSV_SA_CACHE_MB"); e && *e) {
+                try {
+                    long long x = std::stoll(e);
+                    if (x > 0) mb = static_cast<size_t>(x);
+                } catch (...) {}
+            }
+            return mb * static_cast<size_t>(1024) * 1024;
+        }();
+        return v;
+    }
 
     static size_t footprint(const SuffixArray& sa) {
         // text (1B) + sa/lcp/isa (4B each) per character.
@@ -2865,7 +2885,7 @@ struct MultiRefSaCache {
                     return entries_.front().sa;
                 }
             }
-            while (!entries_.empty() && totalBytes_ + bytes > kMaxBytes) {
+            while (!entries_.empty() && totalBytes_ + bytes > max_bytes()) {
                 totalBytes_ -= entries_.back().bytes;
                 entries_.pop_back();
             }

@@ -35,7 +35,14 @@
 #   ./submit.full_fungal_panel.sh --panel 165            # smaller panel
 #   ./submit.full_fungal_panel.sh --panel 200 --dry-run  # print commands only
 #
-# Wall-time estimate: ~1.5-2 days with default array concurrency.
+# Wall-time estimate: --panel 200 is comparator-free by default
+# (ARRAY_MYCOSV_ONLY=1), so per-shard cost is MycoSV (seconds) + read-level
+# validation + biology, ~5-15 min/shard. At the multicore_small QOS cap of ~16
+# concurrent tasks (128 CPU / 8 CPU per task), 200 queries finish in ~3-6 h
+# after bootstrap. --panel 165 keeps comparators ON by default (as before).
+# Toggle either panel with ARRAY_MYCOSV_ONLY=0/1; with comparators on each
+# shard adds up to ~4 h (90-min timeout each for minigraph/svim-asm/anchorwave)
+# and the panel runs past a day.
 
 set -euo pipefail
 
@@ -80,7 +87,42 @@ export MIN_ASSEMBLY_LEVEL=contig
 export MYCOSV_BIOLOGY_TOP_N=5000
 
 ARRAY_RANGE="0-$((QUERY_COUNT - 1))"
-ARRAY_CONCURRENCY="${ARRAY_CONCURRENCY:-30}"
+ARRAY_CONCURRENCY="${ARRAY_CONCURRENCY:-60}"
+ARRAY_CPUS="${ARRAY_CPUS:-8}"
+ARRAY_MEM="${ARRAY_MEM:-40G}"
+ARRAY_TIME="${ARRAY_TIME:-23:30:00}"
+ARRAY_PARTITION="${ARRAY_PARTITION:-multicore_small,multicore}"
+ARRAY_RUN_PGGB="${ARRAY_RUN_PGGB:-0}"
+ARRAY_RUN_CACTUS="${ARRAY_RUN_CACTUS:-0}"
+# Comparator-free is scoped to the 200-panel ONLY. That manuscript-grade panel
+# rests on MycoSV graph-native calls + independent read-level validation;
+# minigraph/svim-asm/anchorwave each carry a 90-min timeout and were the
+# dominant per-shard wall-time cost over 200 queries, so they are disabled.
+#
+# Every other entry point keeps comparators and runs end-to-end as before:
+#   - --panel 165 (and any future smaller panel) defaults to comparators ON.
+#   - The 5-sample table1/table2 assembly + long-read runs invoke
+#     submit.full_fungal_assembly.sh directly without MYCOSV_ONLY, so the
+#     worker's MYCOSV_ONLY:-0 default leaves their comparator path untouched
+#     (--run-minigraph/svim-asm/anchorwave[/pggb/cactus], sniffles/cutesv/svim).
+#
+# Override either way with ARRAY_MYCOSV_ONLY=0 (force comparators on) or =1
+# (force comparator-free); when unset the panel size picks the default below.
+if [[ -z "${ARRAY_MYCOSV_ONLY:-}" ]]; then
+  if [[ "${PANEL_SIZE}" == "200" ]]; then
+    ARRAY_MYCOSV_ONLY=1
+  else
+    ARRAY_MYCOSV_ONLY=0
+  fi
+fi
+# Cap each assembly query to its N longest contigs. MycoSV's hierarchical
+# assembly caller stalls for hours above a few hundred query contigs, and 85 of
+# the 200 panel queries are fragmented public drafts (up to 181k contigs). The
+# cap keeps every query in the panel as its N-longest-contig subset so the run
+# finishes inside the wall-time budget; well-assembled queries (<=N contigs) are
+# untouched. 0 = original behaviour (process every contig). Override with
+# ARRAY_MAX_QUERY_CONTIGS=<N>.
+ARRAY_MAX_QUERY_CONTIGS="${ARRAY_MAX_QUERY_CONTIGS:-150}"
 KEYWORD_COUNT=$(awk -F',' '{print NF}' <<< "${QUERY_GROUPS}")
 
 JOB_PREFIX="panel${PANEL_SIZE}"
@@ -90,6 +132,10 @@ echo "=== ${JOB_PREFIX} launch ==="
 echo "  out_root:         ${OUT_ROOT}"
 echo "  query_count:      ${QUERY_COUNT}"
 echo "  array_range:      ${ARRAY_RANGE}  (concurrency=${ARRAY_CONCURRENCY})"
+echo "  array_resources:  ${ARRAY_PARTITION}, ${ARRAY_CPUS} CPUs, ${ARRAY_MEM}, ${ARRAY_TIME}"
+echo "  heavy_graphs:     pggb=${ARRAY_RUN_PGGB}, cactus=${ARRAY_RUN_CACTUS}"
+echo "  mycosv_only:      ${ARRAY_MYCOSV_ONLY} (1=no comparators, read-level validation only)"
+echo "  max_query_contigs:${ARRAY_MAX_QUERY_CONTIGS} (keep N longest contigs/query; 0=all)"
 echo "  query_groups:     ${#QUERY_GROUPS} chars, ${KEYWORD_COUNT} keywords"
 echo "  min_assembly_lvl: ${MIN_ASSEMBLY_LEVEL}"
 echo "  biology_top_n:    ${MYCOSV_BIOLOGY_TOP_N}"
@@ -142,19 +188,23 @@ echo "bootstrap_jobid=${BS}"
 # Phase B — N-way array, throttled to ARRAY_CONCURRENCY parallel tasks.
 # SKIP_PREPARE=1 reuses prepared/ from bootstrap; FORCE_RERUN_SHARDS=1
 # starts each shard from scratch (matters when bug fixes change call
-# semantics). Comparator set (minigraph / svim-asm / anchorwave / PGGB /
-# Cactus) is selected by submit.full_fungal_assembly.sh's RUN_PGGB /
-# RUN_CACTUS defaults — both on by default for manuscript-grade coverage.
-ARRAY_OVERRIDES="FORCE_RERUN_SHARDS=1,SKIP_PREPARE=1"
+# semantics). The default catch-up profile keeps the always-on assembly
+# comparators (minigraph / svim-asm / anchorwave) and disables PGGB/Cactus,
+# which were the main wall-time and scheduling pressure for the 200-sample
+# panel. Set ARRAY_RUN_PGGB=1 ARRAY_RUN_CACTUS=1 for a slower, full graph
+# comparator rerun.
+ARRAY_OVERRIDES="FORCE_RERUN_SHARDS=1,SKIP_PREPARE=1,RUN_PGGB=${ARRAY_RUN_PGGB},RUN_CACTUS=${ARRAY_RUN_CACTUS},MYCOSV_ONLY=${ARRAY_MYCOSV_ONLY},MAX_ASSEMBLY_QUERY_CONTIGS_KEEP=${ARRAY_MAX_QUERY_CONTIGS}"
 AR=$(submit \
   --dependency=afterok:${BS} \
+  --job-name="${JOB_PREFIX}-array" \
+  -p "${ARRAY_PARTITION}" -c "${ARRAY_CPUS}" --mem="${ARRAY_MEM}" --time="${ARRAY_TIME}" \
   --array=${ARRAY_RANGE}%${ARRAY_CONCURRENCY} \
   --export=ALL,${ARRAY_OVERRIDES} \
   submit.full_fungal_assembly.sh)
 echo "array_jobid=${AR}"
 
 # Phase C — combine all shards into combined/ + master reports.
-COMBINE_OVERRIDES="FULL_ASSEMBLY_SHARDS=1,RESUME_SHARDS=1,SKIP_PREPARE=1"
+COMBINE_OVERRIDES="FULL_ASSEMBLY_SHARDS=1,RESUME_SHARDS=1,SKIP_PREPARE=1,MYCOSV_ONLY=${ARRAY_MYCOSV_ONLY},MAX_ASSEMBLY_QUERY_CONTIGS_KEEP=${ARRAY_MAX_QUERY_CONTIGS}"
 CB=$(submit \
   --dependency=afterany:${AR} \
   --job-name="${JOB_PREFIX}-combine" \

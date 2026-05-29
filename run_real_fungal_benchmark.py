@@ -1149,14 +1149,37 @@ def subset_fastq_records(src: Path, dest: Path, max_records: int) -> tuple[Path,
     tmp = dest.with_suffix(dest.suffix + ".part")
     try:
         with tmp.open("w", encoding="utf-8") as out_fh:
-            for header, seq, plus, qual in _fastq_record_iter(src):
-                if count >= max_records:
+            record_iter = _fastq_record_iter(src)
+            while count < max_records:
+                try:
+                    header, seq, plus, qual = next(record_iter)
+                except StopIteration:
+                    break
+                except (EOFError, OSError, gzip.BadGzipFile) as exc:
+                    # ENA bulk downloads are intentionally capped at
+                    # READ_VALIDATION_MAX_BASES and frequently end mid-record
+                    # without the gzip EOF marker. Keep the complete records
+                    # decoded so far rather than discarding the whole subset:
+                    # the previous behaviour re-raised here, the caller fell
+                    # back to the raw truncated .gz, and no read_subsets/*.fastq
+                    # was materialised -- which silently disabled reference-free
+                    # validation (and thus the pangenome-only call layer) for
+                    # every sample whose download truncated before max_records.
+                    sys.stderr.write(
+                        f"[reads-mode] {src.name}: input truncated after "
+                        f"{count} complete record(s) ({type(exc).__name__}); "
+                        f"keeping records read so far\n"
+                    )
                     break
                 out_fh.write(header)
                 out_fh.write(seq)
                 out_fh.write(plus)
                 out_fh.write(qual)
                 count += 1
+        if count == 0:
+            if tmp.exists():
+                tmp.unlink()
+            return src, 0, False
         tmp.rename(dest)
     except Exception:
         if tmp.exists():
@@ -1354,6 +1377,101 @@ def filter_assembly_query_inputs(
             f"assembly query(s); kept {len(kept)}. Details: {skipped_path}\n"
         )
     return kept
+
+
+def truncate_assembly_query_inputs(
+    query_manifest: list[dict[str, str]],
+    out_dir: Path,
+    keep_largest: int,
+) -> list[dict[str, str]]:
+    """Cap each assembly query to its `keep_largest` longest contigs.
+
+    MycoSV's hierarchical assembly caller scales with the *number* of query
+    contigs: empirically a query with <=~150 contigs finishes in minutes while
+    fragmented drafts (2.7k-180k contigs) stall for hours producing only a
+    trickle of calls. Rather than skip those queries (which drops them from
+    the panel — see filter_assembly_query_inputs) or let them hang, we
+    materialise a subset FASTA holding only the N longest contigs and point
+    MycoSV + read-validation at it. Large/whole-chromosome contigs are cheap,
+    so keeping the longest ones preserves essentially all reliably-callable SV
+    signal; the dropped short contigs carry little. Queries already at or below
+    the cap are left untouched (no rewrite). Truncations are logged to
+    TRUNCATED_ASSEMBLY_QUERIES.tsv so reviewers can see exactly what was kept.
+    """
+    if keep_largest <= 0:
+        return query_manifest
+    trunc_dir = out_dir / "truncated_queries"
+    truncated_rows: list[dict[str, str]] = []
+    for row in query_manifest:
+        query_path = locate_query_path(row)
+        n_contigs, _total, _longest = _fasta_stats(query_path)
+        if n_contigs <= keep_largest:
+            continue
+        records: list[tuple[int, str, str]] = []  # (length, header_line, seq)
+        opener = gzip.open if str(query_path).endswith(".gz") else open
+        try:
+            with opener(query_path, "rt", encoding="utf-8", errors="replace") as fh:
+                header: str | None = None
+                seq_parts: list[str] = []
+                for line in fh:
+                    if line.startswith(">"):
+                        if header is not None:
+                            seq = "".join(seq_parts)
+                            records.append((len(seq), header, seq))
+                        header = line.rstrip("\n")
+                        seq_parts = []
+                    else:
+                        seq_parts.append(line.strip())
+                if header is not None:
+                    seq = "".join(seq_parts)
+                    records.append((len(seq), header, seq))
+        except OSError:
+            continue
+        if not records:
+            continue
+        records.sort(key=lambda r: r[0], reverse=True)
+        kept = records[:keep_largest]
+        trunc_dir.mkdir(parents=True, exist_ok=True)
+        query_asm = row.get("query_asm") or query_path.stem
+        out_fa = trunc_dir / f"{query_asm}.top{keep_largest}.fna"
+        with out_fa.open("w", encoding="utf-8") as ofh:
+            for _len, hdr, seq in kept:
+                ofh.write(hdr + "\n")
+                for i in range(0, len(seq), 80):
+                    ofh.write(seq[i:i + 80] + "\n")
+        kept_bp = sum(r[0] for r in kept)
+        total_bp = sum(r[0] for r in records)
+        truncated_rows.append({
+            "query_asm": query_asm,
+            "original_path": str(query_path),
+            "truncated_path": str(out_fa),
+            "original_contigs": str(n_contigs),
+            "kept_contigs": str(len(kept)),
+            "kept_bp": str(kept_bp),
+            "total_bp": str(total_bp),
+            "kept_bp_fraction": f"{(kept_bp / total_bp if total_bp else 0.0):.4f}",
+            "shortest_kept_bp": str(kept[-1][0]),
+        })
+        # Re-point both the MycoSV input and the generic path at the subset so
+        # read-validation aligns reads to the same (truncated) assembly the
+        # calls were made against.
+        row["path"] = str(out_fa)
+        if row.get("mycosv_path"):
+            row["mycosv_path"] = str(out_fa)
+    if truncated_rows:
+        write_tsv(
+            out_dir / "TRUNCATED_ASSEMBLY_QUERIES.tsv",
+            truncated_rows,
+            ["query_asm", "original_path", "truncated_path", "original_contigs",
+             "kept_contigs", "kept_bp", "total_bp", "kept_bp_fraction",
+             "shortest_kept_bp"],
+        )
+        sys.stderr.write(
+            f"[assembly-truncate] capped {len(truncated_rows)} oversized query(s) "
+            f"to the {keep_largest} longest contigs each; details in "
+            f"{out_dir / 'TRUNCATED_ASSEMBLY_QUERIES.tsv'}\n"
+        )
+    return query_manifest
 
 
 _FASTA_CONTIG_CACHE: dict[str, frozenset[str]] = {}
@@ -2492,6 +2610,17 @@ _FUNGALTRAITS_URL = (
     "funtothefun.csv"
 )
 
+# FunGuild data is already embedded inside the cached FungalTraits long-form
+# CSV as the `trait_name=guild_fg` rows (1,116 species at the time of writing,
+# values like "Ectomycorrhizal", "Plant Pathogen-Wood Saprotroph", "Endophyte").
+# An earlier version of this fetcher pulled funguild_db.json from the
+# UMNFuN/FUNGuild GitHub repo, but that repo was removed in 2025 and every
+# known mirror now 404s. So we read FunGuild's contribution out of the
+# already-cached FungalTraits CSV — no extra HTTP fetch needed. Keeping the
+# constant as None makes the fetch a graceful no-op.
+_FUNGUILD_URL = None  # disabled: upstream removed; data is sourced from
+                      # FungalTraits CSV's guild_fg trait_name rows instead.
+
 
 def fetch_fungaltraits_table(cache_dir: Path) -> Path | None:
     """Download the FungalTraits genus-level lifestyle/trait CSV once and
@@ -2514,10 +2643,21 @@ def fetch_fungaltraits_table(cache_dir: Path) -> Path | None:
     return cached
 
 
+def fetch_funguild_table(cache_dir: Path) -> Path | None:
+    """No-op: FunGuild's upstream repo (UMNFuN/FUNGuild) was removed in 2025
+    and every known JSON mirror 404s. FunGuild's content is already merged
+    into the FungalTraits long-form CSV as the ``guild_fg`` trait_name rows,
+    which we now read directly. Kept as a function so call sites stay
+    compatible.
+    """
+    return None
+
+
 def write_ecological_summary_tsv(
     fungaltraits_csv: Path | None,
     species_to_query_asms: dict[str, list[str]],
     out_path: Path,
+    funguild_json: Path | None = None,  # accepted for back-compat; ignored
 ) -> int:
     """Project the cached FungalTraits CSV onto every panel species, writing
     a flat TSV the visualization report and biology analyzer can join on.
@@ -2570,28 +2710,27 @@ def write_ecological_summary_tsv(
             by_genus.setdefault(genus, {}).update({k: v for k, v in record.items() if v})
         if species:
             by_species.setdefault(species, {}).update({k: v for k, v in record.items() if v})
+    # FunGuild data is folded into FungalTraits as the guild_fg trait_name
+    # (1,116 species at time of writing). The pivot logic above stores it as
+    # record["guild_fg"]. Expose it as the `guild` column — FunGuild's
+    # primary semantic field.
+
     rows: list[dict[str, Any]] = []
+    species_hit = 0
+    species_miss = 0
+    with_guild = 0
     for species, qasms in species_to_query_asms.items():
         species_low = species.strip().lower()
         genus_low = species_low.split(" ")[0] if species_low else ""
         record = by_species.get(species_low) or by_genus.get(genus_low) or {}
         if not record:
+            species_miss += 1
             continue
+        species_hit += 1
         primary_lifestyle = (
             record.get("primary_lifestyle")
             or record.get("Primary_lifestyle")
             or record.get("PRIMARY_LIFESTYLE")
-            or "."
-        )
-        secondary_lifestyle = (
-            record.get("Secondary_lifestyle")
-            or record.get("secondary_lifestyle")
-            or "."
-        )
-        substrate = (
-            record.get("Plant_pathogenic_capacity_template")
-            or record.get("Substrate")
-            or record.get("substrate")
             or "."
         )
         trophic_mode = (
@@ -2599,22 +2738,48 @@ def write_ecological_summary_tsv(
             or record.get("trophic_mode")
             or "."
         )
+        # FunGuild guild — embedded in FungalTraits' long-form export as
+        # trait_name=guild_fg. The pivot stored it as record["guild_fg"].
+        guild = (
+            record.get("guild_fg")
+            or record.get("Guild")
+            or record.get("guild")
+            or "."
+        )
+        if guild != ".":
+            with_guild += 1
         for qasm in qasms:
             rows.append({
                 "query_asm": qasm,
                 "species": species,
                 "primary_lifestyle": primary_lifestyle,
-                "secondary_lifestyle": secondary_lifestyle,
+                "guild": guild,
                 "trophic_mode": trophic_mode,
-                "substrate_or_host": substrate,
+                "source": "fungaltraits",  # only source available right now
             })
     if not rows:
         return 0
+    # Schema rationale:
+    #   * Dropped `secondary_lifestyle` (long-form FungalTraits export no
+    #     longer carries that trait_name).
+    #   * Dropped `substrate_or_host` (the `substrate` trait_name has empty
+    #     values in the current FungalTraits export).
+    #   * Added `guild` from guild_fg — FunGuild's contribution to the merged
+    #     trait table. Downstream consumers (analyze_new_biology_candidates.py,
+    #     sv_visualization_report.py) read trait fields with .get() so the
+    #     schema shift is backward-compatible.
+    #   * `source` records the trait DB; useful when we re-enable a working
+    #     FunGuild mirror as a secondary fetch.
     write_tsv(
         out_path,
         rows,
-        ["query_asm", "species", "primary_lifestyle", "secondary_lifestyle",
-         "trophic_mode", "substrate_or_host"],
+        ["query_asm", "species", "primary_lifestyle", "guild",
+         "trophic_mode", "source"],
+    )
+    sys.stderr.write(
+        f"[traits] joined {len(rows)} rows across {species_hit} species "
+        f"({species_miss} species with no trait record); "
+        f"{with_guild} species also have a FunGuild guild label\n"
     )
     return len(rows)
 
@@ -2647,8 +2812,16 @@ def parse_custom_url_manifest(path: Path) -> list[dict[str, str]]:
 
 def write_tsv(path: Path, rows: list[dict[str, Any]], fieldnames: list[str]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+    # lineterminator="\n": csv.DictWriter defaults to "\r\n" on every platform.
+    # CRLF in TSVs silently breaks downstream consumers that don't strip \r —
+    # documented bug-5 in fungi_tol_bridge.hpp (clade_manifest.tsv) and just
+    # observed in ecological_traits.tsv (last column always looked like ".\r"
+    # instead of ".", so substrate_or_host appeared 100% populated when it was
+    # 0% populated). Force LF for every TSV we emit.
     with path.open("w", newline="", encoding="utf-8") as fh:
-        writer = csv.DictWriter(fh, fieldnames=fieldnames, delimiter="\t")
+        writer = csv.DictWriter(
+            fh, fieldnames=fieldnames, delimiter="\t", lineterminator="\n"
+        )
         writer.writeheader()
         writer.writerows(rows)
 
@@ -3824,6 +3997,7 @@ def prepare_from_ncbi(args: argparse.Namespace) -> int:
                 f"-> {expression_atlas_cache}"
             )
     fungaltraits_csv = fetch_fungaltraits_table(cache_base)
+    funguild_json = fetch_funguild_table(cache_base)
     refs_dir = cache_base / "refs"
     queries_dir = cache_base / "queries"
     refs_dir.mkdir(parents=True, exist_ok=True)
@@ -4270,6 +4444,7 @@ def prepare_from_ncbi(args: argparse.Namespace) -> int:
             fungaltraits_csv,
             species_to_query_asms,
             out_dir / "ecological_traits.tsv",
+            funguild_json=funguild_json,
         )
         if ecological_rows_written:
             sys.stderr.write(
@@ -6698,47 +6873,103 @@ def validate_calls_with_reads(
     for call in truth_calls:
         intrinsic = internal_support(call)
         mode = (query_row.get("query_mode") or "assembly").lower()
-        # MycoSV's C++ pipeline already clusters at SUPPORT>=2; any call with
-        # a usable intrinsic count is "raw-data confirmed" by construction.
-        # Re-aligning short-read kmer/long-read cluster calls to a single
-        # benchmark_ref BAM and re-counting split reads loses ~50% of them
-        # purely because:
-        #   (a) the call lives on a sibling clade the BAM never indexed, or
-        #   (b) short-read assembly anchors land on a synthetic sr_unitig
-        #       contig that the BAM does not contain.
-        # Trust the intrinsic count, but still record the external split-read
-        # count when available (for diagnostic value in the TSV).
-        # force_external skips this shortcut entirely — see docstring.
+        # MycoSV intrinsic-trust shortcut, BAM-first variant.
+        #
+        # The original shortcut auto-marked every MycoSV call with
+        # `intrinsic >= min_support` as `validated=True` without consulting
+        # the BAM. With the current C++ binary emitting intrinsic counts on
+        # essentially every call, the shortcut fired ~100% of the time and
+        # MycoSV's "read-validation rate" became a tautology (≈ fraction of
+        # calls passing the C++ clustering threshold, which is ≈ 100% by
+        # construction). Comparators don't get the shortcut, so the panel
+        # comparison was structurally biased in MycoSV's favor.
+        #
+        # New behavior (Option A from the manuscript-fix audit):
+        #   * If the BAM has the call's contig → run the external split-read
+        #     check exactly like comparators. The intrinsic count is recorded
+        #     for diagnostics but does NOT override a failed external check.
+        #     A call that fails the BAM check is marked
+        #     `status="not_validated_externally"`, `validated=False`.
+        #   * If the BAM does NOT have the contig (sibling-clade routing,
+        #     short-read sr_unitig synthesis), the shortcut still fires:
+        #     mark `status="validated_intrinsic_no_bam"`, `validated=True`.
+        #     This preserves the original intent of not losing ~50% of
+        #     MycoSV calls to BAM contig misses.
+        #   * Query-coord assembly-mode calls keep the
+        #     "query_space_not_reference_validated" status — they're truly
+        #     off-reference and can't be BAM-checked.
         if (not force_external
                 and call.source == "mycosv"
                 and intrinsic is not None and intrinsic >= min_support):
             contig = call.ref_contig if call.coord_space == "reference" and call.ref_contig not in {"", "."} else call.query_contig
-            ext_support: int | None
-            if mode == "assembly" and call.coord_space == "query":
-                ext_support = None
-            elif bam_contigs and contig not in bam_contigs:
-                ext_support = None  # sibling clade contig — would always read 0
-            else:
-                ext_support = count_support(
-                    contig, call.pos, call.end,
-                    svtype=call.svtype, svlen=call.svlen,
-                    flank=effective_flank(call), min_clip=30,
-                )
-            status_label = (
-                "query_space_not_reference_validated"
-                if mode == "assembly" and call.coord_space == "query"
-                else ("validated_intrinsic" if call.coord_space == "query" else "validated")
+            # PanSN strip for vg/PGGB-style names (kept consistent with the
+            # external-validation path below).
+            if bam_contigs and contig not in bam_contigs and "#" in contig:
+                stripped = contig.rsplit("#", 1)[-1]
+                if stripped in bam_contigs:
+                    contig = stripped
+
+            bam_has_contig = bool(bam_contigs) and contig in bam_contigs
+            query_offref = (mode == "assembly" and call.coord_space == "query")
+
+            if query_offref:
+                # Off-reference query-coord call: no BAM lookup possible.
+                # Keep the historical status + validated=True.
+                rows.append(support_row(
+                    call,
+                    intrinsic=intrinsic,
+                    validation_support=None,
+                    validated=True,
+                    status="query_space_not_reference_validated",
+                ))
+                kept.append(call)
+                continue
+
+            if not bam_has_contig:
+                # Sibling-clade contig the BAM was never indexed against —
+                # external check would always read 0. Fall back to the
+                # intrinsic shortcut, but use a distinct status label so the
+                # aggregator can audit how many calls relied on it.
+                rows.append(support_row(
+                    call,
+                    intrinsic=intrinsic,
+                    validation_support=None,
+                    validated=True,
+                    status="validated_intrinsic_no_bam",
+                ))
+                kept.append(call)
+                continue
+
+            # Apples-to-apples external check.
+            ext_support = count_support(
+                contig, call.pos, call.end,
+                svtype=call.svtype, svlen=call.svlen,
+                flank=effective_flank(call), min_clip=30,
             )
+            ext_validated = ext_support is not None and ext_support >= min_support
             rows.append(support_row(
                 call,
                 intrinsic=intrinsic,
                 validation_support=ext_support,
-                validated=True,
-                status=status_label,
+                validated=ext_validated,
+                status="validated" if ext_validated else "not_validated_externally",
             ))
-            kept.append(call)
+            if ext_validated:
+                kept.append(call)
             continue
         contig = call.ref_contig if call.coord_space == "reference" and call.ref_contig not in {"", "."} else call.query_contig
+        # PanSN naming fallback: PGGB / cactus-pangenome / vg-style callsets
+        # report calls against `<sample>#<haplotype>#<contig>` (e.g.
+        # `ref#1#CM146571.1`). The read-validation BAM is indexed by the
+        # bare reference contig (`CM146571.1`), so the absence check would
+        # fire for every PGGB call and mark them all
+        # `contig_absent_from_validation_bam` → read_validated=unknown.
+        # Strip the PanSN prefix and retry the lookup before declaring
+        # the contig absent.
+        if bam_contigs and contig not in bam_contigs and "#" in contig:
+            stripped = contig.rsplit("#", 1)[-1]
+            if stripped in bam_contigs:
+                contig = stripped
         if bam_contigs and contig not in bam_contigs:
             # Distinguish "external validation impossible" from
             # "external validation failed" so the TSV stays interpretable.
@@ -6785,6 +7016,363 @@ def validate_calls_with_reads(
             call,
             intrinsic=intrinsic,
             validation_support=validation_support,
+            validated=validated,
+            status="validated" if validated else "not_validated",
+        ))
+        if validated:
+            kept.append(call)
+    return kept, rows
+
+
+# ============================================================================
+# Reference-free read-level validation.
+#
+# validate_calls_with_reads (above) aligns raw reads to the held-out
+# benchmark reference. That structurally cannot validate pangenome-only
+# events (the breakpoint sits on a contig the benchmark ref does not have)
+# and biases the read-validation rate against MycoSV's pangenome-specific
+# calls. The function below removes the benchmark ref from the loop entirely:
+# it derives one synthetic "junction window" per call from the QUERY
+# ASSEMBLY's local sequence at the breakpoint, aligns raw reads (long-reads
+# preferred, short-reads supported) to that mini-fasta with minimap2, and
+# counts split/clip-supporting reads at the breakpoint position inside each
+# window. Works for every SV type MycoSV emits — DEL/INS/DUP/INV use one
+# window per call, TRA uses two (one per breakend, validated iff either
+# side has >= min_support).
+# ============================================================================
+
+
+def _extract_query_window(
+    query_fasta: Path,
+    contig: str,
+    pos: int,
+    end: int,
+    flank_bp: int,
+) -> tuple[str, int, int] | None:
+    """Return (window_seq, window_start_1based, breakpoint_offset_1based) for
+    a `flank_bp`-padded slice around the call breakpoint, or None if samtools
+    refuses the region (contig absent, pos out of range, etc.).
+    """
+    if not tool_path("samtools"):
+        return None
+    win_start = max(1, pos - flank_bp)
+    win_end = max(win_start, end + flank_bp)
+    region = f"{contig}:{win_start}-{win_end}"
+    try:
+        proc = subprocess.run(
+            ["samtools", "faidx", str(query_fasta), region],
+            text=True, capture_output=True, check=True,
+            timeout=_TOOL_TIMEOUT,
+        )
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
+        return None
+    seq_lines = [
+        ln for ln in proc.stdout.splitlines()
+        if ln and not ln.startswith(">")
+    ]
+    seq = "".join(seq_lines).strip()
+    if not seq:
+        return None
+    # Breakpoint offset within the window, 1-based — used as the "pos" we
+    # ask _samtools_count_breakpoint_support to scan around.
+    bp_offset = max(1, pos - win_start + 1)
+    return seq, win_start, bp_offset
+
+
+def _ensure_query_fasta_indexed(query_fasta: Path, work_dir: Path) -> Path | None:
+    """Return a plain-text, samtools-faidx'd copy of the query assembly so
+    `samtools faidx <query> <region>` works (gzipped FASTA without a .gzi
+    companion is rejected). The query is read-only; the indexed copy lives
+    in work_dir."""
+    if not tool_path("samtools"):
+        return None
+    work_dir.mkdir(parents=True, exist_ok=True)
+    plain = _ensure_plain_fasta(query_fasta, work_dir)
+    if plain is None:
+        return None
+    fai = plain.with_suffix(plain.suffix + ".fai")
+    if not fai.exists():
+        try:
+            run(["samtools", "faidx", str(plain)], cwd=ROOT,
+                timeout=_TOOL_TIMEOUT)
+        except subprocess.CalledProcessError:
+            return None
+    return plain
+
+
+def _refree_record_name(idx: int, suffix: str) -> str:
+    """Junction-fasta record name. Bare ASCII, no whitespace, so minimap2 /
+    samtools handle it without quoting; idx makes it unique per call and
+    suffix ("a"/"b") distinguishes TRA breakends."""
+    return f"call{idx:08d}{suffix}"
+
+
+def _build_junction_window_fasta(
+    calls: list[NormalizedCall],
+    query_fasta_plain: Path,
+    out_fasta: Path,
+    flank_bp: int,
+) -> dict[int, list[tuple[str, int]]]:
+    """Write one junction window per call (two for TRA) to `out_fasta`.
+
+    Returns {call_idx: [(record_name, breakpoint_offset_1based), ...]} so
+    the caller can map each window's support count back to its call. Calls
+    without a usable window (contig absent in assembly, region fetch
+    failed) are omitted from the map.
+    """
+    mapping: dict[int, list[tuple[str, int]]] = {}
+    written = 0
+    with out_fasta.open("w") as out:
+        for idx, call in enumerate(calls):
+            # Always use the query-coord contig — this validator is reference-
+            # free, so reference-coord MycoSV calls are routed through their
+            # paired query_contig field instead.
+            contig = call.query_contig
+            if contig in {"", "."}:
+                continue
+            primary = _extract_query_window(
+                query_fasta_plain, contig, call.pos, call.end, flank_bp,
+            )
+            if primary is None:
+                continue
+            seq, _win_start, bp_off = primary
+            name = _refree_record_name(idx, "a")
+            out.write(f">{name}\n{seq}\n")
+            entries = [(name, bp_off)]
+            # TRA: emit a second window at the mate breakend so a call with
+            # only one valid endpoint (e.g. mate on a fragmented contig) can
+            # still be validated by the surviving side.
+            if call.svtype == "TRA" and _has_mate(call):
+                mate_pos = max(1, call.mate_pos)
+                mate_end = max(mate_pos, call.mate_end or mate_pos)
+                mate = _extract_query_window(
+                    query_fasta_plain, call.mate_contig,
+                    mate_pos, mate_end, flank_bp,
+                )
+                if mate is not None:
+                    mate_seq, _mate_win_start, mate_bp_off = mate
+                    mate_name = _refree_record_name(idx, "b")
+                    out.write(f">{mate_name}\n{mate_seq}\n")
+                    entries.append((mate_name, mate_bp_off))
+            mapping[idx] = entries
+            written += 1
+    if written == 0:
+        # Empty fasta is useless downstream; clean up so the caller knows.
+        try:
+            out_fasta.unlink()
+        except OSError:
+            pass
+        return {}
+    # Index the junction fasta so the BAM build has the matching .fai.
+    try:
+        run(["samtools", "faidx", str(out_fasta)], cwd=ROOT,
+            timeout=_TOOL_TIMEOUT)
+    except subprocess.CalledProcessError:
+        return mapping  # alignment may still proceed without the .fai
+    return mapping
+
+
+def _align_reads_to_junction_fasta(
+    junction_fasta: Path,
+    reads_path: Path,
+    bam_path: Path,
+    *,
+    preset: str,
+    threads: int,
+) -> Path | None:
+    """minimap2 reads -> junction fasta -> sorted+indexed BAM. preset selects
+    map-hifi / map-pb / map-ont for long reads or `sr` for short reads."""
+    if not tool_path("minimap2") or not tool_path("samtools"):
+        return None
+    if not junction_fasta.exists() or junction_fasta.stat().st_size == 0:
+        return None
+    sam_path = bam_path.with_suffix(".sam")
+    try:
+        with sam_path.open("wb") as sam_out:
+            subprocess.run(
+                ["minimap2", "-ax", preset, "-t", str(threads),
+                 str(junction_fasta), str(reads_path)],
+                stdout=sam_out, stderr=subprocess.PIPE, check=True,
+                timeout=_COMPARATOR_TIMEOUT,
+            )
+        run(["samtools", "sort", "-@", str(threads), "-o", str(bam_path),
+             str(sam_path)], cwd=ROOT, timeout=_COMPARATOR_TIMEOUT)
+        run(["samtools", "index", str(bam_path)], cwd=ROOT,
+            timeout=_COMPARATOR_TIMEOUT)
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
+        return None
+    finally:
+        try:
+            sam_path.unlink()
+        except OSError:
+            pass
+    return bam_path
+
+
+def _refree_preset_for_mode(mode: str, query_row: dict[str, str]) -> str:
+    """Pick a minimap2 preset for the raw reads. Long-read is preferred and
+    auto-routed via the existing _long_read_preset (HiFi vs ONT vs CLR);
+    short-read falls back to `sr`."""
+    norm = (mode or "").lower()
+    if norm in {"long-reads", "long_reads", "long"}:
+        return _long_read_preset(query_row)
+    return "sr"
+
+
+def validate_calls_reference_free(
+    calls: list[NormalizedCall],
+    query_row: dict[str, str],
+    raw_reads_path: Path,
+    work_dir: Path,
+    *,
+    mode: str,
+    threads: int,
+    min_support: int,
+    flank_bp: int = 300,
+    min_clip: int = 30,
+) -> tuple[list[NormalizedCall], list[dict[str, Any]]]:
+    """Reference-free read-level validation of MycoSV SVs.
+
+    Workflow:
+      1. Build a junction-window fasta from the QUERY ASSEMBLY at each
+         call's breakpoint(s). The benchmark reference is never consulted,
+         so off-reference / pangenome-only events are first-class citizens.
+      2. minimap2 raw reads -> junction fasta. Long-reads (HiFi/ONT/CLR)
+         routed via _long_read_preset; short-reads use `sr`.
+      3. Per call: count split/clip reads spanning the breakpoint position
+         within its window (reused from _samtools_count_breakpoint_support).
+         TRA passes if either breakend window clears min_support.
+
+    Returns (validated_calls, per_call_rows). per_call_rows is the same
+    shape as validate_calls_with_reads's so the panel aggregator and the
+    on-disk TSV can ingest both validators interchangeably.
+    """
+    rows: list[dict[str, Any]] = []
+    query_asm = query_row.get("query_asm", ".")
+
+    def make_row(
+        call: NormalizedCall,
+        *,
+        support: int | None,
+        validated: bool | None,
+        status: str,
+    ) -> dict[str, Any]:
+        return {
+            "query_asm": query_asm,
+            "ref_contig": call.query_contig,  # validation lives in query coords
+            "pos": call.pos,
+            "end": call.end,
+            "svtype": call.svtype,
+            "source": call.source,
+            "coord_space": "query",
+            "read_support": call.read_support if call.read_support is not None else -1,
+            "validation_support": support if support is not None else -1,
+            "support_source": "reference_free_junction_kmer_alignment",
+            "read_validated": "yes" if validated else ("unknown" if validated is None else "no"),
+            "status": status,
+        }
+
+    if not calls:
+        return [], rows
+    if not tool_path("minimap2") or not tool_path("samtools"):
+        for call in calls:
+            rows.append(make_row(call, support=None, validated=None,
+                                 status="tools_unavailable"))
+        return [], rows
+    if not raw_reads_path.exists():
+        for call in calls:
+            rows.append(make_row(call, support=None, validated=None,
+                                 status="raw_reads_unavailable"))
+        return [], rows
+
+    work_dir.mkdir(parents=True, exist_ok=True)
+    query_fasta = locate_query_path(query_row)
+    if not query_fasta.exists():
+        for call in calls:
+            rows.append(make_row(call, support=None, validated=None,
+                                 status="query_assembly_unavailable"))
+        return [], rows
+    query_fasta_plain = _ensure_query_fasta_indexed(query_fasta, work_dir)
+    if query_fasta_plain is None:
+        for call in calls:
+            rows.append(make_row(call, support=None, validated=None,
+                                 status="query_assembly_index_failed"))
+        return [], rows
+
+    junction_fasta = work_dir / "junction_windows.fa"
+    mapping = _build_junction_window_fasta(
+        calls, query_fasta_plain, junction_fasta, flank_bp,
+    )
+    if not mapping:
+        for call in calls:
+            rows.append(make_row(call, support=None, validated=None,
+                                 status="no_junction_windows_extractable"))
+        return [], rows
+
+    preset = _refree_preset_for_mode(mode, query_row)
+    bam_path = work_dir / "reads_vs_junctions.sorted.bam"
+    aligned = _align_reads_to_junction_fasta(
+        junction_fasta, raw_reads_path, bam_path,
+        preset=preset, threads=threads,
+    )
+    if aligned is None:
+        for call in calls:
+            rows.append(make_row(call, support=None, validated=None,
+                                 status="minimap2_alignment_failed"))
+        return [], rows
+
+    # _samtools_count_breakpoint_support's contig set is bounded to the
+    # junction fasta's records; pull it once so we can short-circuit if a
+    # window was dropped between mapping-build and BAM-header read.
+    bam_contigs: frozenset[str] = frozenset()
+    try:
+        hdr = subprocess.run(
+            ["samtools", "view", "-H", str(aligned)],
+            text=True, capture_output=True, check=True, timeout=_TOOL_TIMEOUT,
+        )
+        bam_contigs = frozenset(
+            ln.split("\t")[1][3:]
+            for ln in hdr.stdout.splitlines()
+            if ln.startswith("@SQ\t")
+            and len(ln.split("\t")) >= 2
+            and ln.split("\t")[1].startswith("SN:")
+        )
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
+        bam_contigs = frozenset()
+
+    kept: list[NormalizedCall] = []
+    for idx, call in enumerate(calls):
+        entries = mapping.get(idx)
+        if not entries:
+            rows.append(make_row(call, support=None, validated=None,
+                                 status="window_extraction_failed"))
+            continue
+        # Per-type SV-length context lets _cigar_indel_supports_call match
+        # I/D/N events that fall inside the window without forcing a clip.
+        per_type_tol = DEFAULT_TOL_BP.get(canonical_group(call.svtype), 0)
+        bp_flank = max(flank_bp // 2, per_type_tol // 5) if per_type_tol > 0 else flank_bp // 2
+        best_support = 0
+        any_contig_present = False
+        for record_name, bp_off in entries:
+            if bam_contigs and record_name not in bam_contigs:
+                continue
+            any_contig_present = True
+            support = _samtools_count_breakpoint_support(
+                aligned, record_name,
+                bp_off, bp_off,
+                svtype=call.svtype, svlen=call.svlen,
+                flank_bp=bp_flank, min_clip=min_clip,
+            )
+            if support > best_support:
+                best_support = support
+        if not any_contig_present:
+            rows.append(make_row(call, support=None, validated=None,
+                                 status="window_absent_from_bam"))
+            continue
+        validated = best_support >= min_support
+        rows.append(make_row(
+            call,
+            support=best_support,
             validated=validated,
             status="validated" if validated else "not_validated",
         ))
@@ -7227,8 +7815,36 @@ def compile_binary_if_needed(binary_path: Path, force: bool = False) -> None:
     import fcntl
     lock_path = binary_path.with_suffix(binary_path.suffix + ".lock")
     lock_path.parent.mkdir(parents=True, exist_ok=True)
+    # flock(2) on the bmh01-rds NFS share returns ENOLCK ("No locks available")
+    # under SLURM array contention — the prior panel lost ~half its shards to
+    # exactly this when the binary looked stale (a .hpp newer than the binary)
+    # and dozens of tasks raced to lock+rebuild. The submit wrapper prebuilds a
+    # current binary with a NODE-LOCAL lock before the array launches, so a
+    # current binary should already exist here. If the lock cannot be taken,
+    # fall back to using that prebuilt binary rather than crashing the shard.
     with lock_path.open("w") as lock_fh:
-        fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX)
+        try:
+            fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX)
+        except OSError as exc:
+            if binary_path.exists() and not _needs_build():
+                sys.stderr.write(
+                    f"[compile] flock unavailable ({exc}); using existing "
+                    f"up-to-date binary at {binary_path}\n"
+                )
+                return
+            if binary_path.exists():
+                sys.stderr.write(
+                    f"[compile] WARNING: flock unavailable ({exc}) and binary "
+                    f"looks stale; proceeding with existing {binary_path} "
+                    f"rather than racing a rebuild. Prebuild it via the submit "
+                    f"wrapper to pick up source changes.\n"
+                )
+                return
+            raise RuntimeError(
+                f"compile_binary_if_needed: cannot lock {lock_path} ({exc}) and "
+                f"no binary exists at {binary_path}; prebuild it before launching "
+                f"the array (the wrapper's node-local prebuild step)."
+            ) from exc
         # Another process may have built the binary while we were waiting
         # for the lock; recheck before doing work.
         if not _needs_build():
@@ -7380,7 +7996,29 @@ def run_mycosv(
     # with multi-species refs benefit greatly from routing; without it the binary would
     # try to load all refs into a flat graph and produce 0 calls across phyla).
     hierarchy_manifest = prepared_dir / "hierarchy_manifest.tsv"
-    if hierarchy_manifest.exists() and (prepared_dir / "ref_list.txt").stat().st_size > 0:
+    # MYCOSV_FORCE_FLAT_QUERY routes queries straight to the flat ref-list
+    # aligner against the benchmark ref subset, skipping hierarchical routing.
+    # GUARD: read modes only (long-/short-reads). Assembly mode is deliberately
+    # excluded so this can never alter the assembly benchmark -- assembly has few
+    # contigs, where hierarchical routing is cheap and improves cross-phylum
+    # recall. Read modes emit thousands of pseudo-contigs after the minimizer-
+    # clustering fix, which the per-contig hierarchical router cannot process in
+    # feasible time (a 47-contig sample already exhausted the 6h tool timeout),
+    # so they align flat against the conspecific+neighbor benchmark ref subset
+    # and still get the single-reference-vs-pangenome-only comparison.
+    force_flat_query = (
+        mode in {"long-reads", "short-reads"}
+        and ref_list_override is not None
+        and os.environ.get("MYCOSV_FORCE_FLAT_QUERY", "0") == "1"
+    )
+    if force_flat_query:
+        sys.stderr.write(
+            f"[mycosv] MYCOSV_FORCE_FLAT_QUERY=1 (mode={mode}) -> flat alignment "
+            f"against {ref_list_override} (skipping hierarchical routing)\n"
+        )
+    if (not force_flat_query
+            and hierarchy_manifest.exists()
+            and (prepared_dir / "ref_list.txt").stat().st_size > 0):
         # If the caller passed a pre-built index (e.g. from
         # prepare-million-real), point the binary at it directly instead of
         # rebuilding. Saves the multi-hour rebuild on the million-real flow,
@@ -9750,6 +10388,14 @@ def benchmark_real_data(args: argparse.Namespace) -> int:
         mycosv_use_full_reads=getattr(args, "mycosv_use_full_reads", False),
     )
     if args.mode == "assembly":
+        # Truncate oversized/fragmented queries to their N longest contigs
+        # (keeps the query in the panel) BEFORE the skip-filter, so a query
+        # that was only oversized by contig count survives as a bounded subset.
+        query_manifest = truncate_assembly_query_inputs(
+            query_manifest,
+            out_dir,
+            getattr(args, "max_assembly_query_contigs_keep_largest", 0),
+        )
         query_manifest = filter_assembly_query_inputs(
             query_manifest,
             out_dir,
@@ -9846,13 +10492,29 @@ def benchmark_real_data(args: argparse.Namespace) -> int:
     # search genuinely needs related refs for cross-genome SV discovery.
     reads_mode = (getattr(args, "mode", "") or "").lower() in {"long-reads", "short-reads"}
     hierarchy_path = prepared_dir / "hierarchy_manifest.tsv"
-    if reads_mode and bench_refs:
+    # Env-var override for the pangenome long-read column in manuscript table 2:
+    # the conspecific-only behavior below is the safe default (avoids
+    # cross-species call scatter), but to *measure* pangenome-only calls we need
+    # the neighbor walk to run for reads mode too. Set
+    # MYCOSV_BENCH_ALLOW_READS_NEIGHBORS=1 to opt in. The output is intentionally
+    # written to a separate run dir so the single-ref callset on disk is not
+    # overwritten.
+    allow_reads_neighbors = os.environ.get(
+        "MYCOSV_BENCH_ALLOW_READS_NEIGHBORS", "0"
+    ) == "1"
+    if reads_mode and bench_refs and not allow_reads_neighbors:
         sys.stderr.write(
             f"[bench-ref] reads mode ({args.mode}): restricting panel to "
             f"{len(bench_refs)} per-query benchmark ref(s); skipping "
             f"genus/family neighbor expansion to avoid cross-species call scatter\n"
         )
-    if not reads_mode and hierarchy_path.exists() and per_query_taxa:
+    elif reads_mode and allow_reads_neighbors:
+        sys.stderr.write(
+            f"[bench-ref] reads mode ({args.mode}): "
+            f"MYCOSV_BENCH_ALLOW_READS_NEIGHBORS=1 -> enabling "
+            f"genus/family/order/class neighbor expansion (pangenome long-read pass)\n"
+        )
+    if (not reads_mode or allow_reads_neighbors) and hierarchy_path.exists() and per_query_taxa:
         try:
             with hierarchy_path.open(encoding="utf-8") as fh:
                 manifest_rows = list(csv.DictReader(fh, delimiter="\t"))
@@ -10130,6 +10792,12 @@ def benchmark_real_data(args: argparse.Namespace) -> int:
 
     agreement_rows: list[dict[str, Any]] = []
     read_validated_truth_rows: list[dict[str, Any]] = []
+    # Reference-free per-call rows. validate_calls_reference_free aligns raw
+    # reads to a junction-window fasta cut out of the QUERY assembly, not
+    # the benchmark reference, so it can validate pangenome-only / off-ref
+    # MycoSV events that the BAM-anchored path structurally cannot reach.
+    # Written next to read_validated_truth.tsv as read_validated_truth_refree.tsv.
+    read_validated_truth_refree_rows: list[dict[str, Any]] = []
     # Leave-one-out comparator-variance benchmark (fungal-specific).
     # loo_summary_rows is the per-(fold, stratum) flattened TSV;
     # loo_variance_by_query is the per-query aggregate (mean / stdev / swing /
@@ -10148,6 +10816,7 @@ def benchmark_real_data(args: argparse.Namespace) -> int:
     # write_tsv at the end of benchmark() overwrites this with the populated
     # rows when we reach it.
     write_tsv(out_dir / "read_validated_truth.tsv", [], READ_VALIDATION_FIELDS)
+    write_tsv(out_dir / "read_validated_truth_refree.tsv", [], READ_VALIDATION_FIELDS)
     support_by_key: dict[tuple[str, str, int, int, str], list[str]] = defaultdict(list)
     # call_keys of MycoSV preds that passed external read validation, keyed by
     # query_asm. Populated inside the per-query loop and consumed after it to
@@ -10288,13 +10957,23 @@ def benchmark_real_data(args: argparse.Namespace) -> int:
                 mycosv_ref_query_keys_kept,
                 single_ref_all_query_keys,
             ) = deduplicate_projected_reference_calls(paired_keep)
-        single_ref_equivalent_counts[query_asm] = len(mycosv_ref_calls)
         single_ref_equivalent_keys_by_query[query_asm] = single_ref_all_query_keys
         single_ref_equivalent_loci_by_query[query_asm] = {
             pangenome_locus_key(c)
             for c in mycosv_query_calls
             if call_key(c) in single_ref_equivalent_keys_by_query[query_asm]
         }
+        # Count single-reference-equivalent at the query-LOCUS level (not the
+        # post-projection ref-locus level) so the value stays bounded by
+        # `total_loci` and satisfies single_ref + pangenome_only ≤ total_loci.
+        # The earlier `len(mycosv_ref_calls)` was the post-projection ref-locus
+        # count: when a query locus projected to multiple ref loci via the
+        # query→benchmark_ref PAF (added by the coordinate-space-leak fix above),
+        # it got multi-counted, inflating single_ref past total_loci and
+        # collapsing pangenome_lift_pct ~30× across the panel.
+        single_ref_equivalent_counts[query_asm] = len(
+            single_ref_equivalent_loci_by_query[query_asm]
+        )
         # Count OFF_REF events that exist in the query-coord set but are
         # un-matchable (no REFPOS, so they were dropped from the ref-coord set).
         # These are real predictions that the single-reference truth callers
@@ -10872,12 +11551,71 @@ def benchmark_real_data(args: argparse.Namespace) -> int:
                     pred_calls=supported_preds,
                 ))
 
+        # Reference-free read-level validation of MycoSV's own calls. Built
+        # on raw reads (long-reads preferred, short-reads supported) aligned
+        # to a junction-window mini-fasta cut from the QUERY ASSEMBLY — no
+        # benchmark reference is consulted. This lets pangenome-only / off-
+        # reference calls clear the read-validation bar that the BAM-to-
+        # benchmark-ref path structurally rejects, which is the prerequisite
+        # for the manuscript's "60-90 % of MycoSV loci are pangenome-only
+        # AND read-validated" claim. Covers all SV types MycoSV emits
+        # (DEL/INS/DUP/INV/TRA).
+        if (
+            validation_requested
+            and getattr(args, "reference_free_read_validation", True)
+            and mycosv_query_calls
+        ):
+            refree_reads_path: Path | None = None
+            refree_mode = query_mode
+            if raw_validation_row is not None and raw_validation_row.get("path"):
+                refree_reads_path = Path(raw_validation_row["path"])
+                refree_mode = raw_validation_row.get("query_mode") or "long-reads"
+            elif query_mode in {"long-reads", "short-reads"}:
+                candidate = Path(query_row.get("path") or "")
+                if candidate.exists():
+                    refree_reads_path = candidate
+            if refree_reads_path is not None and refree_reads_path.exists():
+                refree_dir = out_dir / "read_validation" / query_asm / "_refree"
+                refree_kept, refree_rows = validate_calls_reference_free(
+                    mycosv_query_calls,
+                    query_row,
+                    refree_reads_path,
+                    refree_dir,
+                    mode=refree_mode,
+                    threads=args.threads,
+                    min_support=args.read_validation_min_support,
+                    flank_bp=max(args.read_validation_flank_bp, 200),
+                )
+                read_validated_truth_refree_rows.extend(refree_rows)
+                # Union with the BAM-anchored validated set so the existing
+                # pangenome-call-layers / novel_mycosv_calls write-out treats
+                # a call as read-supported if EITHER validator confirms it.
+                # Without the union, off-ref calls (which the BAM path skips
+                # with status=contig_absent) would lose their reference-free
+                # validation downstream.
+                for c in refree_kept:
+                    validated_mycosv_keys_by_query[query_asm].add(call_key(c))
+                summary_json["queries"][query_asm].setdefault("read_validation", {})
+                summary_json["queries"][query_asm]["read_validation"][
+                    "reference_free"
+                ] = {
+                    "input_calls": len(mycosv_query_calls),
+                    "read_validated": len(refree_kept),
+                    "raw_reads_path": str(refree_reads_path),
+                    "mode": refree_mode,
+                }
+
         # Flush per-query so a mid-loop SLURM timeout / OOM leaves the TSV
         # populated with whatever was validated so far, instead of just the
         # header placeholder written at line ~6354.
         write_tsv(
             out_dir / "read_validated_truth.tsv",
             read_validated_truth_rows,
+            READ_VALIDATION_FIELDS,
+        )
+        write_tsv(
+            out_dir / "read_validated_truth_refree.tsv",
+            read_validated_truth_refree_rows,
             READ_VALIDATION_FIELDS,
         )
 
@@ -10923,6 +11661,11 @@ def benchmark_real_data(args: argparse.Namespace) -> int:
     write_tsv(
         out_dir / "read_validated_truth.tsv",
         read_validated_truth_rows,
+        READ_VALIDATION_FIELDS,
+    )
+    write_tsv(
+        out_dir / "read_validated_truth_refree.tsv",
+        read_validated_truth_refree_rows,
         READ_VALIDATION_FIELDS,
     )
 
@@ -11838,6 +12581,14 @@ def prepare_million_real(args: argparse.Namespace) -> int:
                 f"continuing without ecological_traits.tsv\n"
             )
             fungaltraits_csv = None
+        try:
+            funguild_json = fetch_funguild_table(cache_dir)
+        except Exception as exc:
+            sys.stderr.write(
+                f"[warn] funguild fetch failed: {type(exc).__name__}: {exc}; "
+                f"continuing with FungalTraits only\n"
+            )
+            funguild_json = None
         species_to_query_asms: dict[str, list[str]] = defaultdict(list)
         for qrow in query_manifest_rows:
             sp = qrow.get("species") or "."
@@ -11847,6 +12598,7 @@ def prepare_million_real(args: argparse.Namespace) -> int:
                 fungaltraits_csv,
                 species_to_query_asms,
                 out_dir / "ecological_traits.tsv",
+                funguild_json=funguild_json,
             )
             if ecological_rows_written:
                 print(
@@ -12433,6 +13185,14 @@ def build_parser() -> argparse.ArgumentParser:
                     help="Skip assembly-mode query FASTAs above this total bp before "
                          "launching MycoSV/comparators. 0 disables the filter "
                          "(default: 0).")
+    sb.add_argument("--max-assembly-query-contigs-keep-largest", type=int, default=0,
+                    help="For assembly-mode queries with more than N contigs, keep "
+                         "ONLY the N longest contigs (materialised as a subset FASTA) "
+                         "and run MycoSV + read-validation against that, instead of "
+                         "skipping the whole query. 0 disables (default: 0). Bounds "
+                         "MycoSV's per-query hierarchical-call runtime, which scales "
+                         "with query contig count and stalls above a few hundred. "
+                         "Truncations are logged to TRUNCATED_ASSEMBLY_QUERIES.tsv.")
     sb.add_argument("--skip-input-preflight", action="store_true",
                     help="Skip the cheap FASTA/FASTQ readability preflight. "
                          "Normally keep this on: it catches corrupt cached gzip "
@@ -12508,6 +13268,24 @@ def build_parser() -> argparse.ArgumentParser:
     sb.add_argument("--read-validation-flank-bp", type=int, default=250,
                     help="Window around each breakpoint where supporting "
                          "split/clipped reads are counted (default: 250 bp).")
+    # Reference-free companion to --validate-with-reads: align raw reads to
+    # junction-windows cut from the QUERY assembly (not the benchmark ref)
+    # so off-reference / pangenome-only MycoSV calls can also be
+    # read-validated. Emits read_validated_truth_refree.tsv alongside the
+    # BAM-anchored read_validated_truth.tsv and unions its validated set into
+    # the per-query support map.
+    sb.add_argument("--reference-free-read-validation",
+                    dest="reference_free_read_validation",
+                    action="store_true", default=True,
+                    help="Run reference-free junction-window read validation "
+                         "of MycoSV's own calls in addition to the BAM-to-"
+                         "benchmark-ref validator. Long-reads preferred, "
+                         "short-reads supported. Requires raw reads (either "
+                         "long/short-reads mode, or assembly mode with "
+                         "--raw-read-validation-tsv).")
+    sb.add_argument("--no-reference-free-read-validation",
+                    dest="reference_free_read_validation",
+                    action="store_false")
     return ap
 
 

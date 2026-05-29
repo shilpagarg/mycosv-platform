@@ -942,23 +942,51 @@ def aggregate_panel_read_validation(
     by_query_dir: Path,
     out_tsv: Path,
 ) -> list[dict[str, object]]:
-    """Per-(query, source) yes/total/rate from read_validated_truth.tsv."""
+    """Per-(query, source) yes/total/rate from the union of the BAM-anchored
+    read_validated_truth.tsv and the reference-free
+    read_validated_truth_refree.tsv. A call is counted as read-validated if
+    EITHER file marks it `yes`; this is the prerequisite for the manuscript's
+    Claim 2 (off-reference / pangenome-only loci must be allowed to be
+    read-validated, which the BAM-to-benchmark-ref file structurally cannot
+    do). Dedup is on (ref_contig, pos, end, svtype) inside each (query, source)
+    bucket so a call appearing in both files is counted once.
+    """
     rows: list[dict[str, object]] = []
     for qname, shard in _iter_shards(by_query_dir):
-        f = shard / "read_validated_truth.tsv"
-        if not f.exists() or f.stat().st_size == 0:
-            continue
-        per_source: dict[str, list[int]] = defaultdict(lambda: [0, 0])
-        with f.open() as fh:
-            reader = csv.DictReader(fh, delimiter="\t")
-            for r in reader:
-                src = (r.get("source") or "").strip()
-                if not src:
-                    continue
-                per_source[src][1] += 1
-                if (r.get("read_validated") or "").strip().lower() == "yes":
-                    per_source[src][0] += 1
-        for src, (yes, total) in per_source.items():
+        # call_state[source][call_key] = "yes" if any file said so else "no"
+        call_state: dict[str, dict[tuple[str, str, int, int, str], str]] = (
+            defaultdict(dict)
+        )
+        for fname in ("read_validated_truth.tsv", "read_validated_truth_refree.tsv"):
+            f = shard / fname
+            if not f.exists() or f.stat().st_size == 0:
+                continue
+            with f.open() as fh:
+                reader = csv.DictReader(fh, delimiter="\t")
+                for r in reader:
+                    src = (r.get("source") or "").strip()
+                    if not src:
+                        continue
+                    try:
+                        key = (
+                            (r.get("ref_contig") or "").strip(),
+                            (r.get("coord_space") or "").strip(),
+                            int(r.get("pos") or 0),
+                            int(r.get("end") or 0),
+                            (r.get("svtype") or "").strip(),
+                        )
+                    except (TypeError, ValueError):
+                        continue
+                    flag = (r.get("read_validated") or "").strip().lower()
+                    prev = call_state[src].get(key)
+                    if prev == "yes":
+                        continue
+                    call_state[src][key] = "yes" if flag == "yes" else (prev or "no")
+        for src, by_call in call_state.items():
+            total = len(by_call)
+            yes = sum(1 for v in by_call.values() if v == "yes")
+            if total == 0:
+                continue
             lo, hi = _wilson_ci(yes, total)
             rows.append({
                 "query_asm": qname,
@@ -987,7 +1015,12 @@ def save_panel_read_validation_rate(
     if plt is None or not rows:
         return
     sources_present = sorted({str(r["source"]) for r in rows})
-    preferred_order = ["mycosv", "minigraph", "svim_asm", "anchorwave"]
+    # Order: MycoSV first (highlighted), then the four single-reference
+    # comparators (minigraph / svim-asm / anchorwave), then the two pangenome
+    # graph comparators (PGGB / Cactus) added per reviewer request. Reading
+    # left-to-right in the legend mirrors the comparator-family taxonomy.
+    preferred_order = ["mycosv", "minigraph", "svim_asm", "anchorwave",
+                       "pggb", "cactus"]
     sources = ([s for s in preferred_order if s in sources_present]
                + [s for s in sources_present if s not in preferred_order])
     queries = sorted({str(r["query_asm"]) for r in rows},
@@ -1001,11 +1034,22 @@ def save_panel_read_validation_rate(
     n_src = len(sources)
     bar_w = 0.8 / n_src
     x = _np.arange(n_q)
-    fig_w = max(9.0, n_q * 0.55 + 3.0)
-    fig, ax = plt.subplots(figsize=(fig_w, 4.8))
+    # Slightly taller canvas + a hair wider per-sample so 6 bars per group
+    # don't crowd the per-sample slot at small bar widths. Extra height
+    # leaves room for the two-row legend stacked above the title.
+    fig_w = max(9.0, n_q * 0.65 + 3.0)
+    fig, ax = plt.subplots(figsize=(fig_w, 5.6))
+    # Wong colorblind-safe palette: extending the previous 4-colour map with
+    # CC79A7 (pink, PGGB) and D55E00 (vermillion, Cactus). Both are distinct
+    # from the existing assignments and from the Glomero/Basidio/Asco phylum
+    # band hues used in the background swaths below.
     color_for = {
-        "mycosv": "#0072B2", "minigraph": "#56B4E9",
-        "svim_asm": "#009E73", "anchorwave": "#E69F00",
+        "mycosv":     "#0072B2",  # Wong blue
+        "minigraph":  "#56B4E9",  # Wong sky blue
+        "svim_asm":   "#009E73",  # Wong bluish green
+        "anchorwave": "#E69F00",  # Wong orange
+        "pggb":       "#CC79A7",  # Wong pink
+        "cactus":     "#D55E00",  # Wong vermillion
     }
     for i, src in enumerate(sources):
         offset = (i - (n_src - 1) / 2) * bar_w
@@ -1034,7 +1078,10 @@ def save_panel_read_validation_rate(
     ax.set_xticks(x)
     ax.set_xticklabels(short, rotation=45, ha="right", fontsize=9)
     ax.set_ylabel("Fraction of calls with raw-read split support")
-    ax.set_ylim(0, 1.05)
+    # Lift the y-axis ceiling so the legend has room above the 1.0 baseline
+    # without sitting on top of full-height MycoSV bars. The reference line
+    # is still drawn at 1.0.
+    ax.set_ylim(0, 1.20)
     ax.axhline(1.0, color="#CCC", lw=0.5)
     # Phylum band annotation strip below x-axis labels.
     seen_phylum_at: list[tuple[int, str]] = []
@@ -1053,8 +1100,16 @@ def save_panel_read_validation_rate(
         ax.axvspan(start - 0.5, end - 0.5,
                    color=phylum_color.get(label, "#999"),
                    alpha=0.07, zorder=0)
-    ax.legend(loc="upper right", ncol=n_src, frameon=False, fontsize=9)
-    ax.set_title(title)
+    # Legend layout: title at the very top, legend in a single row right
+    # below it (we cap ncol=6 so it always fits). Both sit above the plot
+    # area so they never collide with full-height MycoSV bars.
+    legend_ncol = n_src  # 6 callers fit on one row at fontsize=9
+    ax.set_title(title, pad=36)
+    ax.legend(
+        loc="upper center", bbox_to_anchor=(0.5, 1.10),
+        ncol=legend_ncol, frameon=False, fontsize=9,
+    )
+    fig.tight_layout()
     _save_dual(fig, path)
     plt.close(fig)
 
@@ -1155,6 +1210,187 @@ def save_panel_pangenome_lift(
     plt.close(fig)
 
 
+# Manuscript claim ranges. Each panel run (5-sample, 200-sample) emits a
+# panel_claim_validation.tsv that gates per-query metrics against these.
+# Without HG002-style ground truth the two intervals here are the
+# manuscript's only quantitative falsifiability surface, so they live as
+# named constants rather than magic numbers inside the function body.
+CLAIM_READ_VALIDATION_MIN = 0.78
+CLAIM_READ_VALIDATION_MAX = 1.00
+CLAIM_PANGENOME_ONLY_MIN = 0.60
+CLAIM_PANGENOME_ONLY_MAX = 0.90
+
+
+def evaluate_panel_claims(
+    rv_rows: list[dict[str, object]],
+    pl_rows: list[dict[str, object]],
+    out_tsv: Path,
+    out_md: Path | None,
+    *,
+    panel_label: str = "panel",
+    read_validation_min: float = CLAIM_READ_VALIDATION_MIN,
+    read_validation_max: float = CLAIM_READ_VALIDATION_MAX,
+    pangenome_only_min: float = CLAIM_PANGENOME_ONLY_MIN,
+    pangenome_only_max: float = CLAIM_PANGENOME_ONLY_MAX,
+) -> list[dict[str, object]]:
+    """Gate the two manuscript claims that lack an HG002-style truth set.
+
+    Claim 1: per-query MycoSV read-validation rate (independent HiFi/ONT/
+             Illumina split-read support) is in [78 %, 100 %].
+    Claim 2: per-query pangenome-only-and-read-validated fraction of dedup
+             loci is in [60 %, 90 %] (i.e. MycoSV finds events no
+             single-reference comparator can find, that the raw reads still
+             confirm).
+
+    Inputs are the existing panel aggregators' outputs (no new pipeline
+    state). One row per query + a pooled `ALL` row. The 5-sample and
+    200-sample panels just call this once each on their own by_query/ tree.
+    """
+    rv_by_query: dict[str, dict[str, object]] = {
+        str(r["query_asm"]): r
+        for r in rv_rows
+        if str(r.get("source", "")).lower() == "mycosv"
+    }
+    pl_by_query: dict[str, dict[str, object]] = {
+        str(r["query_asm"]): r for r in pl_rows
+    }
+    queries = sorted(set(rv_by_query) | set(pl_by_query))
+
+    def gate(value: float, lo: float, hi: float, *, denom: int) -> str:
+        if denom <= 0:
+            return "insufficient_data"
+        if value < lo:
+            return "below_range"
+        if value > hi:
+            return "above_range"
+        return "in_range"
+
+    rows: list[dict[str, object]] = []
+    pool_yes = pool_total = 0
+    pool_dedup = pool_po_read = pool_po_total = pool_single = 0
+    for q in queries:
+        rv = rv_by_query.get(q, {})
+        pl = pl_by_query.get(q, {})
+        yes = as_int(rv.get("yes"))
+        total = as_int(rv.get("total"))
+        rate = (yes / total) if total else 0.0
+        rate_lo = float(rv.get("ci95_lo", 0.0) or 0.0)
+        rate_hi = float(rv.get("ci95_hi", 0.0) or 0.0)
+        dedup = as_int(pl.get("dedup_loci"))
+        single_ref = as_int(pl.get("single_ref_equivalent"))
+        po_total = as_int(pl.get("pangenome_only"))
+        po_read = as_int(pl.get("pangenome_only_read_supported"))
+        po_frac = (po_read / dedup) if dedup else 0.0
+        rows.append({
+            "panel": panel_label,
+            "query_asm": q,
+            "mycosv_calls_total": total,
+            "mycosv_calls_read_validated": yes,
+            "mycosv_read_validation_rate": f"{rate:.4f}",
+            "mycosv_read_validation_ci95_lo": f"{rate_lo:.4f}",
+            "mycosv_read_validation_ci95_hi": f"{rate_hi:.4f}",
+            "claim1_read_validation_status": gate(
+                rate, read_validation_min, read_validation_max, denom=total,
+            ),
+            "dedup_loci": dedup,
+            "single_ref_equivalent_loci": single_ref,
+            "pangenome_only_loci": po_total,
+            "pangenome_only_read_supported_loci": po_read,
+            "pangenome_only_read_supported_fraction_of_dedup": f"{po_frac:.4f}",
+            "claim2_pangenome_only_status": gate(
+                po_frac, pangenome_only_min, pangenome_only_max, denom=dedup,
+            ),
+        })
+        pool_yes += yes
+        pool_total += total
+        pool_dedup += dedup
+        pool_single += single_ref
+        pool_po_total += po_total
+        pool_po_read += po_read
+
+    if rows:
+        pooled_rate = (pool_yes / pool_total) if pool_total else 0.0
+        pooled_lo, pooled_hi = _wilson_ci(pool_yes, pool_total)
+        pooled_po_frac = (pool_po_read / pool_dedup) if pool_dedup else 0.0
+        in_range_c1 = sum(
+            1 for r in rows
+            if r["claim1_read_validation_status"] == "in_range"
+        )
+        in_range_c2 = sum(
+            1 for r in rows
+            if r["claim2_pangenome_only_status"] == "in_range"
+        )
+        rows.append({
+            "panel": panel_label,
+            "query_asm": "ALL",
+            "mycosv_calls_total": pool_total,
+            "mycosv_calls_read_validated": pool_yes,
+            "mycosv_read_validation_rate": f"{pooled_rate:.4f}",
+            "mycosv_read_validation_ci95_lo": f"{pooled_lo:.4f}",
+            "mycosv_read_validation_ci95_hi": f"{pooled_hi:.4f}",
+            "claim1_read_validation_status": (
+                f"in_range_queries={in_range_c1}/{len(rows)}"
+            ),
+            "dedup_loci": pool_dedup,
+            "single_ref_equivalent_loci": pool_single,
+            "pangenome_only_loci": pool_po_total,
+            "pangenome_only_read_supported_loci": pool_po_read,
+            "pangenome_only_read_supported_fraction_of_dedup": f"{pooled_po_frac:.4f}",
+            "claim2_pangenome_only_status": (
+                f"in_range_queries={in_range_c2}/{len(rows)}"
+            ),
+        })
+
+    fields = [
+        "panel", "query_asm",
+        "mycosv_calls_total", "mycosv_calls_read_validated",
+        "mycosv_read_validation_rate",
+        "mycosv_read_validation_ci95_lo", "mycosv_read_validation_ci95_hi",
+        "claim1_read_validation_status",
+        "dedup_loci", "single_ref_equivalent_loci",
+        "pangenome_only_loci", "pangenome_only_read_supported_loci",
+        "pangenome_only_read_supported_fraction_of_dedup",
+        "claim2_pangenome_only_status",
+    ]
+    write_tsv(out_tsv, rows, fields)
+
+    if out_md is not None and rows:
+        lines: list[str] = []
+        lines.append(f"# Claim validation — {panel_label}\n")
+        lines.append(
+            f"- Claim 1 (read-validation rate per query) target: "
+            f"{read_validation_min:.0%}-{read_validation_max:.0%}\n"
+        )
+        lines.append(
+            f"- Claim 2 (pangenome-only & read-validated fraction of "
+            f"dedup loci per query) target: "
+            f"{pangenome_only_min:.0%}-{pangenome_only_max:.0%}\n\n"
+        )
+        header = (
+            "| query | n_calls | read_val_rate (95% CI) | "
+            "claim1 | dedup_loci | PO_read/dedup | claim2 |"
+        )
+        sep = "|---|---:|---|---|---:|---|---|"
+        lines.append(header + "\n")
+        lines.append(sep + "\n")
+        for r in rows:
+            ci = (
+                f"{float(r['mycosv_read_validation_rate']):.2%} "
+                f"({float(r['mycosv_read_validation_ci95_lo']):.2%}-"
+                f"{float(r['mycosv_read_validation_ci95_hi']):.2%})"
+            )
+            po = f"{float(r['pangenome_only_read_supported_fraction_of_dedup']):.2%}"
+            lines.append(
+                f"| {r['query_asm']} | {r['mycosv_calls_total']} | "
+                f"{ci} | {r['claim1_read_validation_status']} | "
+                f"{r['dedup_loci']} | {po} | "
+                f"{r['claim2_pangenome_only_status']} |\n"
+            )
+        out_md.write_text("".join(lines), encoding="utf-8")
+
+    return rows
+
+
 def build_manuscript_table1(
     by_query_dir: Path,
     pl_rows: list[dict[str, object]],
@@ -1193,10 +1429,17 @@ def build_manuscript_table1(
         by_asm_rv[str(r["query_asm"])][str(r["source"])] = {
             "yes": int(r["yes"]), "total": int(r["total"])
         }
-    # Per-shard biology + benchmark + assembly-size lookups.
+    # Per-shard biology + benchmark + assembly-size lookups. The benchmark
+    # iteration splits comparators into two families so Table 1 can report
+    # them side-by-side per Liao 2023 HPRC Table 3 convention:
+    #   * single-reference family: anchorwave, svim_asm, minigraph
+    #   * pangenome-graph family:  pggb, cactus
     biology_class: dict[str, Counter[str]] = defaultdict(Counter)
-    best_f1: dict[str, float] = {}
+    best_single_ref_f1: dict[str, float] = {}
+    best_pango_comp_f1: dict[str, float] = {}
     asm_size_mb: dict[str, float] = {}
+    SINGLE_REF_LABELS = {"anchorwave", "svim_asm", "minigraph"}
+    PANGO_COMP_LABELS = {"pggb", "cactus"}
     for qname, shard in _iter_shards(by_query_dir):
         bf = shard / "biology_findings.tsv"
         if bf.exists() and bf.stat().st_size > 0:
@@ -1215,12 +1458,17 @@ def build_manuscript_table1(
                         continue
                     if (r.get("status") or "") != "ok":
                         continue
+                    label = (r.get("truth_label") or "").lower()
                     try:
                         f1 = float(r.get("f1") or 0)
                     except ValueError:
                         continue
-                    if f1 > best_f1.get(qname, -1.0):
-                        best_f1[qname] = f1
+                    if label in SINGLE_REF_LABELS:
+                        if f1 > best_single_ref_f1.get(qname, -1.0):
+                            best_single_ref_f1[qname] = f1
+                    elif label in PANGO_COMP_LABELS:
+                        if f1 > best_pango_comp_f1.get(qname, -1.0):
+                            best_pango_comp_f1[qname] = f1
         # Assembly size estimate from INPUT_PREFLIGHT.tsv (query row), if present.
         pf = shard / "INPUT_PREFLIGHT.tsv"
         if pf.exists():
@@ -1270,7 +1518,12 @@ def build_manuscript_table1(
             "mycosv_read_validated_pct": (
                 f"{(rv['yes'] / rv['total'] * 100):.1f}" if rv["total"] else "."
             ),
-            "best_comparator_f1": (f"{best_f1[q]:.3f}" if q in best_f1 else "."),
+            "best_single_ref_comp_f1": (
+                f"{best_single_ref_f1[q]:.3f}" if q in best_single_ref_f1 else "."
+            ),
+            "best_pangenome_comp_f1": (
+                f"{best_pango_comp_f1[q]:.3f}" if q in best_pango_comp_f1 else "."
+            ),
             "hgt_starship": cls.get("HGT / Starship", 0),
             "te_repeat": cls.get("TE / repeat", 0) + cls.get("RIP / genome defense", 0),
             "other_structural": cls.get("Structural (other)", 0),
@@ -1301,8 +1554,13 @@ def build_manuscript_table1(
             "mycosv_read_validated_pct": (
                 f"{(rv_all_yes / rv_all_tot * 100):.1f}" if rv_all_tot else "."
             ),
-            "best_comparator_f1": (
-                f"{(sum(best_f1.values()) / len(best_f1)):.3f}" if best_f1 else "."
+            "best_single_ref_comp_f1": (
+                f"{(sum(best_single_ref_f1.values()) / len(best_single_ref_f1)):.3f}"
+                if best_single_ref_f1 else "."
+            ),
+            "best_pangenome_comp_f1": (
+                f"{(sum(best_pango_comp_f1.values()) / len(best_pango_comp_f1)):.3f}"
+                if best_pango_comp_f1 else "."
             ),
             "hgt_starship": sum(int(r["hgt_starship"]) for r in rows),
             "te_repeat": sum(int(r["te_repeat"]) for r in rows),
@@ -1313,7 +1571,8 @@ def build_manuscript_table1(
         "sample", "species", "class", "assembly_size_mb",
         "total_loci", "single_ref_equivalent", "pangenome_only",
         "pangenome_lift_pct", "pangenome_only_read_supported",
-        "mycosv_read_validated_pct", "best_comparator_f1",
+        "mycosv_read_validated_pct",
+        "best_single_ref_comp_f1", "best_pangenome_comp_f1",
         "hgt_starship", "te_repeat", "other_structural",
     ]
     write_tsv(out_tsv, rows, columns)
@@ -1330,7 +1589,8 @@ def build_manuscript_table1(
         "pangenome_lift_pct": "Pangenome lift (%)",
         "pangenome_only_read_supported": "PO read-supported",
         "mycosv_read_validated_pct": "MycoSV read-valid. (%)",
-        "best_comparator_f1": "Best comp. F1",
+        "best_single_ref_comp_f1": "Best single-ref comp. F1",
+        "best_pangenome_comp_f1": "Best pangenome comp. F1",
         "hgt_starship": "HGT/Starship",
         "te_repeat": "TE/RIP/repeat",
         "other_structural": "Other SV",
@@ -1343,8 +1603,11 @@ def build_manuscript_table1(
         " (Glomeromycota → Basidiomycota → Ascomycota). *Pangenome lift* is the percentage"
         " of deduplicated MycoSV loci not representable on the held-out single benchmark"
         " reference; *read-supported* loci are independently confirmed by raw-read split"
-        " alignments. *Best comparator F1* is the maximum of MycoSV vs anchorwave / svim_asm"
-        " / minigraph in exact-match scoring against the same single-reference truth."
+        " alignments. *Best single-ref comp. F1* is the maximum of MycoSV vs anchorwave /"
+        " svim_asm / minigraph exact-match scoring against the single-reference truth;"
+        " *Best pangenome comp. F1* is the corresponding maximum against the two"
+        " pangenome-graph comparators (PGGB, Minigraph-Cactus) on their decomposed"
+        " bubble VCF truth sets."
         f" Of {total_panel_shards} panel shards attempted, {len(queries)} completed the full"
         f" MycoSV calling pipeline; the remaining {failed_shards} timed out with a promoted"
         " hierarchical checkpoint (MYCOSV_FAILED.txt marker) and are excluded from this"
@@ -1454,6 +1717,8 @@ def build_manuscript_method_comparison_table(
     anchor_n = sum(comparator_counts.get("anchorwave", []))
     svim_n = sum(comparator_counts.get("svim_asm", []))
     mini_n = sum(comparator_counts.get("minigraph", []))
+    pggb_n = sum(comparator_counts.get("pggb", []))
+    cactus_n = sum(comparator_counts.get("cactus", []))
     rows: list[dict[str, object]] = [
         {
             "method": "MycoSV (this work)",
@@ -1504,6 +1769,34 @@ def build_manuscript_method_comparison_table(
             "off_ref_novel_sequence": "0 (not supported)",
             "panel_total_calls": mini_n,
             "read_validation_rate": rate_str("minigraph"),
+            "lineage_labels": "No (sample IDs only)",
+        },
+        {
+            # PGGB (Garrison 2024): all-vs-all WFA-based pangenome graph;
+            # decomposed VCF per shard is the comparator truth set.
+            "method": "PGGB",
+            "strategy": "All-vs-all WFA pangenome graph (wfmash/seqwish/smoothxg)",
+            "coord_space": "Reference + bubble graph",
+            "median_calls_per_sample": med(comparator_counts.get("pggb", [])),
+            "single_reference_calls": f"{pggb_n:,}",
+            "pangenome_only_loci": "Partial (bubble traversals only)",
+            "off_ref_novel_sequence": "0 (not supported)",
+            "panel_total_calls": pggb_n,
+            "read_validation_rate": rate_str("pggb"),
+            "lineage_labels": "No (sample IDs only)",
+        },
+        {
+            # Minigraph-Cactus (Hickey 2024): progressive Cactus + minigraph
+            # base graph; pangenome.vcf.gz per shard is the comparator truth.
+            "method": "Minigraph-Cactus",
+            "strategy": "Progressive Cactus + minigraph base (cactus-pangenome)",
+            "coord_space": "Reference + bubble graph",
+            "median_calls_per_sample": med(comparator_counts.get("cactus", [])),
+            "single_reference_calls": f"{cactus_n:,}",
+            "pangenome_only_loci": "Partial (bubble traversals only)",
+            "off_ref_novel_sequence": "0 (not supported)",
+            "panel_total_calls": cactus_n,
+            "read_validation_rate": rate_str("cactus"),
             "lineage_labels": "No (sample IDs only)",
         },
     ]
@@ -1922,6 +2215,18 @@ def run_panel_mode(by_query_dir: Path, out_dir: Path) -> int:
         out_dir / "table_method_comparison_pangenome_vs_single_ref.md",
     )
 
+    # Standalone falsifiability check for the two claims that lack an
+    # HG002-style truth set. Re-runs cheaply per panel (5-sample, 200-sample)
+    # off the same already-aggregated TSVs.
+    panel_label = by_query_dir.parent.name or by_query_dir.name
+    evaluate_panel_claims(
+        rv_rows,
+        pl_rows,
+        out_dir / "panel_claim_validation.tsv",
+        out_dir / "panel_claim_validation.md",
+        panel_label=panel_label,
+    )
+
     # Minimal HTML wrapper so an operator can preview both panels together.
     page = f"""<!doctype html>
 <html><head><meta charset='utf-8'>
@@ -2230,6 +2535,13 @@ def main(argv: list[str] | None = None) -> int:
         save_stacked_bar(fig, by_scope_element, title="Fungal biology classes by pangenome scope")
         figures.append(fig)
 
+        rows = [
+            {"scope": scope, "category": cat, "n_calls": n}
+            for scope, counts in by_scope_element.items()
+            for cat, n in sorted(counts.items())
+        ]
+        write_tsv(outdir / "biology_class_by_pangenome_scope.tsv", rows, ["scope", "category", "n_calls"])
+
         fig = outdir / "biology_class_by_discovery_bucket.png"
         save_stacked_bar(fig, by_bucket_element, title="Biology classes by MycoSV discovery bucket", normalize=True)
         figures.append(fig)
@@ -2331,13 +2643,6 @@ def main(argv: list[str] | None = None) -> int:
         )
         if fig.exists():
             figures.append(fig)
-
-        rows = [
-            {"scope": scope, "category": cat, "n_calls": n}
-            for scope, counts in by_scope_element.items()
-            for cat, n in sorted(counts.items())
-        ]
-        write_tsv(outdir / "biology_class_by_pangenome_scope.tsv", rows, ["scope", "category", "n_calls"])
 
     if tiers:
         tier_table: dict[str, Counter[str]] = defaultdict(Counter)

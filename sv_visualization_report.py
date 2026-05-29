@@ -497,6 +497,17 @@ def plot_stacked_counts(df: pd.DataFrame, index_col: str, stack_col: str, title:
     counts = pd.crosstab(idx, stack, normalize="index" if normalize else False)
     counts = counts[[c for c in SVTYPE_ORDER if c in counts.columns] + [c for c in counts.columns if c not in SVTYPE_ORDER]]
     counts.index = [short_sample_label(v) for v in counts.index]
+    # In --mycosv-only runs the comparator agreement table is all no_comparator
+    # placeholder rows, so the crosstab can collapse to no numeric columns/rows.
+    # pandas' bar plot raises "no numeric data to plot" in that case; render an
+    # explicit placeholder instead so report generation stays non-fatal.
+    if counts.empty or counts.shape[1] == 0:
+        fig, ax = plt.subplots(figsize=(8, 4))
+        ax.text(0.5, 0.5, f"{title}\n(no numeric comparator data — mycosv-only run)",
+                ha="center", va="center", wrap=True)
+        ax.axis("off")
+        fig.tight_layout()
+        return fig
     fig, ax = plt.subplots(figsize=(max(10, 0.34 * len(counts.index) + 3), 5.5))
     counts.plot(kind="bar", stacked=True, ax=ax)
     ax.set_title(title)

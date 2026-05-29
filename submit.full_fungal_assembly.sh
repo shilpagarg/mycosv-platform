@@ -42,6 +42,13 @@ MAX_CLADE_GENOMES="${MAX_CLADE_GENOMES:-32}"
 # 64-ref monolithic MycoSV timeout seen in the first full run.
 BENCHMARK_REF_CAP="${BENCHMARK_REF_CAP:-8}"
 READVAL_SUPPORT="${READVAL_SUPPORT:-1}"
+# Cap each assembly query to its N longest contigs. MycoSV's hierarchical
+# assembly caller scales with query contig count and stalls for hours above a
+# few hundred contigs (fragmented public drafts run 2.7k-180k contigs). 0
+# disables (every contig processed, original behaviour). When set, oversized
+# queries are kept in the panel as their N-longest-contig subset rather than
+# hanging or being skipped; see TRUNCATED_ASSEMBLY_QUERIES.tsv.
+MAX_ASSEMBLY_QUERY_CONTIGS_KEEP="${MAX_ASSEMBLY_QUERY_CONTIGS_KEEP:-0}"
 SEED="${SEED:-1}"
 FULL_ASSEMBLY_SHARDS="${FULL_ASSEMBLY_SHARDS:-1}"
 # Default to a generated read-validation manifest under prepared/ so the
@@ -116,9 +123,14 @@ MYCOSV_BIN="${MYCOSV_BIN:-${PROJECT_DIR}/fungi_graphsv_tol_bin}"
 BIN_LOCK="${BIN_LOCK:-${TMPDIR:-/tmp}/$(basename "${MYCOSV_BIN}").${USER}.lock}"
 if [[ -x "${MYCOSV_BIN}" && "${FORCE_PREBUILD:-0}" != "1" ]]; then
   BIN_MTIME=$(stat -c %Y "${MYCOSV_BIN}" 2>/dev/null || echo 0)
-  SRC_MTIME=$(stat -c %Y "${PROJECT_DIR}/main.cpp" 2>/dev/null || echo 0)
+  # Newest of main.cpp AND every *.hpp — must match the Python's _needs_build()
+  # which also checks headers. Comparing only main.cpp meant a newer .hpp left
+  # the binary "stale" by the Python's reckoning, so each array task tried to
+  # lock+rebuild on the NFS share and ~half hit ENOLCK ("No locks available").
+  SRC_MTIME=$(stat -c %Y "${PROJECT_DIR}/main.cpp" ${PROJECT_DIR}/*.hpp 2>/dev/null | sort -nr | head -1)
+  SRC_MTIME="${SRC_MTIME:-0}"
   if (( BIN_MTIME >= SRC_MTIME && BIN_MTIME > 0 )); then
-    echo "[prebuild] ${MYCOSV_BIN} mtime ${BIN_MTIME} >= main.cpp ${SRC_MTIME}; skipping lock+rebuild"
+    echo "[prebuild] ${MYCOSV_BIN} mtime ${BIN_MTIME} >= newest source ${SRC_MTIME} (main.cpp + *.hpp); skipping lock+rebuild"
     SKIP_PREBUILD=1
   fi
 fi
@@ -252,32 +264,45 @@ run_benchmark_dir() {
   # pipeline + heredocs rather than spawning new shell scripts.
   local mode="${MODE:-assembly}"
   local comparator_flags=()
-  case "${mode}" in
-    assembly)
-      comparator_flags=(--run-minigraph --run-svim-asm --run-anchorwave)
-      if [[ "${RUN_PGGB:-1}" == "1" ]]; then
-        comparator_flags+=(--run-pggb)
-      fi
-      if [[ "${RUN_CACTUS:-1}" == "1" ]]; then
-        comparator_flags+=(--run-cactus)
-      fi
-      if [[ "${RUN_SYRI:-0}" == "1" ]]; then
-        comparator_flags+=(--run-syri)
-      fi
-      ;;
-    long-reads)
-      comparator_flags=(--run-sniffles --run-cutesv --run-svim)
-      ;;
-    short-reads)
-      comparator_flags=(--run-delly --run-manta)
-      ;;
-    *)
-      echo "[error] unsupported MODE=${mode} (expected: assembly|long-reads|short-reads)" >&2
-      return 2
-      ;;
-  esac
-  echo "[mode] ${mode}"
-  echo "[comparators] enabled: ${comparator_flags[*]}"
+  # MYCOSV_ONLY=1 short-circuits every comparator (minigraph/svim-asm/
+  # anchorwave/pggb/cactus/syri and the reads-mode baselines). The run then
+  # rests entirely on MycoSV's graph-native calls + independent read-level
+  # validation. This is the comparator-free full-fungal experiment: each
+  # comparator carries a 90-min timeout and was the dominant per-shard
+  # wall-time cost, so disabling them is what brings the 200-query panel
+  # inside a single-digit-hour budget.
+  if [[ "${MYCOSV_ONLY:-0}" == "1" ]]; then
+    comparator_flags=(--mycosv-only)
+    echo "[mode] ${mode} (mycosv-only: comparators disabled)"
+    echo "[comparators] enabled: none (--mycosv-only)"
+  else
+    case "${mode}" in
+      assembly)
+        comparator_flags=(--run-minigraph --run-svim-asm --run-anchorwave)
+        if [[ "${RUN_PGGB:-1}" == "1" ]]; then
+          comparator_flags+=(--run-pggb)
+        fi
+        if [[ "${RUN_CACTUS:-1}" == "1" ]]; then
+          comparator_flags+=(--run-cactus)
+        fi
+        if [[ "${RUN_SYRI:-0}" == "1" ]]; then
+          comparator_flags+=(--run-syri)
+        fi
+        ;;
+      long-reads)
+        comparator_flags=(--run-sniffles --run-cutesv --run-svim)
+        ;;
+      short-reads)
+        comparator_flags=(--run-delly --run-manta)
+        ;;
+      *)
+        echo "[error] unsupported MODE=${mode} (expected: assembly|long-reads|short-reads)" >&2
+        return 2
+        ;;
+    esac
+    echo "[mode] ${mode}"
+    echo "[comparators] enabled: ${comparator_flags[*]}"
+  fi
   python3 -u run_real_fungal_benchmark.py benchmark \
     --prepared-dir "${PREPARED_DIR}" \
     --out-dir "${out_dir}" \
@@ -288,6 +313,7 @@ run_benchmark_dir() {
     --reuse-registry-dir "${BENCHMARK_REGISTRY_DIR}" \
     --benchmark-ref-cap "${BENCHMARK_REF_CAP}" \
     --read-validation-min-support "${READVAL_SUPPORT}" \
+    --max-assembly-query-contigs-keep-largest "${MAX_ASSEMBLY_QUERY_CONTIGS_KEEP}" \
     "${comparator_flags[@]}" \
     "${query_args[@]}" \
     "${raw_read_args[@]}" \

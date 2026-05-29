@@ -43,6 +43,7 @@
 #include <cctype>
 #include <cmath>
 #include <cstdio>
+#include <deque>
 #include <ext/stdio_filebuf.h>
 #include <filesystem>
 #include <fstream>
@@ -847,21 +848,71 @@ long_reads_to_pseudocontigs(const std::vector<RawRead>& reads,
     };
     std::vector<Candidate> candidates;
 
-    // Step 1: anchor -> read-index multimap
+    // Step 1: canonical (k,w) minimizer anchors -> read-index multimap.
+    // Fixed-stride k-mer sampling does NOT co-locate between overlapping reads
+    // (each read samples positions offset by the overlap shift), so it only
+    // matched via repeated k-mer *sequences* -- which transitively merged the
+    // whole read set into one cluster. Switching to canonical minimizers makes
+    // anchors position- and strand-stable: two reads overlapping the same locus
+    // select the same minimizers in their shared span regardless of offset or
+    // strand, so the >=2-shared-anchor union below clusters by locus instead of
+    // by incidental sequence repeats.
+    const int clusterK = std::max(anchorK, 15);
+    const size_t minimizerWindow = 100;  // k-mers per minimizer window
+    const size_t maxMinimizersPerRead = maxAnchorsPerRead * 2;
+    auto mix64 = [](uint64_t x) -> uint64_t {  // splitmix64 finalizer
+        x ^= x >> 30; x *= 0xbf58476d1ce4e5b9ULL;
+        x ^= x >> 27; x *= 0x94d049bb133111ebULL;
+        x ^= x >> 31; return x;
+    };
     std::unordered_map<uint64_t, std::vector<uint32_t>> anchorMap;
     anchorMap.reserve(N * 10);
+    const uint64_t kmerMask = (clusterK >= 32) ? ~0ULL
+                              : ((1ULL << (2 * clusterK)) - 1);
+    const unsigned revShift = 2u * static_cast<unsigned>(clusterK - 1);
     for (uint32_t ri = 0; ri < static_cast<uint32_t>(N); ++ri) {
         const std::string& seq = reads[ri].seq;
-        if (static_cast<int>(seq.size()) < anchorK) continue;
+        if (static_cast<int>(seq.size()) < clusterK) continue;
         std::unordered_set<uint64_t> seen;
-        const size_t anchorStep = std::max<size_t>(
-            static_cast<size_t>(anchorK),
-            std::max<size_t>(1, seq.size() / std::max<size_t>(1, maxAnchorsPerRead)));
-        for (size_t j = 0; j + static_cast<size_t>(anchorK) <= seq.size();
-             j += anchorStep) {
-            const uint64_t h = fnv1a(seq.data() + j, static_cast<size_t>(anchorK));
-            if (seen.insert(h).second) anchorMap[h].push_back(ri);
+        std::deque<std::pair<uint64_t, size_t>> dq;  // monotonic (hash, kmerIdx)
+        uint64_t fwd = 0, rev = 0;
+        int valid = 0;
+        size_t kmerIdx = 0;
+        size_t lastEmitted = std::numeric_limits<size_t>::max();
+        auto emit = [&](uint64_t h) {
+            if (seen.size() < maxMinimizersPerRead && seen.insert(h).second)
+                anchorMap[h].push_back(ri);
+        };
+        for (size_t p = 0; p < seq.size(); ++p) {
+            int b;
+            switch (seq[p]) {
+                case 'A': case 'a': b = 0; break;
+                case 'C': case 'c': b = 1; break;
+                case 'G': case 'g': b = 2; break;
+                case 'T': case 't': b = 3; break;
+                default:  b = -1; break;
+            }
+            if (b < 0) {  // N / ambiguous base breaks the k-mer run
+                valid = 0; fwd = rev = 0; dq.clear();
+                lastEmitted = std::numeric_limits<size_t>::max();
+                continue;
+            }
+            fwd = ((fwd << 2) | static_cast<uint64_t>(b)) & kmerMask;
+            rev = (rev >> 2) | (static_cast<uint64_t>(3 - b) << revShift);
+            if (++valid < clusterK) continue;
+            const uint64_t h = mix64(std::min(fwd, rev));  // canonical
+            const size_t idx = kmerIdx++;
+            while (!dq.empty() && dq.back().first >= h) dq.pop_back();
+            dq.emplace_back(h, idx);
+            while (!dq.empty() && dq.front().second + minimizerWindow <= idx)
+                dq.pop_front();
+            if (idx + 1 >= minimizerWindow && dq.front().second != lastEmitted) {
+                emit(dq.front().first);
+                lastEmitted = dq.front().second;
+            }
         }
+        if (kmerIdx > 0 && kmerIdx < minimizerWindow && !dq.empty())
+            emit(dq.front().first);  // short read: emit global minimum
     }
 
     // Step 2: Union-Find (iterative path compression to avoid stack overflow on
@@ -883,18 +934,53 @@ long_reads_to_pseudocontigs(const std::vector<RawRead>& reads,
         a = find(a); b = find(b);
         if (a != b) parent[b] = a;
     };
-    // Directly union reads that share an informative anchor. The previous
-    // pair-count map materialised every read pair for every anchor
-    // (O(sum anchor_degree^2)); public ONT yeast runs spent minutes here
-    // before a single SV was called. Repetitive anchors are still skipped by
-    // the degree cap, so a star-union per anchor preserves the useful
-    // clustering signal without the quadratic pair table.
-    for (const auto& kv : anchorMap) {
-        const auto& vec = kv.second;
-        if (vec.size() < 2 || vec.size() > 200) continue;
-        const uint32_t root = vec.front();
-        for (size_t i = 1; i < vec.size(); ++i)
-            unite(root, vec[i]);
+    // Union reads only when they share at least MIN_SHARED_ANCHORS distinct
+    // anchors. At lrAnchorK=12 most 12-mers are not genome-unique, so a single
+    // shared anchor transitively bridges unrelated loci: a star-union per
+    // anchor collapsed entire 60k-200k read subsets into ONE cluster -> one
+    // pseudo-contig, starving the caller of contigs (public ONT fungal runs
+    // emitted ~70-180 SVs where assembly mode emits ~1000). Requiring 2+
+    // co-occurring anchors keeps genuine read overlaps (which share many
+    // anchors) while dropping spurious single-k-mer bridges.
+    //
+    // Cost stays bounded: repetitive anchors above degreeCap are skipped, so
+    // each contributing anchor adds at most C(degreeCap,2) pairs, and the
+    // co-occurrence map is hard-capped to keep peak memory well under the
+    // cgroup limit. This is NOT the old all-pairs table (which had no degree
+    // cap and spent the whole timeout here).
+    {
+        constexpr uint8_t MIN_SHARED_ANCHORS = 2;
+        const size_t degreeCap = largeBatch ? 48 : 128;
+        const size_t maxPairEntries = 16'000'000;  // ~0.5-1 GB worst case
+        std::unordered_map<uint64_t, uint8_t> shared;
+        shared.reserve(std::min<size_t>(maxPairEntries, N * 4 + 16));
+        bool pairTableFull = false;
+        for (const auto& kv : anchorMap) {
+            if (pairTableFull) break;
+            const auto& vec = kv.second;
+            if (vec.size() < 2 || vec.size() > degreeCap) continue;
+            for (size_t i = 0; i < vec.size() && !pairTableFull; ++i) {
+                for (size_t j = i + 1; j < vec.size(); ++j) {
+                    uint32_t a = vec[i], b = vec[j];
+                    if (find(a) == find(b)) continue;  // already co-clustered
+                    const uint64_t key =
+                        (static_cast<uint64_t>(std::min(a, b)) << 32) |
+                        static_cast<uint64_t>(std::max(a, b));
+                    auto it = shared.find(key);
+                    if (it == shared.end()) {
+                        if (shared.size() >= maxPairEntries) {
+                            pairTableFull = true;
+                            break;
+                        }
+                        shared.emplace(key, uint8_t{1});
+                    } else if (static_cast<uint8_t>(it->second + 1) >= MIN_SHARED_ANCHORS) {
+                        unite(a, b);
+                    } else {
+                        ++it->second;
+                    }
+                }
+            }
+        }
     }
 
     // Step 3: group by cluster root
