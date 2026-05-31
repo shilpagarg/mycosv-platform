@@ -284,17 +284,8 @@ def compatible(truth: dict[str, Any], pred: dict[str, Any]) -> bool:
     if truth.get("qasm") and pred.get("qasm") and truth["qasm"] != pred["qasm"]:
         return False
 
-    # Bug-fix (2026-05-12): the previous groupings were dangerously over-
-    # permissive — DEL was bucketed with INS and DUP, and INV was bucketed
-    # with TRA. That meant a DEL truth event would score as TP against an
-    # INS prediction at the same locus, and an INV truth event would
-    # score as TP against a TRA prediction. Combined with the per-type
-    # stats below (TP keyed by truth.type, FP keyed by pred.type), the
-    # simulated PR metrics silently reported inflated recall for one
-    # type while attributing the matched-but-wrong predictions as FP on
-    # another type. Replace with the conservative groupings every other
-    # SV benchmark uses (Truvari, sveval): keep DEL, INV, OFF_REF strict;
-    # accept INS↔DUP and the TRA_* family as biologically equivalent.
+    # Conservative SV-type compatibility: keep DEL, INV, and OFF_REF strict;
+    # accept INS/DUP and the TRA_* family as biologically related calls.
     type_groups = (
         {"DEL", "TDEL"},
         {"INS", "DUP", "TANDEM_DUP"},
@@ -396,9 +387,7 @@ def _global_greedy_matches(truth_list: list[dict[str, Any]],
                            pred_list: list[dict[str, Any]]) -> tuple[dict[int, int], set[int]]:
     """Return one-to-one compatible matches, prioritising nearest breakpoints.
 
-    The previous truth-order greedy walk could consume a shared prediction for
-    a looser match before a later truth row reached its best/only prediction.
-    Sorting all compatible pairs by distance gives deterministic, local-best
+    Sort all compatible pairs by distance to get deterministic, local-best
     one-to-one assignments without making metrics depend on VCF row order.
     """
     pairs: list[tuple[float, int, int]] = []

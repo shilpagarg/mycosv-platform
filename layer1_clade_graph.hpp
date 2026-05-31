@@ -669,22 +669,10 @@ inline double gc_content(std::string_view seq) {
 }
 
 // ── detect_tandem_repeat ─────────────────────────────────────────────────
-// Period-regularity counting.
-// Returns true if seq contains a tandem run of period p (2–12) with at
-// least minCopies copies totalling at least minLen bases.
-//
-// Algorithm: for each period p, check that seq[i] == seq[i-p] for a run
-// of length ≥ p*minCopies using strict period-regularity counting.
-// Period-regularity tandem repeat detector.
-// For each period p in [minPeriod, maxPeriod], counts a run of consecutive
-// positions i where seq[i] == seq[i - p].  A run of length L means the
-// segment has period p and spans L+p bases (the p-length seed plus L
-// matching offsets).  The run counter resets to 0 on any mismatch so
-// partial matches from unrelated regions do not combine.
-//
-// Returns true when any period p has a run ≥ (minCopies-1)*p positions
-// (i.e. at least minCopies copies of the p-mer unit) AND the total span
-// ≥ minLen bases.
+// Strict period-regularity detector. For each period p, a run counts
+// consecutive positions where seq[i] == seq[i - p]. A run of
+// (minCopies - 1) * p positions spans minCopies copies of the p-mer unit;
+// the run resets on mismatch so unrelated partial matches never combine.
 inline bool detect_tandem_repeat(std::string_view seq,
                                   int minPeriod  = 2,
                                   int maxPeriod  = 12,
@@ -703,7 +691,7 @@ inline bool detect_tandem_repeat(std::string_view seq,
             if (seq[static_cast<size_t>(i)] == seq[static_cast<size_t>(i - p)])
                 ++run;
             else
-                run = 0;   // reset on any mismatch — no partial credit
+                run = 0;
             if (run >= target_run && (run + p) >= minLen)
                 return true;
         }
@@ -837,8 +825,7 @@ inline bool detect_sine(std::string_view seq) {
 //   hull must be < 44%, which is biologically accurate for Starship hulls.
 //
 // Cargo criterion: interior window GC >= (cladeGc - 0.02), i.e. approximately
-//   genic GC (45-55% in practice). Previous threshold of 0.55 was too high
-//   and would miss Starships in lower-GC organisms.
+//   genic GC (45-55% in practice), including lower-GC organisms.
 //
 // Ref: Urquhart et al. 2023 Current Biology (discovery paper).
 inline bool detect_starship(std::string_view seq,
@@ -898,8 +885,8 @@ inline bool detect_hgt_island(std::string_view seq,
 // sliding window.  RIP leaves a C->T / G->A signature in repeated DNA, commonly
 // summarized with dinucleotide indices such as TpA/CpA or composite RIP
 // indices.  This detector intentionally stays portable and alignment-free, but
-// it now uses the expected CpA depletion / TpA enrichment signal instead of the
-// older C/G imbalance proxy, which could mark merely C-rich sequence as RIP.
+// it uses the expected CpA depletion / TpA enrichment signal rather than
+// generic C/G imbalance, which can mark merely C-rich sequence as RIP.
 inline bool detect_rip_window(std::string_view seq,
                                double productIndexThresh = 1.5,
                                int    winLen        = 500) {
@@ -943,8 +930,9 @@ inline ElementClass classify_repeat_element(std::string_view seq,
     if (detect_rip_window(seq))                        return ElementClass::RIP;
 
     // Starship: large AT-rich element with GC-rich cargo.  Treat this as a
-    // taxon-aware label when phylum is known; without context retain the old
-    // sequence-only behavior for standalone detector tests and legacy callers.
+    // taxon-aware label when phylum is known; without context use the
+    // sequence-only classifier for standalone detector tests and callers that
+    // do not pass taxonomy.
     if (starship_supported_phylum(phylum) &&
         detect_starship(seq, cladeGc))                 return ElementClass::STARSHIP;
 
@@ -1002,7 +990,7 @@ enum class TraIntra { LINEAR, TRA_INTRA, TRA_INTER };
 // =========================================================================
 // DS-8: is_inversion_flex  — quick-reject for impossible inversions
 // =========================================================================
-// Correct fix: |refLen - altLen| must be ≤ tolerance × min(ref,alt).
+// Accept inversions only when allele lengths differ within the relative tolerance.
 inline bool is_inversion_flex(size_t refLen, size_t altLen,
                                double tolerance = 0.10) {
     if (refLen == 0 || altLen == 0) return false;
@@ -1136,11 +1124,8 @@ struct SuffixArray {
     // Build from (name, seq) pairs.  Each contig is separated by a unique
     // sentinel (char values 1–30) so cross-contig matches never fire.
     //
-    // IMPORTANT: sentinel IDs are capped to 1–30 (all < 32) so that the
-    // find_mems guard `static_cast<unsigned char>(c) < 32u` reliably stops
-    // extension at every sentinel.  The previous range 1–63 allowed IDs
-    // 32–63 (printable ASCII) to slip through the guard, enabling spurious
-    // cross-contig MEMs when more than 31 contigs were loaded.
+    // Sentinel IDs stay in 1-30 (all < 32) so find_mems reliably stops
+    // extension at every contig boundary and cannot form cross-contig MEMs.
     void build(const std::vector<std::pair<std::string,std::string>>& contigs) {
         text.clear(); contigEnd.clear(); contigName.clear();
         int sentinel_id = 1;
@@ -1637,14 +1622,9 @@ private:
         return best;
     }
 
-    // Predecessor search with two prunes vs. the old full-left-subtree walk:
-    //   1. subtreeBest <= best  → nothing in this subtree can beat the
-    //      running best, skip it entirely (the O(n)→O(log n) win).
-    //   2. nd.rPos < rPos - maxGap → every node in nd's LEFT subtree has
-    //      rPos <= nd.rPos and is therefore out of the gap band; skip left.
-    // Both prunes are exact: they only skip subtrees that provably cannot
-    // contain a strictly-better predecessor, so results are identical to the
-    // old exhaustive walk.
+    // Exact predecessor search prunes:
+    //   1. subtreeBest <= best: no entry in this subtree can beat the running best.
+    //   2. nd.rPos < rPos - maxGap: every left-subtree rPos is out of band.
     void find_pred_rec(int node, int rPos, int qPos, int maxGap,
                        float& best, int& bestIdx) const {
         if (node < 0) return;
@@ -1737,10 +1717,7 @@ struct SvTypeFromChain {
         // TRA: first and last MEM on different reference contigs.
         // Anchor the primary break after the first MEM on the source contig,
         // and the mate break at the start of the terminal MEM on the target
-        // contig. The old code incorrectly reported the source contig again as
-        // CHR2/POS2, which made valid inter-contig chains look like broken
-        // self-translocations in VCF output.
-        // rBreakStart/rBreakEnd are returned in *local contig coordinates*
+        // contig. rBreakStart/rBreakEnd are returned in local contig coordinates
         // (mate-contig space) so VCF POS2 is interpretable as a position on
         // the named CHR2 contig — not the concatenated suffix-array offset.
         if (c0 >= 0 && cN1 >= 0 && c0 != cN1) {
@@ -1979,8 +1956,8 @@ struct SvTypeFromChain {
 
             // Backward rPos jumps are DUP territory.
             if (lrg < 0) continue;
-            // Forward overlap in query (negative qGap) means the next MEM overlaps the
-            // previous one's footprint — likely a near-tandem repeat; skip.
+            // Forward overlap in query (negative qGap) means adjacent MEM
+            // footprints overlap, likely from a near-tandem repeat; skip.
             if (lqg < 0) continue;
 
             const int ld = lqg - lrg;

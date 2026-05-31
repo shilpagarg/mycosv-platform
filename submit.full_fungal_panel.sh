@@ -162,9 +162,8 @@ submit() {
 # launched 16 parallel workers each holding up to ~1.5 GB of full-base
 # graph state, plus glibc per-arena fragmentation across ~9k full-base
 # shards. 256G fits well inside `multicore` (1.5 TB/node, MaxMemPerNode
-# UNLIMITED) — no himem node needed. Algorithmic fixes (tiered worker
-# pool + streaming FASTA reads + centroid roll-up) also landed in
-# fungi_tol_bridge.hpp to cut peak RSS further.
+# UNLIMITED) — no himem node needed. Tiered worker pools, streaming FASTA
+# reads, and centroid roll-up in fungi_tol_bridge.hpp cut peak RSS further.
 #
 # MALLOC_ARENA_MAX / MALLOC_TRIM_THRESHOLD_: tame glibc malloc per-thread
 # arenas (default = 8 × CPU_COUNT, so 16 cores × 8 = 128 arenas, each

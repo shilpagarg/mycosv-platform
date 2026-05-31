@@ -1039,9 +1039,9 @@ def save_panel_read_validation_rate(
     # leaves room for the two-row legend stacked above the title.
     fig_w = max(9.0, n_q * 0.65 + 3.0)
     fig, ax = plt.subplots(figsize=(fig_w, 5.6))
-    # Wong colorblind-safe palette: extending the previous 4-colour map with
-    # CC79A7 (pink, PGGB) and D55E00 (vermillion, Cactus). Both are distinct
-    # from the existing assignments and from the Glomero/Basidio/Asco phylum
+    # Wong colorblind-safe palette extended with CC79A7 (pink, PGGB) and
+    # D55E00 (vermillion, Cactus). Both are distinct from the caller colors
+    # and from the Glomero/Basidio/Asco phylum
     # band hues used in the background swaths below.
     color_for = {
         "mycosv":     "#0072B2",  # Wong blue

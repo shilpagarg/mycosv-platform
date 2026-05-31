@@ -2,20 +2,17 @@
 // layer2_registry.hpp — v14
 // Clade Graph Registry (Layer 2)
 //
-// Changes vs v12/v13
-// ==================
-//  DS-1   O(1) LRU eviction (Sleator & Tarjan 1985) — unchanged
-//  DS-2   Per-clade load-once shared_future guard — unchanged
-//  DS-3   Atomic-rename manifest flush — unchanged
+// Core responsibilities
+// =====================
+//  DS-1   O(1) LRU eviction (Sleator & Tarjan 1985)
+//  DS-2   Per-clade load-once shared_future guard
+//  DS-3   Atomic-rename manifest flush
 //  DS-17  FenwickTree for eviction accounting existed in earlier iterations.
 //         The current hot path uses O(1) LRU bookkeeping plus a running byte
 //         counter instead, which is simpler and cheaper for the present cache.
-//  FIX-M9 insert_into_cache no longer rebuilds any global accounting structure
-//         under the write-lock; eviction now relies on the running byte counter
-//         and O(1) LRU removal.
-//  FIX-M10 sanitize() is now a thin forwarder to tol::sanitize_name_impl
-//          so the character set is defined in exactly one place.  The impl
-//          is inlined here (cannot include fungi_tol_bridge.hpp — circular).
+//  sanitize() forwards to tol::sanitize_name_impl so the character set is
+//  defined in exactly one place. The impl is inlined here because including
+//  fungi_tol_bridge.hpp would create a cycle.
 
 #include "layer1_clade_graph.hpp"
 
@@ -137,10 +134,8 @@ inline std::vector<CladeDescriptor> load_manifest(const std::string& path) {
         std::istringstream ls(line);
         std::string cell;
         while (std::getline(ls, cell, '\t')) {
-            // Bug 5 fix: strip CR from CRLF-encoded manifests so the last cell
-            // (typically the fasta_paths or centroid_hashes column on the very
-            // last line of a CRLF manifest) doesn't keep a trailing '\r' that
-            // breaks fs::exists() downstream.
+            // Strip CR from CRLF-encoded manifests so the last cell does not
+            // keep a trailing '\r' that breaks fs::exists() downstream.
             if (!cell.empty() && cell.back() == '\r') cell.pop_back();
             cols.push_back(std::move(cell));
         }
@@ -167,8 +162,7 @@ inline std::vector<CladeDescriptor> load_manifest(const std::string& path) {
             std::istringstream fp(fastaCol);
             std::string path;
             while (std::getline(fp, path, ',')) {
-                // Bug 5 fix: defensive CR strip in case the cell-level strip
-                // above somehow missed it (e.g., embedded CR mid-list).
+                // Defensive CR strip for embedded CRs inside comma lists.
                 if (!path.empty() && path.back() == '\r') path.pop_back();
                 if (!path.empty()) c.fastaPaths.push_back(std::move(path));
             }
@@ -219,7 +213,7 @@ public:
         , maxCacheEntries_(maxCacheEntries)
     {}
 
-    // FIX-L: gbz_io::save runs outside any lock.
+    // Save graph payload outside the registry lock.
     void register_clade(const CladeGraph& g,
                         const std::vector<uint64_t>& centroidHashes = {}) {
         const std::string gbzPath = clade_path(g.cladeName);
@@ -401,15 +395,8 @@ private:
         return std::make_shared<CladeGraph>(gbz_io::load(descCopy.graphPath));
     }
 
-    // FIX-M9 + FIX-M15: insert_into_cache
-    //
-    // The byte counter cacheCurrentBytes_ is incremented BEFORE the eviction
-    // loop so that the loop always sees the would-be post-insertion size.
-    // Previously the counter was incremented after the loop, meaning the
-    // eviction test used the pre-insertion size and could leave the cache
-    // over-budget by exactly sz bytes when sz > 0, or fill indefinitely with
-    // zero-byte stub entries when sz == 0.
-    //
+    // Increment cacheCurrentBytes_ before eviction so the loop sees the
+    // would-be post-insertion size.
     // The full write-lock is held throughout (required for list/map
     // consistency).  The eviction itself is O(K) where K is the number of
     // entries evicted — no full Fenwick rebuild needed.

@@ -827,7 +827,7 @@ greedy_overlap_assemble(std::vector<std::string> seqs,
 // 2. Union-Find: reads sharing >=1 anchor (with <=200 total readers
 //    to skip repetitive anchors) are merged into one cluster.
 // 3. Per cluster: exact overlap assembly first; if that cannot merge the reads,
-//    fall back to the older majority-vote consensus.
+//    fall back to majority-vote consensus.
 // 4. Single-read clusters emitted directly (preserves truly unique loci).
 // ----------------------------------------------------------------
 inline std::unordered_map<std::string, std::string>
@@ -945,9 +945,8 @@ long_reads_to_pseudocontigs(const std::vector<RawRead>& reads,
     //
     // Cost stays bounded: repetitive anchors above degreeCap are skipped, so
     // each contributing anchor adds at most C(degreeCap,2) pairs, and the
-    // co-occurrence map is hard-capped to keep peak memory well under the
-    // cgroup limit. This is NOT the old all-pairs table (which had no degree
-    // cap and spent the whole timeout here).
+    // co-occurrence map is hard-capped to keep peak memory under the cgroup
+    // limit.
     {
         constexpr uint8_t MIN_SHARED_ANCHORS = 2;
         const size_t degreeCap = largeBatch ? 48 : 128;
@@ -1051,9 +1050,8 @@ long_reads_to_pseudocontigs(const std::vector<RawRead>& reads,
         for (uint32_t ri : selectedMembers) lens.push_back(reads[ri].seq.size());
         std::sort(lens.begin(), lens.end());
         const size_t medLen = lens[lens.size() / 2];
-        // FIX: medLen * 1.2 promotes size_t to double, which silently truncates for
-        // very large read lengths (double has 53-bit mantissa, size_t is 64 bits).
-        // Use integer arithmetic: medLen + medLen/5 = medLen * 1.2 exactly.
+        // Use integer arithmetic for medLen * 1.2 so very large size_t values
+        // are not rounded through double.
         const size_t capLen = medLen + medLen / 5 + 1;
 
         const std::array<uint32_t,5> zero_arr = {0u,0u,0u,0u,0u};
@@ -1226,8 +1224,8 @@ short_reads_to_pseudocontigs(const std::vector<RawRead>& reads,
     // keyed on the first (k-1) chars of the canonical form therefore misses
     // successors whose canonical form is their own RC: the RC's first (k-1)
     // chars differ from the last (k-1) chars of the current canonical k-mer.
-    // Fix: enumerate all four possible next bases, compute canonical(overlap+b),
-    // and look up directly in solid.  cur_actual tracks the k-mer in its
+    // Enumerate all four possible next bases, compute canonical(overlap+b),
+    // and look up directly in solid. cur_actual tracks the k-mer in its
     // traversal direction (may differ from its canonical form in solid/visited).
     std::unordered_set<std::string> visited;
     visited.reserve(solid.size());

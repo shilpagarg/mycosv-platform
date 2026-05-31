@@ -204,10 +204,10 @@ def augment_routing_store(index_dir: Path, target_centroids: int, seed: int) -> 
     hashes_per_centroid = max(16, max(len(row["hashes"]) for row in real_rows if row["hashes"]))
     decoys = target_centroids - len(real_rows)
     # Write to a per-process tmp path and os.replace() into position so a
-    # SLURM kill or OOM mid-write leaves the previous routing_centroids.bin
-    # intact instead of a half-written file with a truthful header and
-    # missing decoy records (which the C++ external store would then parse
-    # past EOF). The .skip companion is unlinked AFTER the rename so any
+    # SLURM kill or OOM mid-write leaves routing_centroids.bin intact instead
+    # of a half-written file with a truthful header and missing decoy records
+    # (which the C++ external store would then parse past EOF). The .skip
+    # companion is unlinked AFTER the rename so any
     # stale skip index is purged only when the new store actually lands.
     tmp_path = store_path.with_name(
         f"{store_path.name}.part.{os.getpid()}"

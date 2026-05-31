@@ -104,9 +104,7 @@ def discover_truth_sets(
                 d = comp_root / label / qasm
                 if not d.exists():
                     continue
-                # svim writes to <d>/svim_out/variants.vcf, not <d>/*.vcf —
-                # the previous glob missed it and silently dropped svim from
-                # the comparator callsets for every long-reads recompute.
+                # svim writes to <d>/svim_out/variants.vcf, not <d>/*.vcf.
                 candidates: list[Path] = []
                 if label == "svim":
                     candidates.append(d / "svim_out" / "variants.vcf")

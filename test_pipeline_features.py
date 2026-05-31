@@ -25,9 +25,7 @@ def read_magic(path: Path) -> int:
 def read_text_tsv(path: Path) -> str:
     return path.read_text()
 
-# Derive ROOT from this file's location so the tests work regardless of where
-# the repository is checked out.  The old hardcoded /mnt/data path caused every
-# test to fail immediately when the binary was not at that location.
+# Derive ROOT from this file's location so tests work from any checkout path.
 ROOT = Path(__file__).resolve().parent
 MAIN = ROOT / 'main.cpp'
 SIM = ROOT / 'test_amf.py'
@@ -61,9 +59,7 @@ def _relocate_windows_temp_exe(path: Path) -> Path:
     trusted = {slot.resolve() for slot in TRUSTED_EXE_SLOTS if slot.exists()}
     if resolved in trusted:
         return path
-    # Deep pytest temp paths are noticeably flakier on this machine than a
-    # short path directly under %TEMP%. A repo-local cache is more reliable
-    # than the older trusted-slot shim, so prefer it first.
+    # Deep pytest temp paths are flaky here; prefer a short repo-local cache.
     needs_relocation = temp_root in resolved.parents or resolved.parent == EXE_CACHE.resolve()
     if needs_relocation:
         try:
@@ -1140,9 +1136,9 @@ def test_simulator_produces_on_ref_truth_records_with_plain_names(
 def test_simulator_hint_mode_writes_sv_encoded_names(tmp_path: Path) -> None:
     """With --write-hint-contigs, contig names carry __sv_ suffixes.
 
-    This is the opt-in mode used only by legacy smoke tests.  It must not
-    be the default.  We verify that hint names are written when the flag
-    is present, and that the truth TSV records them faithfully.
+    This opt-in mode is for smoke tests only; it must not be the default.
+    Verify that hint names are written when the flag is present, and that the
+    truth TSV records them faithfully.
     """
     outdir = tmp_path / 'hint_sim'
     run([

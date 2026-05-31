@@ -526,8 +526,7 @@ def apply_rip(seq: str, window: int = 500, fraction: float = 0.3,
     This is measured by the RIP product index (TpA/CpA > 1.5) and RIP substrate
     index (CpA/TpA < 0.7). Ref: Selker et al. 2003; Cambareri et al. 1989.
 
-    Previous implementation used C→T on any C (incorrect; introduced GC-ratio
-    distortion without the canonical dinucleotide specificity).
+    Mutates only CpA context to preserve the canonical dinucleotide specificity.
     """
     rnd = random.Random(seed)
     bases = list(seq)

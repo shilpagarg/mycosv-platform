@@ -3,36 +3,12 @@
 
 // fungi_tol_bridge.hpp — v15
 //
-// Fixes vs v14
-// ============
-//  FIX-C1  TE classification for DEL: classify_repeat_element() now called on
-//          the deleted reference subsequence (rBreakStart–rBreakEnd, offset by
-//          contig start), enabling TE-mediated deletion annotation.
-//
-//  FIX-C2  HGT cross-clade novelty: Path C in both hierarchical_call_assembly
-//          and hierarchical_call_assembly_multirank now tracks sameCladeOverlap
-//          and otherCladeOverlap separately, calls score_cross_clade_novelty(),
-//          and stamps elementClass="HGT" when same-clade overlap < 0.05 and
-//          other-clade overlap >= 0.10.
-//
-// Fixes vs v13 (carried forward from v14)
-// ========================================
-//  FIX-B1  kmer_overlap_fraction: replaced unordered_set<string> O(N·k) with a
-//          rolling polynomial hash (FNV-1a) O(N) build → O(1) lookup.  This
-//          reduces peak memory from ~200 MB to ~4 MB on a 10 Mb AMF contig.
-//
-//  FIX-B2  try_mem_chain_call: chain index recovery now tracks the permutation
-//          array explicitly (O(N) copy) rather than a quadratic search-for-match.
-//
-//  FIX-B3  build_multi_rank_index_from_manifest: fully implemented.  Previously
-//          referenced in main.cpp but never defined — causing a linker error.
-//
-//  FIX-B4  hierarchical_call_assembly_multirank: real implementation that routes
-//          independently at each Linnaean rank (phylum→class→order→family→genus→species)
-//          and merges calls deduplicated by (contig, pos) key.
-//
-//  FIX-B5  GFA output for OFF_REF calls now includes EC:Z: (ElementClass) tag
-//          sourced from classify_repeat_element().
+// Integration layer for hierarchical fungal SV calling. Key responsibilities:
+//  - annotate DEL and OFF_REF sequence with repeat/TE/HGT element classes;
+//  - score cross-clade novelty using separate same-clade and other-clade overlap;
+//  - build and query multi-rank indices across Linnaean ranks;
+//  - recover MEM-chain provenance without quadratic chain-to-MEM lookup;
+//  - emit GFA records with element-class tags for downstream reports.
 
 #include <algorithm>
 #include <atomic>
@@ -280,12 +256,8 @@ inline std::string sanitize_filename(const std::string& s) {
 }
 
 // ── split_tab / split_csv ─────────────────────────────────────────────────
-// Bug 5 fix: registry manifests written with CRLF line endings (clade_manifest.tsv
-// in the million_real prepared dir is one such file) put a stray '\r' on the
-// last cell of every line. fs::exists() on those paths returns false because
-// the OS looks for "...fna.gz\r" which doesn't exist — every hierarchical-call
-// reference ref was silently dropped, leaving only OFF_REF whole-contig calls.
-// Strip the trailing CR here so every downstream caller sees clean cells.
+// Registry manifests written with CRLF line endings put a stray '\r' on the
+// last cell of every line. Strip it so downstream path lookups see clean cells.
 inline std::vector<std::string> split_tab(const std::string& line) {
     std::vector<std::string> out;
     std::string cur;
@@ -369,7 +341,7 @@ inline bool for_each_fasta_record(const std::string& path, Fn&& fn) {
     return any;
 }
 
-// ── FIX-B1: rolling-hash k-mer overlap ───────────────────────────────────
+// ── Rolling-hash k-mer overlap ────────────────────────────────────────────
 // Uses FNV-1a rolling hash so the unordered_set<string> allocation is
 // eliminated.  Build: O(N).  Lookup: O(k) per query k-mer.
 // For the AMF case (N~100 Mb) this cuts peak memory from ~500 MB to ~8 MB.
@@ -407,13 +379,9 @@ inline std::unordered_set<uint64_t> kmer_hashes(const std::string& seq, int k) {
     return kmer_hashes(std::string_view(seq.data(), seq.size()), k);
 }
 
-// k-mer Jaccard similarity: |A ∩ B| / |A ∪ B|.
-//
-// Previous version used min(|A|,|B|) as denominator (containment index).
-// That overstates similarity when one sequence is much shorter than the other
-// and causes false high-similarity routing for novel short contigs.
-// Standard Jaccard is used here: denom = |A| + |B| - |intersection|.
-//
+// k-mer Jaccard similarity: |A intersect B| / |A union B|. Standard Jaccard
+// avoids containment-style overstatement when one sequence is much shorter
+// than the other.
 // For the MEM-chain novelty scorer (Path C) and routing purposes, a value
 // close to 0 means "novel", close to 1 means "known reference match".
 inline double kmer_overlap_fraction(const std::string& a, const std::string& b, int k) {
@@ -465,14 +433,9 @@ inline bool is_low_complexity_sequence(std::string_view seq) {
             alphabet.insert(static_cast<char>(
                 std::toupper(static_cast<unsigned char>(ch))));
     if (alphabet.size() <= 1) return true;
-    // Algorithmic fix: was `ks.size() <= 1` (rejects only pure homopolymer
-    // but conflates with 2-base alternations). Tightened to reject pure
-    // homopolymer and very-low-diversity 5-mer profiles, but kept low
-    // enough that AT-rich STARSHIP hulls (typically 6–30 distinct 5-mers
-    // per 500 bp window) and TE termini pass. The previous test (≤ 1)
-    // missed clean homopolymer blends like 'AAAA…TTTT…'; the new floor
-    // (< 4) catches those without flagging real low-diversity-but-
-    // informative sequence.
+    // Reject pure homopolymer and very-low-diversity 5-mer profiles, while
+    // keeping the floor low enough that AT-rich STARSHIP hulls (typically
+    // 6-30 distinct 5-mers per 500 bp window) and TE termini pass.
     auto ks = kmer_hashes(seq, 5);
     return ks.size() < 4;
 }
@@ -522,10 +485,8 @@ public:
             d.compressedBytes = static_cast<size_t>(std::stoull(get("compressed_bytes", 6)));
             const std::string fastaCol = get("fasta_paths", SIZE_MAX);
             if (!fastaCol.empty()) d.fastaPaths = split_csv(fastaCol);
-            // Compatibility with a short-lived broken schema: older manifests
-            // had no fasta_paths column, so cols[7] was crc32. Treat that as
-            // metadata rather than a path; otherwise TolGlobal tried to open
-            // the CRC as a FASTA filename and loaded zero reference sequence.
+            // Compatibility: manifests without a fasta_paths column store
+            // crc32 in cols[7]. Treat that as metadata rather than a path.
             if (d.fastaPaths.empty() && cols.size() >= 8 && col.find("fasta_paths") == col.end()
                 && cols[7].find('/') != std::string::npos) {
                 d.fastaPaths = split_csv(cols[7]);
@@ -1610,7 +1571,7 @@ inline void build_tol_index_from_manifest(const std::string& manifestPath,
                   << " partitioned manifest groups\n";
 }
 
-// ── FIX-B3: build_multi_rank_index_from_manifest ─────────────────────────
+// ── build_multi_rank_index_from_manifest ─────────────────────────────────
 // Builds one routing shard + graph payload per (rank, clade) pair so the
 // multi-rank query path can route at phylum/class/order/family/genus/species
 // independently.  The extended manifest (9 columns) is required.
@@ -2216,7 +2177,7 @@ inline VariantCallBridge make_insdel_call(const std::string& qAsm,
 }
 
 // ── make_offref_call ──────────────────────────────────────────────────────
-// FIX-B5: also classifies the element type and stores it in elementClass.
+// Classifies the element type and stores it in elementClass.
 inline VariantCallBridge make_offref_call(const std::string& qAsm,
                                           const std::string& qContig,
                                           const std::string& seq,
@@ -2281,10 +2242,8 @@ discover_graph_native_offref_windows(const std::string& seq,
     const size_t n = seq.size();
     size_t win = minWindowBp;
     if (win == 0) {
-        // Off-ref window floor used to be hard-coded at max(minSvLen, 500), which
-        // masked sub-500 bp novelty events that minigraph/svim_asm easily detect.
-        // Allow windows down to max(minSvLen, 100) — still large enough that random
-        // k-mer overlap is informative but small enough to surface real microSVs.
+        // Allow windows down to max(minSvLen, 100): large enough that random
+        // k-mer overlap is informative, small enough to surface real microSVs.
         win = std::max<size_t>(
             fo.tolMinBlockBp > 0 ? fo.tolMinBlockBp : 0u,
             static_cast<size_t>(std::max(fo.minSvLen, 100)));
@@ -2355,12 +2314,9 @@ discover_graph_native_offref_windows(const std::string& seq,
             }
         }
         const std::string tier = infer_novelty_tier(bestOverlap);
-        // Algorithmic fix: previously only NOVEL/NOVEL_WEAK/DIVERGED
-        // windows were emitted, but OFF_REF_KNOWN (overlap ≥ 0.20) windows
-        // are *also* SVs in the pangenome sense — they represent reference
-        // segments either missing from the query reference set or present
-        // in a divergent location. Emit them too; downstream tiering still
-        // labels them OFF_REF_KNOWN.
+        // OFF_REF_KNOWN (overlap >= 0.20) windows are also SVs in the
+        // pangenome sense: reference segments missing from the query reference
+        // set or present in a divergent location.
         if (tier != "NOVEL" && tier != "NOVEL_WEAK" && tier != "DIVERGED" &&
             tier != "OFF_REF_KNOWN") continue;
         OffRefWindowCall ow;
@@ -2421,9 +2377,9 @@ inline VariantCallBridge make_offref_window_call(const std::string& qAsm,
     return v;
 }
 
-// ── FIX-B2: try_mem_chain_call ────────────────────────────────────────────
+// ── try_mem_chain_call ────────────────────────────────────────────────────
 // The order permutation is tracked explicitly so chain-to-MEM recovery is O(N)
-// instead of the previous quadratic search.
+// instead of quadratic.
 static bool try_mem_chain_call(
         const std::string& qAsm,
         const std::string& qContig,
@@ -2531,8 +2487,8 @@ static bool try_mem_chain_call(
 
         auto res = SvTypeFromChain::classify(chain, chainRev, sa, fo.minSvLen);
 
-        // DUP fallback: ChainTreap requires strictly-increasing rPos and silently
-        // drops backward-mapping MEMs that are the signature of tandem duplications.
+        // DUP fallback: ChainTreap requires strictly increasing rPos and drops
+        // backward-mapping MEMs that are the signature of tandem duplications.
         // Re-classify the qPos-sorted forward MEMs directly to catch that pattern.
         // Also re-check INS calls: with 1% divergence the primary chain sees a net
         // positive query gap (delta > 0) and classifies DUPs as INS.
@@ -2586,11 +2542,10 @@ static bool try_mem_chain_call(
                     continue;
                 }
                 if (ci >= 0 && ci != srcCtg) {
-                    // Allow cross-assembly TRAs: in the hierarchical TOL mode the SA
-                    // intentionally contains multiple reference assemblies per clade, so
-                    // a query breakpoint matching contigs from different assemblies is a
-                    // valid intra-clade TRA (or HGT candidate). Blocking cross-assembly
-                    // pairs was causing TRA recall=0 in multi-reference SA contexts.
+                    // Allow cross-assembly TRAs: hierarchical TOL SAs contain
+                    // multiple reference assemblies per clade, so a query
+                    // breakpoint matching different assemblies is a valid
+                    // intra-clade TRA or HGT candidate.
                     const int qGap = m.qPos - (srcMem->qPos + srcMem->len);
                     if (qGap >= 0 && qGap <= traGap &&
                         (dstMem == nullptr || m.len > dstMem->len))
@@ -2746,8 +2701,7 @@ static bool try_mem_chain_call(
             }
         } else if (res.type == T2::DEL && primaryRef != nullptr && primaryRef->has_seq()) {
             const double gcBg = primaryRef->cladeGc;
-            // SvTypeFromChain::classify now returns local-contig coordinates,
-            // so no subtraction of contigEnd is required here.
+            // SvTypeFromChain::classify returns local-contig coordinates here.
             const int rS = res.rBreakStart;
             const int rE = res.rBreakEnd;
             const auto& refSeq = primaryRef->seq();
@@ -2796,21 +2750,15 @@ static bool try_mem_chain_call(
 // ── multi-ref suffix-array cache ──────────────────────────────────────────
 // try_mem_chain_call_multi builds a SuffixArray over the concatenated top-K
 // reference contigs. The ref set is selected from the query contig's
-// k-mer-similar shortlist, so consecutive query contigs of the *same* genome
-// route to the same (or near-identical) ref set — yet the original code
-// rebuilt the SA from scratch on every call. SuffixArray::build is
-// O(N log^2 N); on chromosome-scale fungal query contigs (~150 contigs across
-// 5 genomes, multi-Mb concatenated ref text each) that per-contig rebuild was
-// the dominant cost after the ChainTreap fix and is why assembly-mode runs
-// blew past the 4 h wall clock.
+// k-mer-similar shortlist, so consecutive query contigs of the same genome
+// route to the same or near-identical ref set. SuffixArray::build is
+// O(N log^2 N), so cache built SAs across contigs.
 //
 // This LRU cache keys a built SA by the exact ordered set of RefSeq pointers
 // that went into it (pointers are stable for the program lifetime). It is a
-// single PROCESS-WIDE cache guarded by a mutex — NOT thread_local: with 8
-// worker threads a 1 GB per-thread cache would need 8 GB, which on top of the
-// SingleRefMemCache budget blows the 12 GiB cgroup cap and the process is
-// OOM-killed mid-write (0-byte VCF). The shared cache is bounded once for the
-// whole process. Returned values are shared_ptr, so a thread keeps its SA
+// single process-wide cache guarded by a mutex, not thread_local, so the cache
+// is bounded once for the whole process. Returned values are shared_ptr, so a
+// thread keeps its SA
 // alive even if another thread evicts that entry concurrently — only the
 // lookup/insert is serialised, the (expensive) SA *use* is lock-free.
 struct MultiRefSaCache {
@@ -2829,12 +2777,10 @@ struct MultiRefSaCache {
     // rate.
     //
     // Runtime-overridable via MYCOSV_SA_CACHE_MB (default 2048). Read-mode
-    // pangenome passes iterate up to N benchmark refs PER pseudo-contig; with
-    // thousands of pseudo-contigs and a ~455 MB SA per ~35 Mbp genome, a 2 GiB
-    // budget holds only ~4 SAs and thrashes (rebuilding ~all of them every
-    // contig — this was the ~7.6 min/contig wall). Sizing the cache to hold all
-    // benchmark-ref SAs makes per-contig cost a cache hit. Pure cache sizing:
-    // identical calls, just fewer rebuilds; benefits assembly mode too.
+    // pangenome passes iterate up to N benchmark refs per pseudo-contig; with
+    // thousands of pseudo-contigs and large ref SAs, small budgets thrash.
+    // Sizing the cache to hold all benchmark-ref SAs makes per-contig cost a
+    // cache hit. Pure cache sizing: identical calls, fewer rebuilds.
     static size_t max_bytes() {
         static const size_t v = [] {
             size_t mb = 2048;
@@ -2992,15 +2938,11 @@ static bool try_mem_chain_call_multi(
             posToMemIdx.emplace(key, mi);
         }
 
-        // ALGORITHMIC FIX (recall): iterative primary-chain extraction.
-        // treap.best_chain_path() returns the highest-SCORING chain — a
-        // single long MEM (score = len) routinely outranks a multi-anchor
-        // chain of shorter MEMs. The previous code returned immediately when
-        // the first chain was a singleton (for non-shortPseudo queries),
-        // throwing away every multi-anchor chain hiding behind it. Now we
-        // skip singleton primaries by marking their MEMs consumed and
-        // rebuilding the treap, until we find a chain with >=2 anchors or
-        // exhaust the score floor.
+        // Iterative primary-chain extraction. treap.best_chain_path() returns
+        // the highest-scoring chain, so a single long MEM can outrank a
+        // multi-anchor chain of shorter MEMs. Skip singleton primaries by
+        // marking their MEMs consumed and rebuilding until a chain has >=2
+        // anchors or the score floor is exhausted.
         std::vector<bool> primaryConsumed(allMems.size(), false);
         std::vector<SuffixArray::Mem> chain;
         std::vector<bool> chainRev;
@@ -3091,7 +3033,7 @@ static bool try_mem_chain_call_multi(
             events = SvTypeFromChain::classify_all(chain, chainRev, sa, fo.minSvLen);
         }
 
-        // DUP fallback: ChainTreap silently drops backward-mapping MEMs that signal
+        // DUP fallback: ChainTreap drops backward-mapping MEMs that signal
         // tandem dups; re-classify the forward MEMs to catch that pattern.
         const bool needsDupRescue = events.empty() ||
             (events.size() == 1 && events.front().type == SvTypeFromChain::Type::INS);
@@ -3167,9 +3109,8 @@ static bool try_mem_chain_call_multi(
         // Merge adjacent small INS/DEL events of the same type within mergeWindow bp
         // to keep the call set comparable to comparator truth (svim_asm collapses
         // microsatellite-adjacent indels into a single record).
-        // The window must not scale with minSvLen — at --min-svlen 200 the
-        // old formula folded every event within 400 bp into one record, which
-        // is exactly the TE-burst regime fungal pangenomes care about.
+        // The window must not scale with minSvLen: TE-burst regions can carry
+        // multiple real events within a few hundred bp.
         const int mergeWindow = 80;
         std::sort(events.begin(), events.end(),
                   [](const SvTypeFromChain::Result& a,
@@ -3198,7 +3139,7 @@ static bool try_mem_chain_call_multi(
         // converted to events, remove its query footprint and mine additional
         // non-overlapping chains for the same (query contig, reference) pair.
         // This rescues fragmented/read pseudo-contigs where one strong local
-        // path previously suppressed many weaker but valid SV-bearing paths.
+        // path can otherwise suppress weaker but valid SV-bearing paths.
         std::vector<std::pair<int,int>> usedQ;
         usedQ.reserve(chain.size());
         for (const auto& m : chain)
@@ -3252,16 +3193,11 @@ static bool try_mem_chain_call_multi(
                 extraChain.push_back(allMems[static_cast<size_t>(mi)]);
                 extraRev.push_back(isRev[static_cast<size_t>(mi)]);
             }
-            // ALGORITHMIC FIX (recall): treap.best_chain_path() returns the
-            // highest-SCORING chain — a single long MEM (score = len) often
-            // outranks a multi-anchor chain of shorter MEMs. The previous
-            // `break` on size<2 (or empty events) abandoned ALL further
-            // iterations, throwing away any genuine multi-anchor chains
-            // hiding behind the long singleton. Mark this chain's q-footprint
-            // consumed and `continue` so the next iteration's treap rebuild
-            // can surface the multi-anchor chains we actually want. The
-            // `extraOrder.empty()` and `extraScore < effectiveMinBlockScore`
-            // breaks above plus the loop bound still guarantee termination.
+            // treap.best_chain_path() returns the highest-scoring chain. A
+            // single long MEM can outrank a multi-anchor chain of shorter MEMs;
+            // mark this chain's q-footprint consumed and continue so the next
+            // treap rebuild can surface multi-anchor chains. The empty-order,
+            // low-score, and loop-bound exits still guarantee termination.
             if (extraChain.size() < 2) {
                 for (const auto& m : extraChain)
                     usedQ.push_back({m.qPos, m.qPos + m.len});
@@ -3403,14 +3339,9 @@ static bool try_mem_chain_call_multi(
             v.svlen = res.svLen;
             if (res.type != T::TRA)
                 v.refContig = res.rContig.empty() ? v.refContig : res.rContig;
-            // ALGORITHMIC FIX (provenance + dedup): when the multi-ref chain
-            // spans contigs from different ref ASSEMBLIES, override the
-            // primaryRef-derived refAsm/cladeRank/phylum to match the actual
-            // event's contig. Without this, every event in the chain inherits
-            // the first contig's assembly even when the SV is anchored on a
-            // different ref's chromosome — corrupting refAsm-keyed dedup
-            // (select_best_call_per_contig, multirank merge_calls) and the
-            // multisample VCF's per-(qAsm, refAsm) provenance tags.
+            // When a multi-ref chain spans contigs from different reference
+            // assemblies, use the event contig's refAsm/cladeRank/phylum so
+            // dedup and multisample provenance stay keyed to the true anchor.
             if (res.type != T::TRA && eventRef != nullptr && eventRef != primaryRef) {
                 v.refAsm = !eventRef->asmName.empty()
                     ? eventRef->asmName
@@ -3561,9 +3492,8 @@ static bool try_mem_chain_call_multi(
 // ── per-contig checkpoint hook ───────────────────────────────────────────
 // Thread-local: lets the caller (main.cpp process_query) inject a flush
 // callback that runs the moment each contig is fully processed inside
-// hierarchical_call_assembly. Without this, the function buffers all 15+
-// contigs' calls and only the caller's per-query flush runs — so a SIGTERM
-// mid-query loses every contig that was already chained.
+// hierarchical_call_assembly, so checkpointing preserves completed contigs
+// even if a job ends mid-query.
 using PerContigFlushHook = std::function<void(const std::string& qAsm,
                                               const std::string& contigName,
                                               const std::vector<VariantCallBridge>& contigCalls)>;
@@ -3648,10 +3578,9 @@ hierarchical_call_assembly(const std::string& qAsm,
     for (const auto& kv : contigs) {
         const std::string& name = kv.first;
         const std::string& seq  = kv.second;
-        // Per-contig flush guard: ensures completed-contig calls are flushed
-        // to the checkpoint sink the moment this iteration ends, regardless
-        // of which `continue` path (A/B/C) terminates it. Without this, a
-        // SIGTERM mid-query loses every previously-finished contig.
+        // Per-contig flush guard: completed-contig calls are flushed to the
+        // checkpoint sink when this iteration ends, regardless of which
+        // `continue` path (A/B/C) terminates it.
         ContigFlushGuard _flushGuard{out, out.size(), qAsm, name};
         const auto routed = skipPerContigRouting
             ? std::vector<std::string>{}
@@ -3820,11 +3749,8 @@ hierarchical_call_assembly(const std::string& qAsm,
                 }
             }
 
-            // Previously: required bestDelta ≤ min(|q|,|r|)/2. That clamp
-            // silently dropped accessory-chromosome PAV (the largest, most
-            // biologically meaningful events in fungal pangenomes) because
-            // the length difference exceeds half the shorter contig by
-            // definition. Length fallback now only requires minSvLen/maxSvLen.
+            // Accessory-chromosome PAV can exceed half the shorter contig by
+            // definition, so length fallback only requires minSvLen/maxSvLen.
             if (best && bestDelta >= fo.minSvLen && bestDelta <= fo.maxSvLen) {
                 out.push_back(make_insdel_call(qAsm, name, *best,
                                                static_cast<int>(seq.size()), fo));
@@ -3833,9 +3759,9 @@ hierarchical_call_assembly(const std::string& qAsm,
                 continue;
             }
             // Best ref matched but the contig-wide length delta is too small
-            // to call as one SV. Emit per-window OFF_REF/INDEL calls so sub-
-            // contig variants are not silently absorbed by Path C's whole-
-            // contig fallback.
+            // to call as one SV. Emit per-window OFF_REF/INDEL calls so
+            // sub-contig variants are not absorbed by Path C's whole-contig
+            // fallback.
             if (best) {
                 size_t windowsBefore = out.size();
                 append_window_calls(name, seq);
@@ -3890,8 +3816,8 @@ hierarchical_call_assembly(const std::string& qAsm,
             }
         }
         const bool hasRoutingCtx = !routedClades.empty();
-        // Match the loosened thresholds in score_cross_clade_novelty:
-        // sameClade < 0.10, otherClade ≥ 0.08, other − same ≥ 0.05.
+        // Match score_cross_clade_novelty thresholds: sameClade < 0.10,
+        // otherClade >= 0.08, other - same >= 0.05.
         const bool isHgt = hasRoutingCtx &&
             sameCladeOverlap < 0.10 &&
             otherCladeOverlap >= 0.08 &&
@@ -4205,7 +4131,7 @@ hierarchical_call_assembly_multirank(
                     }
                 }
                 const bool hasRoutingCtx = !routedClades.empty();
-                // Loosened thresholds — see score_cross_clade_novelty note.
+                // Same thresholds as score_cross_clade_novelty.
                 const bool isHgt = hasRoutingCtx &&
                     sameCladeOverlap < 0.10 &&
                     otherCladeOverlap >= 0.08 &&

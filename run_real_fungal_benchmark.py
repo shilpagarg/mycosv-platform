@@ -727,10 +727,7 @@ def run_mycosv_command(
         if stream_stdout_path is not None and stream_stderr_path is not None:
             # Stream mode: stdout/stderr go straight to disk so the operator
             # can `tail -f` the log and see whether MycoSV is alive or stuck
-            # on a specific query. This is the fix for "the benchmark looks
-            # hung but is actually working" — subprocess.run with capture_output
-            # buffers all bytes until exit, which made any long per-query
-            # routing/loading silently invisible.
+            # on a specific query.
             sys.stderr.write(
                 f"[mycosv] streaming stderr -> {stream_stderr_path}\n"
                 f"[mycosv]   `tail -f {stream_stderr_path}` to watch live\n"
@@ -865,20 +862,14 @@ _HTTP_TIMEOUT = 300  # seconds; prevents hanging on slow/unresponsive NCBI
 # the bulk download loop sees.  4xx other than 429 are permanent (e.g. 404
 # for an assembly that doesn't expose a GFF) and are not retried.
 _HTTP_RETRY_STATUS = {429, 500, 502, 503, 504}
-# 8 attempts at 2,4,8,16,32,60,60,60 = ~242 s end-to-end. The previous 5-attempt
-# schedule (max 30s total) gave up while NCBI's ftp.ncbi.nlm.nih.gov mirror was
-# still in a 503 burst — saw 4 hard failures (GCA_000507425_3, GCA_003184365_1,
-# GCA_020503465_1, GCA_051529335_1) in the prep run. Going to 8 attempts plus a
-# longer backoff cap keeps the failure rate near zero on a typical server hiccup
-# without blowing wall time on a permanent outage.
+# 8 attempts with exponential backoff gives mirrors time to recover from
+# short 503 bursts without spending excessive wall time on permanent outages.
 _HTTP_MAX_ATTEMPTS = 8
 _HTTP_BACKOFF_BASE = 2.0
 _HTTP_BACKOFF_CAP  = 90.0
-# Max workers for ftp.ncbi.nlm.nih.gov. 8 was the prior default but the
-# 2026-05-15 prep run (slurm-14936460) still saw a sustained 503 storm —
-# hundreds of [retry] lines, multiple URLs climbing to attempt 4/8. Dropping
-# to 6 + the per-host semaphore/cooldown below keeps GFF throughput close to
-# the 8-worker run while staying inside NCBI's well-behaved client window.
+# Max workers for ftp.ncbi.nlm.nih.gov. Six workers plus the per-host
+# semaphore/cooldown keeps GFF throughput high while staying inside NCBI's
+# well-behaved client window.
 _HTTP_MAX_PARALLEL_FTP_NCBI = 6
 
 # Hosts we treat as a single overloadable resource. When a 503/429 fires on
@@ -1048,9 +1039,8 @@ def http_download(url: str, dest: Path) -> Path:
             shutil.copyfileobj(resp, out)
         # Validate Content-Length when the server advertised one. ENA / NCBI
         # mirrors occasionally close the connection after writing a partial
-        # stream without raising IncompleteRead, which previously cached a
-        # truncated .gz that later blew up at decompress time as
-        # "Compressed file ended before the end-of-stream marker was reached".
+        # stream without raising IncompleteRead; catch that before caching a
+        # truncated .gz that later fails during decompression.
         if content_length is not None:
             try:
                 expected = int(content_length)
@@ -1159,12 +1149,10 @@ def subset_fastq_records(src: Path, dest: Path, max_records: int) -> tuple[Path,
                     # ENA bulk downloads are intentionally capped at
                     # READ_VALIDATION_MAX_BASES and frequently end mid-record
                     # without the gzip EOF marker. Keep the complete records
-                    # decoded so far rather than discarding the whole subset:
-                    # the previous behaviour re-raised here, the caller fell
-                    # back to the raw truncated .gz, and no read_subsets/*.fastq
-                    # was materialised -- which silently disabled reference-free
-                    # validation (and thus the pangenome-only call layer) for
-                    # every sample whose download truncated before max_records.
+                    # decoded so far rather than discarding the whole subset;
+                    # otherwise reference-free validation and the pangenome-only
+                    # call layer lose usable complete records from partial
+                    # capped downloads.
                     sys.stderr.write(
                         f"[reads-mode] {src.name}: input truncated after "
                         f"{count} complete record(s) ({type(exc).__name__}); "
@@ -1803,8 +1791,8 @@ def species_group_key(row: dict[str, str]) -> str:
 
 # NCBI Taxonomy renames that have left panel presets out of sync. Each entry
 # maps a panel-preset species name to additional accepted names that NCBI's
-# assembly_summary may use today. Add bidirectionally so legacy and current
-# names both match. Sourced from the 2019–2023 Saccharomycetes reclassification
+# assembly_summary may use today. Add bidirectionally so synonym and current
+# names both match. Sourced from the 2019-2023 Saccharomycetes reclassification
 # (Takashima & Sugita) and the 2024 ICTF list updates.
 SPECIES_ALIASES: dict[str, list[str]] = {
     "candida glabrata": ["nakaseomyces glabratus", "nakaseomyces glabrata", "[candida] glabrata"],
@@ -2205,9 +2193,7 @@ def _ensembl_fungi_gff_url(
     return url, filename
 
 
-# Tally of per-asm annotation outcomes. download_ncbi_gene_annotation_source
-# used to emit one stderr line per assembly without a NCBI GFF (1400+ lines
-# in a 2000-assembly run, drowning real errors). The function now records
+# Tally of per-asm annotation outcomes. The download helper records
 # (kind, asm_name) tuples here; the caller prints a single summary line.
 ANNOTATION_SOURCE_TALLY: dict[str, list[str]] = {
     "ncbi_gff": [],
@@ -2326,7 +2312,7 @@ def _atlas_species_slug(species: str) -> str:
 def _atlas_species_matches(record_species: str, target_species: str) -> bool:
     """Loose species match: case-insensitive, tolerates `Genus_species` vs
     `Genus species`, allows the Atlas `Genus species (strain/subspecies ...)`
-    variants, and the legacy `[Candida] foo` synonym style. Used to drop the
+    variants, and bracketed `[Candida] foo` synonym style. Used to drop the
     catalog-wide noise the Atlas endpoint returns when its `species=` param is
     not respected server-side.
     """
@@ -2464,8 +2450,8 @@ def fetch_atlas_experiment_analytics(
     # working file-based downloader is /experiments-content/<acc>/resources/
     # ExperimentDownloadSupplier.RnaSeqDifferential/tsv which streams the
     # gene-level analytics TSV directly. We try the modern path first and
-    # fall back to the legacy one only if the new URL also returns HTML —
-    # gives us a clean upgrade path without forcing a cache wipe.
+    # fall back to the accessKey URL only if the direct TSV path also returns
+    # HTML, giving a clean upgrade path without forcing a cache wipe.
     candidate_urls = (
         f"https://www.ebi.ac.uk/gxa/experiments-content/{experiment_accession}"
         f"/resources/ExperimentDownloadSupplier.RnaSeqDifferential/tsv",
@@ -2690,10 +2676,8 @@ def write_ecological_summary_tsv(
         trait_name = (record.get("trait_name") or "").strip().lower()
         trait_value = (record.get("value") or "").strip()
         if trait_name and trait_value:
-            # The current traitecoevo/fungaltraits export is long-form
-            # (speciesMatched, trait_name, value). Pivot the ecology fields we
-            # use so the downstream join can consume it like the older wide
-            # FungalTraits v1.2 CSV.
+            # Pivot the long-form traitecoevo/fungaltraits export into the
+            # wide ecology fields consumed downstream.
             pivoted = {
                 "GENUS": genus,
                 "SPECIES": species,
@@ -2880,10 +2864,8 @@ def snapshot_mycosv_outputs(out_prefix: Path) -> dict[Path, bytes]:
     """Keep prior MycoSV artifacts in memory before a rerun truncates them.
 
     The C++ binary streams directly to calls.vcf/calls.hits.tsv/calls.gfa. If a
-    rerun is killed mid-write, the old successful callset used to be lost and
-    replaced by a partial or failure-header file. These artifacts are small
-    enough for the real-data benchmark panels, and preserving them makes failed
-    reruns diagnosable instead of destructive.
+    rerun is killed mid-write, restore the last complete artifacts instead of
+    leaving a partial or failure-header file.
     """
     snapshots: dict[Path, bytes] = {}
     for path in (
@@ -3216,13 +3198,9 @@ def stream_gene_annotations_to_tsv(
 ) -> int:
     """Stream gene rows source-by-source straight to disk with alias expansion.
 
-    The non-streaming path used to collect every parsed gene from every
-    GFF/GBFF source plus its alias duplicates into a single in-memory list
-    before calling write_tsv. With 2000 GBFF sources (~10K genes each) and
-    per-row alias expansion to ~3-5 owners, that materialised 60M+ dicts and
-    OOM-killed prepare_million_real under the 12 GiB cgroup cap before any
-    TSV bytes hit disk. Streaming bounds memory to one source (~10K rows)
-    at a time.
+    Streaming bounds memory to one source at a time. With thousands of GBFF
+    sources and alias expansion to multiple owners, a single in-memory list
+    would be much larger than the 12 GiB cgroup budget.
 
     Returns the number of rows written (header excluded).
     """
@@ -3321,10 +3299,8 @@ def ena_filereport_species_url(species: str, max_rows: int = 200) -> str:
 
 
 def fetch_ena_read_runs_by_species(species: str, max_rows: int = 200) -> list[dict[str, str]]:
-    # Try the preset name first, then SPECIES_ALIASES (NCBI/ENA renames such as
-    # Candida glabrata -> Nakaseomyces glabratus). ENA's filereport keys on the
-    # current scientific_name, so a panel still using the legacy name otherwise
-    # silently returns 0 runs even though reads exist under the new genus.
+    # Try the preset name first, then SPECIES_ALIASES for NCBI/ENA renames
+    # such as Candida glabrata -> Nakaseomyces glabratus.
     candidates: list[str] = [species]
     candidates.extend(SPECIES_ALIASES.get(species.strip().lower(), []))
     seen: set[str] = set()
@@ -3440,12 +3416,8 @@ def filter_ena_rows_for_mode(rows: list[dict[str, str]], query_mode: str) -> lis
     if not preferred:
         return rows
     matched = [row for row in rows if (row.get("instrument_platform") or "").upper() in preferred]
-    # Hard filter: an Illumina run must NOT be returned for long-reads mode (and
-    # vice versa). The previous `matched or rows` fallback caused species with
-    # no long-read submissions (e.g. L. kluyveri) to receive the same Illumina
-    # accessions for both short-reads and long-reads modes — the resulting
-    # files were byte-identical, mislabeled, and broke downstream platform
-    # detection in the SV callers.
+    # Hard filter: an Illumina run must not be returned for long-reads mode
+    # and vice versa, otherwise downstream SV callers see mislabeled input.
     # Drop runs with read_count below the noise floor — saw `SRR33624766: 1
     # reads` in production, which is a sentinel ENA upload and aligns to nothing.
     # When read_count is absent (older submissions), keep the row so we don't
@@ -3502,10 +3474,8 @@ def select_ena_read_sources(run_rows: list[dict[str, str]], query_mode: str, max
     picked_runs = 0
     for row in filtered:
         # Only accept ENA's curated FASTQ mirrors. submitted_ftp can carry
-        # `.bas.h5`, `.bax.h5`, and `.metadata.xml` for older PacBio runs (e.g.
-        # ERR3500124), which the previous fallback happily concatenated into a
-        # `.fastq` file — every downstream caller then died with a UTF-8
-        # decode error. If fastq_ftp is empty we have no usable reads.
+        # PacBio `.bas.h5`, `.bax.h5`, and `.metadata.xml` payloads; if
+        # fastq_ftp is empty we have no usable reads.
         row_urls = [
             item for item in split_values(row.get("fastq_ftp", ""))
             if sequence_kind_from_name(item) == "fastq"
@@ -3543,12 +3513,9 @@ def selected_urls_from_ena_meta(meta: dict[str, str]) -> list[str]:
 
 def merge_sequence_sources(sources: list[str], dest_prefix: Path) -> Path:
     # Byte-mode concatenation. ENA mirrors occasionally serve compressed FASTQs
-    # whose extension does not match their magic bytes (bz2/zstd/partial), and
-    # the previous text-mode merge crashed at the first non-UTF-8 byte (seen in
-    # production as "'utf-8' codec can't decode byte 0x89" on Rhizophagus
-    # long-reads). Treating the payload as opaque bytes is safe because every
-    # downstream consumer (mycosv, samtools, minimap2, comparators) reads
-    # gzip-/text- formats via their own auto-detection.
+    # whose extension does not match their magic bytes (bz2/zstd/partial).
+    # Treating payloads as opaque bytes is safe because downstream consumers
+    # do their own gzip/text auto-detection.
     if not sources:
         raise ValueError("No sequence sources were provided")
     kind = sequence_kind_from_name(sources[0])
@@ -3564,10 +3531,9 @@ def merge_sequence_sources(sources: list[str], dest_prefix: Path) -> Path:
             try:
                 _validate_fastq_payload(out_path)
             except ValueError as exc:
-                # Cached file from a previous run is corrupt (e.g. PacBio
-                # bas.h5 / metadata.xml saved as `.fastq`). Drop it so the
-                # caller can retry against a different ENA accession instead
-                # of silently re-using a 10 GB blob of garbage forever.
+                # Cached payload is corrupt (for example, PacBio bas.h5 /
+                # metadata.xml saved as `.fastq`). Drop it so the caller can
+                # retry against a different ENA accession.
                 sys.stderr.write(f"[reads-mode] dropping corrupt cached payload: {exc}\n")
                 # _validate_fastq_payload already unlinked the file before
                 # raising — fall through to the re-download path.
@@ -3588,7 +3554,7 @@ def merge_sequence_sources(sources: list[str], dest_prefix: Path) -> Path:
                 # Bail on empty / HTML-error-page payloads (gzip header alone
                 # is 10 bytes; a one-record gzipped FASTQ is ~40-100 bytes,
                 # so 20 catches "obviously broken" without rejecting tiny
-                # fixtures). The previous silent skip let mycosv read 0
+                # fixtures). Empty payloads can otherwise let mycosv read 0
                 # sequences and still report success.
                 if local_part != out_path and local_part.parent == dest_prefix.parent and local_part.exists():
                     local_part.unlink()
@@ -3629,11 +3595,8 @@ def _validate_fastq_payload(path: Path) -> None:
 
     ENA `submitted_ftp` and a few legacy mirrors occasionally serve PacBio
     `.bas.h5` / `.metadata.xml` payloads (XML preamble + HDF5 binary) that
-    look superficially like a generic blob. The previous code wrote those
-    bytes to a `.fastq` file and every downstream comparator then died with
-    `'utf-8' codec can't decode byte 0x89 in position N: invalid start byte`.
-    Rather than emit a corrupt file, fail fast so the caller can drop the
-    run and pick a different ENA accession.
+    look superficially like generic blobs. Fail fast rather than emit a
+    corrupt FASTQ so the caller can choose another ENA accession.
     """
     try:
         with path.open("rb") as fh:
@@ -3914,11 +3877,8 @@ def prepare_from_ncbi(args: argparse.Namespace) -> int:
             matches = select_species_rows(all_rows, sel["species"], args.max_assemblies_per_species)
             if not matches:
                 # Surface this loudly so the operator does not silently lose a
-                # panel reference (e.g. Leptosphaeria maculans / Ustilago
-                # maydis disappeared from a previous run because no entry in
-                # assembly_summary started with those exact names — the
-                # species are present in NCBI but as `Plenodomus` synonyms or
-                # `Mycosarcoma maydis` / `[U.] maydis`. Add to SPECIES_ALIASES
+                # panel reference when assembly_summary uses a synonym such as
+                # `Plenodomus` or `Mycosarcoma maydis`. Add to SPECIES_ALIASES
                 # to recover them.
                 sys.stderr.write(
                     f"[panel-select] WARNING: no NCBI assembly matched species "
@@ -4487,11 +4447,8 @@ def prepare_from_ncbi(args: argparse.Namespace) -> int:
 
 
 def load_query_manifest(path: Path) -> list[dict[str, str]]:
-    # Surface a clear, actionable error when the manifest is missing — the raw
-    # FileNotFoundError used to bubble up from `path.open()` deep in benchmark()
-    # with no hint that the upstream `prepare` step never finished (e.g. another
-    # job partially cleaned the prepared dir, or the user pointed --prepared-dir
-    # at the wrong place).
+    # Surface a clear, actionable error when the manifest is missing, usually
+    # because `prepare` never finished or --prepared-dir points at the wrong place.
     if not path.exists():
         raise FileNotFoundError(
             f"query_manifest.tsv not found at {path}. The prepared directory is "
@@ -5162,8 +5119,8 @@ def load_mycosv_paired_calls(
     Lets the benchmark loop, after matching reference-coord truth vs
     reference-coord mycosv predictions, attribute the comparator-support label
     back to the QUERY-coord call_key that `support_by_key` is indexed by — the
-    bridge across coord spaces that was previously missing and caused every
-    mycosv call in biology_findings.tsv to be flagged `mycosv_unique=yes`.
+    bridge across coordinate spaces so biology_findings.tsv can mark
+    `mycosv_unique` accurately.
     """
     query_calls: list[NormalizedCall] = []
     ref_calls: list[NormalizedCall] = []
@@ -5763,9 +5720,8 @@ def match_calls_detail(
     # Two-pass match. Pass 1 is the historical greedy 1:1: each pred can
     # claim at most one truth (and vice versa), nearest-distance first. Pass 2
     # then sweeps remaining truth and credits any that fall inside the span of
-    # a pred already used in pass 1 via the span-contain rule — this fixes
-    # the coarse-chain credit leak where a single mycosv chain-level DEL
-    # spans N fine-grained truth DELs and previously got TP=1 + FN=(N-1).
+    # a pred already used in pass 1 via the span-contain rule. A single coarse
+    # mycosv chain-level DEL can span N fine-grained truth DELs.
     # The pred is not re-consumed; it still counts as one pred for precision,
     # but recall properly reflects every truth event the coarse chain covers.
     # Returns (used_pred_indices, used_truth_indices, missed_truth_indices).
@@ -6648,12 +6604,11 @@ def _build_validation_bam(
     """
     mode = (query_row.get("query_mode") or "assembly").lower()
     if mode == "assembly":
-        # Assembly inputs are not raw reads. The old default aligned whole
-        # assemblies as pseudo-reads to a sibling benchmark reference, which
-        # is slow for fragmented fungal assemblies and often creates a
-        # misleading 0-byte/empty validation SAM after timeout. Keep this as
-        # an explicit opt-in for debugging, while the benchmark loop uses
-        # MycoSV's intrinsic assembly-anchor support for efficient validation.
+        # Assembly inputs are not raw reads. Whole-assembly pseudo-read
+        # alignment is slow for fragmented fungal assemblies and can create
+        # misleading empty validation SAMs after timeout. Keep it as an
+        # explicit debugging opt-in; the benchmark loop uses MycoSV's
+        # intrinsic assembly-anchor support for efficient validation.
         if os.environ.get("MYCOSV_ASSEMBLY_EXTERNAL_VALIDATION", "0") != "1":
             return None
         if not tool_path("minimap2") or not tool_path("samtools"):
@@ -7651,8 +7606,7 @@ def _lift_calls_to_benchmark_ref(
         if clade in {".", "", "OFF_REFERENCE"}:
             # No clade info — keep the call on its native ref_contig so it
             # still scores for `reference_any_clade` rows; the bench_contigs
-            # filter at the caller will drop it from the strict reference
-            # row. Previous behaviour silently discarded these.
+            # filter at the caller will drop it from the strict reference row.
             out.append(call)
             continue
         if clade not in lift_tables_by_clade:
@@ -7670,9 +7624,7 @@ def _lift_calls_to_benchmark_ref(
             # or alignment too diverged for asm20). Keep the call on its
             # native ref_contig so the `reference_any_clade` row still sees
             # it; the bench_contigs filter at the caller drops it from the
-            # strict reference row. Previously: silent drop, which made
-            # pred_calls in exact_benchmark_summary.tsv much smaller than
-            # the actual mycosv prediction set.
+            # strict reference row.
             out.append(call)
             continue
         lifted_start = _lift_pos(table, call.ref_contig, call.pos)
@@ -8349,10 +8301,8 @@ def run_minigraph_for_query(query_row: dict[str, str], out_dir: Path, threads: i
             check=True,
             timeout=_COMPARATOR_TIMEOUT,
         )
-    # Fail-loud on silently-empty comparator output. Previously, minigraph
-    # writing zero bubbles silently produced a 0-byte bubbles.bed; downstream
-    # the comparator was scored with truth_calls=[] which inflated mycosv FP
-    # counts and gave `status=no_truth` rows that looked like ordinary results.
+    # Fail loudly on empty comparator output. A 0-byte bubbles.bed means the
+    # comparator produced no usable truth set, not an ordinary no-truth result.
     if bubble_bed.stat().st_size == 0:
         _log_comparator_failure(
             out_dir, "minigraph", query_asm,
@@ -9113,9 +9063,8 @@ def run_anchorwave_for_query(query_row: dict[str, str], out_dir: Path, threads: 
         pass
     if not vcf_path.exists() or vcf_path.stat().st_size == 0:
         return None
-    # Header-only VCFs (size > 0 but zero records) used to slip through and be
-    # scored as empty truth, inflating mycosv FPs. Treat them as comparator
-    # failure with a logged reason instead.
+    # Header-only VCFs (size > 0 but zero records) are comparator failures, not
+    # empty truth sets.
     try:
         with vcf_path.open() as fh:
             has_record = any(
@@ -9139,7 +9088,7 @@ def _per_query_thread_budget(n_queries: int, threads: int) -> tuple[int, int]:
     Cap parallelism so each query still gets >=3 threads (the practical floor
     where minimap2 / samtools sort show usable speedup): for the typical
     million-real 5-query x 16-thread case this yields 5 parallel queries with
-    3 threads each, versus the old 1 query x 16 threads x 5 serial iterations.
+    3 threads each.
     """
     n = max(1, n_queries)
     per_min = max(1, threads // n if threads >= n else 1)
@@ -10108,9 +10057,9 @@ def _report_comparator_status(args: argparse.Namespace, out_dir: Path) -> None:
     }
 
     # Categorize every comparator in three buckets so the file is informative
-    # even when no --run-X flag was passed (previously the file was just a
-    # header). The buckets are: (1) requested + available -> actually ran,
-    # (2) requested + missing binaries -> silently skipped, (3) not requested
+    # even when no --run-X flag was passed. The buckets are:
+    # (1) requested + available -> actually ran,
+    # (2) requested + missing binaries -> skipped, (3) not requested
     # but binaries are present -> available, just not enabled.
     requested_running: list[tuple[str, list[str]]] = []
     requested_missing: list[tuple[str, list[str], str]] = []
@@ -10139,7 +10088,7 @@ def _report_comparator_status(args: argparse.Namespace, out_dir: Path) -> None:
         lines.append("\n")
 
     if requested_missing:
-        lines.append("REQUESTED BUT MISSING (silently skipped):\n")
+        lines.append("REQUESTED BUT MISSING (skipped):\n")
         for flag, absent, hint in requested_missing:
             tool_name = flag.replace("run_", "")
             lines.append(f"  [skip] {tool_name}: missing {', '.join(absent)}\n")
@@ -10436,18 +10385,11 @@ def benchmark_real_data(args: argparse.Namespace) -> int:
     # mode-filtered query is supposed to be compared against, *plus* a bounded
     # neighborhood of phylogenetically related refs from prepared_dir.
     #
-    # History: limiting this list to one benchmark_ref_fasta per query (5 refs
-    # for the million_real held-out queries) capped MycoSV's per-query call
-    # volume an order of magnitude below the comparators. The C++ binary
-    # honors --max-ref-memory-mb so an over-broad list is safe — refs are
-    # loaded sequentially until the cap (now 8 GB; ≈200 fungal refs) — but a
-    # list that misses every related ref forces the per-query MEM-chain
-    # search to fall back on cross-genus refs (~5 % overlap) instead of the
-    # genus-mate the user actually deposited. Two queries (Lodderomyces,
-    # Dactylellina) ended up with 0 calls against their own benchmark refs.
-    #
     # Strategy: start with the per-query benchmark refs, then give each query
     # a fair share of NEIGHBOR_REF_CAP — adding genus → family → order → class
+    # neighbors until the cap is filled. The C++ binary enforces
+    # --max-ref-memory-mb, so an over-broad list is safe; missing related refs
+    # is much more damaging than carrying a bounded neighborhood.
     # neighbors per query before moving on. A per-query budget is essential
     # because one query's genus can dominate the corpus (~1100 Saccharomyces
     # refs in the million_real manifest); a global walk would let it swallow
@@ -10605,7 +10547,7 @@ def benchmark_real_data(args: argparse.Namespace) -> int:
                 "gfa": str(out_prefix.with_suffix(".gfa")),
             }
             failure_action = (
-                "restored the previous MycoSV outputs instead of replacing "
+                "restored prior MycoSV outputs instead of replacing "
                 "them with an empty failure callset"
             )
         else:
@@ -10679,9 +10621,7 @@ def benchmark_real_data(args: argparse.Namespace) -> int:
     # does not abort the entire benchmark — surviving comparators still
     # contribute to exact_benchmark_summary.tsv.
     # Comparators are scheduled across queries via run_per_query_in_parallel so
-    # the 5-query x N-tool bench fan-out lands inside the per-mode wall budget;
-    # the old serial loop spent ~N x single_query_time and routinely blew the
-    # 4 h cap with one slow svim_asm / minigraph / sniffles per mode.
+    # the 5-query x N-tool fan-out stays inside the per-mode wall budget.
     if args.run_syri and args.mode == "assembly":
         results = run_per_query_in_parallel(
             "syri", run_syri_for_query, query_manifest, out_dir, args.threads,
@@ -10977,8 +10917,7 @@ def benchmark_real_data(args: argparse.Namespace) -> int:
         # Count OFF_REF events that exist in the query-coord set but are
         # un-matchable (no REFPOS, so they were dropped from the ref-coord set).
         # These are real predictions that the single-reference truth callers
-        # can't represent, so reporting them separately stops them from being
-        # silently invisible in exact_benchmark_summary.tsv.
+        # cannot represent, so report them separately.
         mycosv_off_ref_dropped = sum(
             1 for c in mycosv_query_calls if c.svtype == "OFF_REF"
         )
@@ -11373,8 +11312,7 @@ def benchmark_real_data(args: argparse.Namespace) -> int:
         # Always validate MycoSV's own predictions against the held-out
         # reads/assembly. Validate reference and query coordinate calls
         # separately: a query may have a few anchored REF calls plus many
-        # OFF_REF query-space calls, and the old `ref_calls or query_calls`
-        # fallback silently skipped the latter.
+        # OFF_REF query-space calls; validate both instead of choosing one.
         if can_validate_reads:
             read_validation_summary: dict[str, Any] = {
                 "min_split_reads": args.read_validation_min_support,
@@ -11913,10 +11851,8 @@ def prepare_million_real(args: argparse.Namespace) -> int:
     index over them, and (optionally) pad it with synthetic decoys up to a
     target centroid count.
 
-    This is the bridge between the real-data workflow (which currently only
-    downloads a few dozen assemblies per panel) and the million-scale
-    workflow (which was previously all synthetic). With this subcommand,
-    the million-scale index can be backed by real NCBI fungal genomes.
+    This bridges the small real-data workflow and the million-scale workflow,
+    allowing the million-scale index to be backed by real NCBI fungal genomes.
     """
     out_dir = args.out_dir.resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -11969,10 +11905,8 @@ def prepare_million_real(args: argparse.Namespace) -> int:
     # build the hierarchy manifest the MycoSV binary consumes.
     # Tighter progress reporting + per-row time budget: with ~10000 assemblies
     # and a shared cache, most rows are no-op cache hits but a single hung
-    # download (NCBI 5xx, slow mirror) used to silently stall the whole loop.
-    # Emit one progress line every 200 examined rows + one every 60 s of wall
-    # clock so the operator can tell the difference between "downloading" and
-    # "stuck", and bail individual rows that exceed _HTTP_TIMEOUT.
+    # download can stall the loop. Emit one progress line every 200 examined
+    # rows plus one every 60 s of wall clock.
     # Parallel download. The serial loop spent ~3 h on ~3300/10000 rows in
     # production because every NCBI fetch was synchronous; threading is safe
     # since materialize_entry is per-URL and disk-cached. Workers are tunable
@@ -12237,12 +12171,8 @@ def prepare_million_real(args: argparse.Namespace) -> int:
                         "available assemblies; not filling from unrelated taxa.\n"
                     )
             else:
-                # Seed-aware holdout. The old stride scheme picked the same 5
-                # assemblies for every --seed value, so re-running with a
-                # different seed couldn't surface selection bias. random.sample
-                # with a Random(args.seed) instance gives reproducible-but-
-                # varied selection: same seed -> same set, different seed ->
-                # disjoint coverage.
+                # Seed-aware holdout: same seed -> same set; different seeds
+                # sample different query assemblies and surface selection bias.
                 query_indices = sorted(rng.sample(eligible_indices, n_queries))
         # Lookup helpers indexed by lineage so we can pick the closest sibling.
         by_genus: dict[str, list[int]] = defaultdict(list)
@@ -12299,13 +12229,9 @@ def prepare_million_real(args: argparse.Namespace) -> int:
                     return picked
                 cand = ref_manifest_rows[pool[0]]
                 return cand.get("asm_name", "."), cand["fasta_path"]
-            # No genus/family/phylum sibling in the corpus. The previous
-            # behavior fell through to ref_manifest_rows[0] — an alphabetically
-            # first ascomycete against a phylum-isolated basidiomycete /
-            # cryptomycotan query — producing zero homologous alignments and
-            # silent NaN F1. Returning (".", ".") propagates honestly: the
-            # query lands in query_manifest.tsv with an empty bench ref, and
-            # the comparator runners + read-validation paths all skip cleanly
+            # No genus/family/phylum sibling in the corpus. Returning (".", ".")
+            # propagates honestly: the query lands in query_manifest.tsv with
+            # an empty bench ref, and comparator/read-validation paths skip cleanly.
             # on benchmark_ref_fasta in {"", "."} (e.g. line 6498).
             sys.stderr.write(
                 f"[holdout] {qrow.get('asm_name', '?')}: no genus/family/phylum "
@@ -12342,12 +12268,9 @@ def prepare_million_real(args: argparse.Namespace) -> int:
         # Drop queries from the ref/hierarchy manifest so the index doesn't
         # see its own truth (would silently boost recall).
         keep_mask = [i not in query_set for i in range(len(ref_manifest_rows))]
-        # Bug-fix: source_link_rows for the held-out asms were appended with
-        # role="ref" inside _download_one (we don't know the holdout decision
-        # at that point). Re-tag them to role="query" so public_data_links
-        # / source_links honestly reflect the manifest. Without this, every
-        # downstream join against role="query" misses the assembly query
-        # rows entirely.
+        # source_link_rows for held-out assemblies are appended before the
+        # holdout decision is known. Re-tag them to role="query" so
+        # public_data_links/source_links honestly reflect the manifest.
         held_out_asm_names = {ref_manifest_rows[qi]["asm_name"] for qi in query_indices}
         for sl in source_link_rows:
             if sl.get("role") == "ref" and sl.get("query_asm") in held_out_asm_names:
@@ -12871,7 +12794,7 @@ def prepare_million_real(args: argparse.Namespace) -> int:
         "query_assemblies_held_out": held_out_assembly_rows,
         "query_rows_total": len(query_manifest_rows),
         "million_real_query_genera": getattr(args, "million_real_query_genera", ""),
-        # Back-compat alias for older log scrapers that key on this field.
+        # Compatibility alias for log scrapers that key on this field.
         "queries_held_out": len(query_manifest_rows),
         "refs_in_index": len(ref_manifest_rows),
         "target_centroids": args.target_centroids,
@@ -13175,7 +13098,7 @@ def build_parser() -> argparse.ArgumentParser:
                     help="In read modes, pass the original full FASTQ to MycoSV "
                          "while comparators use the capped subset. Off by default "
                          "because million-real public FASTQs can be multi-GB and "
-                         "previously caused empty VCFs after timeout/OOM kills.")
+                         "can produce empty VCFs after timeout/OOM kills.")
     sb.add_argument("--max-assembly-query-contigs", type=int, default=0,
                     help="Skip assembly-mode query FASTAs with more than this many "
                          "records before launching MycoSV/comparators. 0 disables "

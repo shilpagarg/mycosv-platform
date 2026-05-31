@@ -49,12 +49,9 @@ inline OffRefNoveltyTier score_off_ref_novelty(double overlapFraction) {
 // site treats the locus as highly interesting; the elementClass field should be
 // set to "HGT" separately via classify_repeat_element().
 //
-// Thresholds widened: same-clade < 0.10 (was 0.05) and other-clade ≥ 0.08
-// (was 0.10), AND the other-clade signal must exceed same-clade by ≥ 0.05.
-// The previous strict AND-gate combined with the k=7 Jaccard inflation meant
-// real HGT islands bordered by host sequence almost never reached NOVEL —
-// the calling sites now use higher k and containment, so the thresholds
-// can be loosened without inflating FPs.
+// Cross-clade signal requires same-clade < 0.10, other-clade >= 0.08, and
+// other-clade signal exceeding same-clade by >= 0.05. Callers use higher-k
+// containment, so host-border sequence no longer masks real HGT islands.
 inline OffRefNoveltyTier score_cross_clade_novelty(
         double sameCladeOverlap,
         double highestOtherCladeOverlap) {

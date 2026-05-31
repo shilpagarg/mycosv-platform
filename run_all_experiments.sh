@@ -51,23 +51,18 @@ MILLION_REAL_TARGET_CENTROIDS="${MILLION_REAL_TARGET_CENTROIDS:-1000000}"
 # step 2b). 5 keeps wall time bounded on large indexes; raise on long-walltime
 # nodes.
 MILLION_REAL_QUERIES="${MILLION_REAL_QUERIES:-5}"
-# Per-clade RAM cap on the MycoSV binary's hierarchical graph build. 8 was
-# the old conservative default sized for a 12 GiB cgroup, but it collapses
-# ~99 % of intra-clade SV diversity for densely-sampled fungal families
-# (Saccharomycetaceae alone contributes ~1100 refs in the million-real
-# corpus). 32 fits comfortably inside the 128 GiB SLURM job — the
-# per-clade graph + suffix arrays at 32 refs land at ~6 GiB total —
-# and recovers genus-level SV recall that the 8-cap silently dropped.
-# Lower to 8 on the 12 GiB cgroup or via env override on tight nodes.
+# Per-clade RAM cap on the MycoSV binary's hierarchical graph build.
+# 32 fits comfortably inside the 128 GiB SLURM job and preserves more
+# intra-clade SV diversity for densely sampled fungal families. Lower to 8
+# on 12 GiB cgroups or via env override on tight nodes.
 MILLION_REAL_MAX_CLADE_GENOMES="${MILLION_REAL_MAX_CLADE_GENOMES:-32}"
 
 # Per-query memory caps for the MycoSV binary in the million-real bench.
 # Without a per-thread cache cap, the SingleRefMemCache (suffix arrays for
 # every ref contig touched by a query) grows unbounded; with --threads
-# parallel queries each holding their own cache the binary previously died
-# with std::bad_alloc on multi-Gbp routed sub-graphs.  Default 4096 MB per
-# thread fits comfortably in a 128 GiB SLURM job at 16 threads (~64 GiB
-# total cache budget); shrink on tight cgroups or raise on bigger nodes.
+# parallel queries each hold their own cache. Default 4096 MB per thread fits
+# comfortably in a 128 GiB SLURM job at 16 threads (~64 GiB total cache
+# budget); shrink on tight cgroups or raise on bigger nodes.
 MILLION_REAL_SA_MAX_CONTIG_MB="${MILLION_REAL_SA_MAX_CONTIG_MB:-25}"
 MILLION_REAL_SINGLE_REF_CACHE_MB="${MILLION_REAL_SINGLE_REF_CACHE_MB:-4096}"
 MILLION_REAL_MAX_REF_MEMORY_MB="${MILLION_REAL_MAX_REF_MEMORY_MB:-4096}"
@@ -75,12 +70,10 @@ MILLION_REAL_BENCH_REF_CAP="${MILLION_REAL_BENCH_REF_CAP:-256}"
 MILLION_REAL_TOL_CACHE_GB="${MILLION_REAL_TOL_CACHE_GB:-4}"
 MILLION_REAL_TOL_CACHE_ENTRIES="${MILLION_REAL_TOL_CACHE_ENTRIES:-32}"
 MILLION_REAL_MAX_CALLS_PER_CONTIG="${MILLION_REAL_MAX_CALLS_PER_CONTIG:-5000}"
-# Per-chain block-score floor for MycoSV. Default in main.cpp is 6.0, but
-# cross-species fungal pairs (~75-85% identity) routinely produce real chains
-# scoring 3-5 that get silently dropped at the floor; on the million-real
-# bench that translated to a 20-40% recall hit on diverged sister-clade refs.
-# 4.0 keeps the FP rate flat (the same-locus dedup + 4x dominance gate still
-# fire) while admitting cross-clade signal. Override per run for tighter FP.
+# Per-chain block-score floor for MycoSV. Cross-species fungal pairs
+# (~75-85% identity) routinely produce real chains scoring 3-5, so 4.0 admits
+# cross-clade signal while same-locus dedup and the 4x dominance gate keep the
+# FP rate flat. Override per run for tighter FP.
 MILLION_REAL_MIN_BLOCK_SCORE="${MILLION_REAL_MIN_BLOCK_SCORE:-4.0}"
 MILLION_REAL_MAX_ASSEMBLY_QUERY_CONTIGS="${MILLION_REAL_MAX_ASSEMBLY_QUERY_CONTIGS:-5000}"
 MILLION_REAL_MAX_ASSEMBLY_QUERY_BP="${MILLION_REAL_MAX_ASSEMBLY_QUERY_BP:-350000000}"
@@ -145,7 +138,7 @@ REAL_HEAVY_MAX_ASSEMBLY_QUERY_BP_AMF="${REAL_HEAVY_MAX_ASSEMBLY_QUERY_BP_AMF:-15
 
 # Timeout used inside run_real_fungal_benchmark.py for individual external
 # tool calls. Keep it at least as large as the assembly benchmark cap so AMF
-# MycoSV runs are governed by the stage timeout, not an older 2h hard stop.
+# MycoSV runs are governed by the stage timeout, not the binary default.
 export MYCOSV_TOOL_TIMEOUT="${MYCOSV_TOOL_TIMEOUT:-39600}"
 # Per-comparator soft cap (minigraph / svim_asm / svim / sniffles / cuteSV /
 # delly / manta / pggb / cactus / anchorwave + their shared minimap2 align
@@ -352,8 +345,8 @@ if [[ "$EXPERIMENT_TYPE" == "all" || "$EXPERIMENT_TYPE" == "million-real" ]]; th
   prepare_million_succeeded=0
   # Reads-mode coverage in the million-real bench. When 1, prepare-million-real
   # resolves public ENA reads for each held-out query species. Short-reads are
-  # deliberately off by default for now: they dominated wall time and previously
-  # prevented long-reads from starting. Set MILLION_REAL_READ_MODES=both and
+  # deliberately off by default for now because they dominate wall time. Set
+  # MILLION_REAL_READ_MODES=both and
   # MILLION_REAL_BENCHMARK_MODES=assembly,short-reads,long-reads to re-enable.
   MILLION_REAL_INCLUDE_READS="${MILLION_REAL_INCLUDE_READS:-1}"
   MILLION_REAL_READ_MODES="${MILLION_REAL_READ_MODES:-long-reads}"
@@ -473,7 +466,7 @@ if [[ "$EXPERIMENT_TYPE" == "all" || "$EXPERIMENT_TYPE" == "million-real" ]]; th
       # Per-mode comparator selection: keep wall time bounded by skipping
       # the heaviest tool in each mode while still producing real F1 numbers
       # in exact_benchmark_summary.tsv. Override with MILLION_REAL_MYCOSV_ONLY=1
-      # to fall back to the previous mycosv-only behaviour.
+      # to force MycoSV-only benchmark rows.
       million_real_comparator_flags=()
       if [[ "${MILLION_REAL_MYCOSV_ONLY:-0}" == "1" ]]; then
         million_real_comparator_flags=(--mycosv-only)
@@ -660,8 +653,7 @@ if [[ "$EXPERIMENT_TYPE" == "all" || "$EXPERIMENT_TYPE" == "real" ]]; then
 
       # Override for assembly mode on heavy panels: skip cactus/pggb/anchorwave
       # (the multi-Gbp killers) and instead enable only the lighter comparators
-      # explicitly. Without this carve-out a single AMF assembly run consumed
-      # the entire SLURM time budget in the previous matrix run.
+      # explicitly so a single AMF assembly run cannot consume the stage budget.
       if [[ "${mode}" == "assembly" ]] && [[ ",${HEAVY_COMPARATOR_SKIP_PANELS}," == *",${panel},"* ]]; then
         comparator_flags=(--run-syri --run-minigraph --run-svim-asm)
         echo "      [skip] heavy comparators (cactus/pggb/anchorwave) for ${panel} (HEAVY_COMPARATOR_SKIP_PANELS)"

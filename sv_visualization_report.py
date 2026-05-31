@@ -111,8 +111,7 @@ def read_table(path: Optional[str]) -> Optional[pd.DataFrame]:
     # header. Falling back to the python engine with on_bad_lines='skip'
     # drops only the offending rows instead of aborting the whole report.
     # low_memory=False reads each column in a single pass so pandas can pick a
-    # consistent dtype; the previous chunked read emitted a DtypeWarning on the
-    # 30+ mixed-type columns produced by the comparator merge.
+    # consistent dtype across the mixed-type comparator merge columns.
     try:
         return pd.read_csv(p, sep=sep, low_memory=False)
     except pd.errors.ParserError:

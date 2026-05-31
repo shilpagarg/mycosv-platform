@@ -10,12 +10,8 @@
 //        in RAM.
 // DS-14  WaveletTree over BWT for O(k log σ) alphabet prefilter
 //
-// FIX-LOCK v14: route() previously acquired registryMu_ TWICE per phylum
-// (once to snapshot the phylum list, once for the per-shard pointer).
-// The double-acquire is now eliminated: the phylum-shard snapshot and
-// pointer capture are merged into a single brief critical section that
-// produces a vector<PhylumShard*>; all per-shard queries then run under
-// only the per-shard shared_lock, with no global lock held.
+// route() snapshots phylum-shard pointers under one brief registryMu_ hold;
+// per-shard queries then run under only the shard shared_lock.
 
 #include "layer1_clade_graph.hpp"
 
@@ -620,10 +616,8 @@ private:
 // =========================================================================
 // PhylumShardedRouter  — per-phylum VP-tree + Tier-B fallback
 //
-// FIX-LOCK v14:
-//   route() now captures (PhylumShard*, bool) pairs under a single brief
-//   registryMu_ hold, then releases registryMu_ before doing any per-shard
-//   work.  This eliminates the double-acquire that existed in v12/v13.
+// route() captures shard pointers under one brief registryMu_ hold, then
+// releases it before any per-shard work.
 // =========================================================================
 class PhylumShardedRouter {
 public:
@@ -706,7 +700,7 @@ public:
         rebuild_locked();
     }
 
-    // FIX-LOCK v14: single registryMu_ acquisition for snapshot.
+    // Snapshot shard pointers under one registry lock.
     std::vector<RouteResult> route(std::string_view seq,
                                     const SyncmerParams& sp,
                                     const SyncmerParams& fbSp,

@@ -1156,7 +1156,7 @@ def classify_guild_taxonomic(
       2. Saccharomycotina/Schizosaccharomycotina classes -> Yeast
       3. Pezizomycotina classes -> Filamentous
       4. Basidiomycota phylum -> Basidio
-      5. Fall through to legacy genus/lifestyle table for 'Other'/edge cases.
+      5. Fall through to genus/lifestyle fallback for 'Other'/edge cases.
 
     The 13-sample panel resolves cleanly into AMF + Filamentous + Yeast; the
     165-sample panel adds the dominant Basidio (74/165) bucket.
@@ -1256,8 +1256,8 @@ def _load_query_class_map(manifest_path: Path | None) -> dict[str, dict[str, str
     """query_asm -> {phylum, class, ...} from prepared/query_manifest.tsv.
 
     Falls back to {} when the manifest is missing; classify_guild_taxonomic
-    then degrades to its genus-list / lifestyle fallback (the legacy
-    behavior). With the manifest in place the 165-sample run resolves into
+    then degrades to its genus-list / lifestyle fallback. With the manifest in
+    place the 165-sample run resolves into
     4 guilds (AMF / Filamentous / Basidio / Yeast) instead of 2.
     """
     out: dict[str, dict[str, str]] = {}

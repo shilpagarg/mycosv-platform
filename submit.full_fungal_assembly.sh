@@ -57,9 +57,8 @@ FULL_ASSEMBLY_SHARDS="${FULL_ASSEMBLY_SHARDS:-1}"
 # disable read-validation entirely.
 RAW_READ_VALIDATION_TSV="${RAW_READ_VALIDATION_TSV-${OUT_ROOT}/prepared/read_validation_manifest.tsv}"
 RAW_READ_VALIDATION_MAX_READS="${RAW_READ_VALIDATION_MAX_READS:-200000}"
-# Cap on rows kept in biology_candidates.tsv / biology_findings.tsv. The
-# previous hard-coded 200 throttled per-query biology to a token sample; lift
-# to 5000 so HGT/Starship/RIP/TE candidates across all SV types come through.
+# Cap on rows kept in biology_candidates.tsv / biology_findings.tsv. Keep this
+# high enough for HGT/Starship/RIP/TE candidates across all SV types.
 BIOLOGY_TOP_N="${BIOLOGY_TOP_N:-5000}"
 export MYCOSV_BIOLOGY_TOP_N="${BIOLOGY_TOP_N}"
 RESUME_SHARDS="${RESUME_SHARDS:-1}"
