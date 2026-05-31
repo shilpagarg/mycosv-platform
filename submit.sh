@@ -20,8 +20,8 @@ if [[ "${MYCOSV_FORCE_REBUILD:-1}" == "1" && -f "${MYCOSV_BIN}" ]]; then
   rm -f "${MYCOSV_BIN}"
 fi
 
-# Keep million-real benchmark memory bounded by default, including explicit
-# flat-fallback debug runs.
+# Keep million-real benchmark memory bounded by default, including
+# flat-fallback runs.
 export MILLION_REAL_SINGLE_REF_CACHE_MB="${MILLION_REAL_SINGLE_REF_CACHE_MB:-4096}"
 export MILLION_REAL_MAX_REF_MEMORY_MB="${MILLION_REAL_MAX_REF_MEMORY_MB:-4096}"
 

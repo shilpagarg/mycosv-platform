@@ -1,78 +1,24 @@
 #!/usr/bin/env python3
-# Designed for Linux
-"""test_amf.py — Fungal SV simulator for the TOL pipeline.
+"""Fungal SV simulator for the TOL/MycoSV benchmark.
 
-Domain corrections applied (vs previous version — 21 issues fixed)
-====================================================================
-TAXONOMY (2 fixes)
-  - Laccaria: family Hydnangiaceae (NOT Amanitaceae). Matheny et al. 2006.
-  - Batrachochytrium dendrobatidis: order Rhizophydiales, family
-    Rhizophydiaceae (NOT Chytridiales/Chytriaceae). James et al. 2006.
-
-ECOLOGY (1 fix)
-  - Mortierella: lifestyle 'soil_endophyte' (NOT endomycorrhizal). Guo 2020.
-
-GC CONTENT — per-genus/class hard-coded from published genomes (5 fixes)
-  - Puccinia: 42% (Duplessis et al. 2011 PNAS)
-  - Fusarium: 48% (Ma et al. 2010 Nature)
-  - Cladonia: 51% (Armaleo et al. 2019 Nat. Commun.)
-  - Batrachochytrium: 40% (Joneson et al. 2011)
-  - giant_amf: 28.5% (DAOM 197198; Chen et al. 2018 PNAS)
-  New genera added: Lachancea 40%, Ustilago 54%, Botrytis 44%,
-    Epichloë 48%, Verticillium 53%, Mortierella 43%
-
-GENOME SIZE (1 fix)
-  - giant_amf: 150 Mb (post-decontamination). The 750 Mb figure was an
-    error. Chen et al. 2018 PNAS.
-
-TE BIOLOGY (2 fixes)
-  - rust_smut_te_heavy: TIR elements removed from dispatch (<2% in
-    Puccinia); Gypsy LTR + RIP only. Duplessis et al. 2011 PNAS.
-  - arbuscular_mf/giant_amf: STARSHIP removed (only confirmed in
-    Ascomycota, not Glomeromycota). Urquhart et al. 2023 Curr. Biol.
-
-SV BIAS (2 fixes)
-  - arbuscular_mf: TRA removed (AMF largely asexual/clonal; inter-contig
-    translocations rare). Corrected to DUP_INS.
-  - lichenised: HGT added to element dispatch (algal/cyanobacterial HGT
-    documented). Slot & Rokas 2011 Science.
-
-OFF-REFERENCE GC (1 fix)
-  - off_ref_gc now direction-aware: high-GC hosts shift DOWN (AT-rich TEs
-    or Firmicutes donors), low-GC hosts shift UP.
-
-RIP BIOLOGY (1 fix)
-  - apply_rip: now targets CpA dinucleotides only (canonical RIP context:
-    CpA→TpA). Selker et al. 2003; Cambareri et al. 1989.
-
-STARSHIP BIOLOGY (1 fix)
-  - embed_starship: cargo GC lowered to ~genic (45-55%), hull GC is
-    relative to clade background (not absolute 0.42). Urquhart et al. 2023.
-
-HGT BIOLOGY (1 fix)
-  - embed_hgt_island: GC deviation set to +0.10 (published range ±0.05-0.10
-    for mycological HGT). Slot & Rokas 2011.
-
-DUPLICATE GENUS (1 fix)
-  - compact_yeast now uses Lachancea (not Saccharomyces again) to avoid
-    duplicate genus shards in the routing index.
-
-NEW SCENARIOS (3 additions)
-  - necrotrophic: Botrytis cinerea (Leotiomycetes) — distinct from
-    two-speed Fusarium; GC 44%, moderate TE.
-  - strict_endophyte: Epichloë festucae — near-TE-free compact genome.
-  - smut: Ustilago maydis — compact dikaryote separate from Puccinia rust.
+The simulator emits reference/query assemblies, known truth SVs, taxonomy
+metadata, and optional read data for fungal scenarios spanning compact yeasts,
+AMF, rust/smut pathogens, lichenised fungi, endophytes, and HGT-enriched
+lineages. Scenario parameters are curated from representative fungal genome
+biology so benchmark truth reflects plausible GC, repeat, TE, HGT, and
+off-reference regimes.
 """
 from __future__ import annotations
 
 import argparse
 import random
+import re
 from pathlib import Path
 
-# ── RANKS — single authoritative list (mirrors taxonomy_ranks.hpp) ────────
+# Taxonomic ranks used by the simulator and taxonomy_ranks.hpp.
 RANKS = ["phylum", "class", "order", "family", "genus", "species"]
 
-# ── Per-genus GC (published genome papers) ────────────────────────────────
+# Per-genus GC fractions from representative published genomes.
 _GENUS_GC: dict[str, float] = {
     "Saccharomyces":    0.38,
     "Lachancea":        0.40,
@@ -89,7 +35,7 @@ _GENUS_GC: dict[str, float] = {
     "Mortierella":      0.43,
 }
 
-# ── Per-class GC fallback ─────────────────────────────────────────────────
+# Per-class GC fallback when the genus is not represented above.
 _CLASS_GC: dict[str, float] = {
     "Sordariomycetes":    0.48,
     "Saccharomycetes":    0.38,
@@ -103,7 +49,7 @@ _CLASS_GC: dict[str, float] = {
     "Chytridiomycetes":   0.40,
 }
 
-# ── SCENARIOS ─────────────────────────────────────────────────────────────
+# Scenario metadata.
 SCENARIOS: dict[str, dict[str, str]] = {
     # Ascomycota / yeasts
     "core": dict(
@@ -114,7 +60,7 @@ SCENARIOS: dict[str, dict[str, str]] = {
         hgt_regime="low", expected_sv_bias="balanced",
     ),
     "compact_yeast": dict(
-        # FIX: use Lachancea, not Saccharomyces, to avoid duplicate genus shard
+        # Lachancea avoids duplicating Saccharomyces in the routing index.
         phylum="Ascomycota", cls="Saccharomycetes",
         order="Saccharomycetales", family="Saccharomycetaceae", genus="Lachancea",
         lifestyle="compact_yeast", architecture="very_small_compact_yeast",
@@ -138,7 +84,7 @@ SCENARIOS: dict[str, dict[str, str]] = {
         # F. oxysporum LS chromosomes: MITE TIR + Gypsy LTR + RIP
     ),
     "two_speed_pathogen_extreme": dict(
-        # FIX: use Verticillium (canonical two-speed model), not Fusarium again
+        # Verticillium is the canonical two-speed model for this scenario.
         phylum="Ascomycota", cls="Sordariomycetes",
         order="Glomerellales", family="Plectosphaerellaceae", genus="Verticillium",
         lifestyle="two_speed_pathogen", architecture="highly_rearranged_two_speed",
@@ -146,7 +92,7 @@ SCENARIOS: dict[str, dict[str, str]] = {
         hgt_regime="moderate", expected_sv_bias="INV_TRA_INS",
     ),
     "necrotrophic": dict(
-        # NEW: Botrytis cinerea — distinct from Fusarium two-speed model
+        # Botrytis separates the necrotrophic model from Fusarium.
         phylum="Ascomycota", cls="Leotiomycetes",
         order="Helotiales", family="Sclerotiniaceae", genus="Botrytis",
         lifestyle="necrotrophic_pathogen", architecture="necrotroph_moderate_te",
@@ -155,7 +101,7 @@ SCENARIOS: dict[str, dict[str, str]] = {
         # B. cinerea B05.10: GC 44%; 43 Mb. van Kan et al. 2017.
     ),
     "strict_endophyte": dict(
-        # NEW: Epichloë festucae — near-TE-free, horizontal transmission
+        # Epichloe represents a compact, near-TE-free strict endophyte.
         phylum="Ascomycota", cls="Sordariomycetes",
         order="Hypocreales", family="Clavicipitaceae", genus="Epichloë",
         lifestyle="strict_endophyte", architecture="compact_endophyte_low_te",
@@ -175,7 +121,7 @@ SCENARIOS: dict[str, dict[str, str]] = {
     "ectomycorrhizal": dict(
         phylum="Basidiomycota", cls="Agaricomycetes",
         order="Agaricales",
-        family="Hydnangiaceae",   # FIX: was Amanitaceae (wrong). Matheny 2006.
+        family="Hydnangiaceae",   # Matheny 2006.
         genus="Laccaria",
         lifestyle="ectomycorrhizal", architecture="medium_large_secretome_missp",
         genome_scale="medium_large", repeat_regime="moderate", te_regime="moderate",
@@ -193,7 +139,7 @@ SCENARIOS: dict[str, dict[str, str]] = {
         # Dikaryotic nature modelled as single-haploid proxy.
     ),
     "smut": dict(
-        # NEW: Ustilago maydis — compact dikaryote, separate from rust
+        # Ustilago keeps compact smuts distinct from Puccinia rusts.
         phylum="Basidiomycota", cls="Ustilaginomycetes",
         order="Ustilaginales", family="Ustilaginaceae", genus="Ustilago",
         lifestyle="smut_pathogen", architecture="compact_dikaryote_smut",
@@ -209,8 +155,7 @@ SCENARIOS: dict[str, dict[str, str]] = {
         genome_scale="very_large", repeat_regime="very_high", te_regime="high",
         hgt_regime="moderate", expected_sv_bias="DUP_INS",
         # GC ~32%; ~150 Mb; Gypsy/Copia dominant (40-60%).
-        # FIX: TRA removed (largely asexual, translocations rare).
-        # FIX: STARSHIP removed (not confirmed in Glomeromycota).
+        # AMF are largely asexual; STARSHIP is not confirmed in Glomeromycota.
     ),
     "giant_amf": dict(
         phylum="Glomeromycota", cls="Glomeromycetes",
@@ -219,13 +164,12 @@ SCENARIOS: dict[str, dict[str, str]] = {
         genome_scale="extreme_large",
         repeat_regime="extreme", te_regime="high",
         hgt_regime="moderate", expected_sv_bias="DUP_large_INS",
-        # FIX: GC set to 28.5% (DAOM 197198). Genome ~150 Mb post-decontam.
+        # DAOM 197198 GC is 28.5%; genome is ~150 Mb post-decontamination.
         # Pre-decontamination 750 Mb figure was wrong. Chen 2018 PNAS.
     ),
     # Mucoromycota / soil endophyte
     "soil_endophyte": dict(
-        # FIX: renamed from 'endomycorrhizal'; lifestyle corrected.
-        # Mortierella is NOT endomycorrhizal. Guo et al. 2020 Curr. Biol.
+        # Mortierella is treated as soil_endophyte, not endomycorrhizal.
         phylum="Mucoromycota", cls="Mortierellomycetes",
         order="Mortierellales", family="Mortierellaceae", genus="Mortierella",
         lifestyle="soil_endophyte", architecture="moderate_repeat_soil_endophyte",
@@ -235,8 +179,8 @@ SCENARIOS: dict[str, dict[str, str]] = {
     # Chytridiomycota
     "hgt_receiver": dict(
         phylum="Chytridiomycota", cls="Chytridiomycetes",
-        order="Rhizophydiales",     # FIX: was Chytridiales. James 2006.
-        family="Rhizophydiaceae",   # FIX: was Chytriaceae.
+        order="Rhizophydiales",     # James 2006.
+        family="Rhizophydiaceae",
         genus="Batrachochytrium",
         lifestyle="hgt_receiver", architecture="gc_shifted_hgt_receiver",
         genome_scale="small_medium", repeat_regime="moderate", te_regime="low",
@@ -244,8 +188,8 @@ SCENARIOS: dict[str, dict[str, str]] = {
     ),
     "cross_phylum_hgt_stress": dict(
         phylum="Chytridiomycota", cls="Chytridiomycetes",
-        order="Rhizophydiales",     # FIX: was Chytridiales.
-        family="Rhizophydiaceae",   # FIX: was Chytriaceae.
+        order="Rhizophydiales",
+        family="Rhizophydiaceae",
         genus="Batrachochytrium",
         lifestyle="cross_phylum_hgt", architecture="cross_phylum_hgt_stress",
         genome_scale="medium", repeat_regime="moderate", te_regime="moderate",
@@ -255,7 +199,7 @@ SCENARIOS: dict[str, dict[str, str]] = {
 
 ALLOWED_SV_TYPES: frozenset[str] = frozenset({"INS", "DEL", "DUP", "INV", "TRA"})
 
-# ── Element dispatch per scenario ─────────────────────────────────────────
+# Element dispatch per scenario.
 _SCENARIO_ELEMENTS: dict[str, list[str]] = {
     "core":                        ["NONE"],
     "compact_yeast":               ["NONE"],
@@ -264,19 +208,19 @@ _SCENARIO_ELEMENTS: dict[str, list[str]] = {
     "two_speed_pathogen_extreme":  ["TE_LTR", "RIP", "TE_TIR"],
     "necrotrophic":                ["TE_LINE", "TE_TIR"],
     "strict_endophyte":            ["NONE"],
-    "lichenised":                  ["HGT"],   # FIX: algal HGT documented
+    "lichenised":                  ["HGT"],   # algal HGT documented
     "ectomycorrhizal":             ["TE_TIR", "REPEAT"],
-    "rust_smut_te_heavy":          ["TE_LTR", "RIP"],   # FIX: TIR removed
+    "rust_smut_te_heavy":          ["TE_LTR", "RIP"],
     "smut":                        ["NONE"],
-    "arbuscular_mf":               ["TE_LTR", "REPEAT"], # FIX: STARSHIP removed
-    "giant_amf":                   ["TE_LTR", "REPEAT"], # FIX: STARSHIP removed
+    "arbuscular_mf":               ["TE_LTR", "REPEAT"],
+    "giant_amf":                   ["TE_LTR", "REPEAT"],
     "soil_endophyte":              ["TE_LINE", "REPEAT"],
     "hgt_receiver":                ["HGT"],
     "cross_phylum_hgt_stress":     ["HGT", "TE_LINE"],
 }
 
 
-# ── Helpers ───────────────────────────────────────────────────────────────
+# Helpers.
 
 def normalize_query_contig_name(name: str) -> str:
     """Strip __sv_ simulator suffix."""
@@ -290,7 +234,7 @@ def clamp01(value: float | None, default: float) -> float:
 
 
 def scenario_gc(meta: dict[str, str], override: float | None) -> float:
-    """Lookup GC from published genome values (genus → class → heuristic)."""
+    """Lookup GC from genus, then class, then phylum heuristic."""
     if override is not None:
         return clamp01(override, 0.45)
     gc = _GENUS_GC.get(meta.get("genus", ""))
@@ -418,11 +362,11 @@ def rand_seq(n: int, gc: float = 0.45, seed: int = 1) -> str:
     return "".join(rnd.choices(bases, weights=weights, k=n))
 
 
-# ── Element embedders ─────────────────────────────────────────────────────
+# Element embedders.
 
 def embed_tandem_repeat(seq: str, period: int = 4, copies: int = 8,
                         pos: int | None = None, seed: int = 1) -> str:
-    """Period-regularity tandem repeat (≥5 copies, ≥50 bp)."""
+    """Period-regularity tandem repeat with at least 5 copies and 50 bp."""
     rnd = random.Random(seed)
     pos = pos if pos is not None else rnd.randint(0, max(0, len(seq) // 4))
     unit = rand_seq(period, gc=0.45, seed=seed + 1)
@@ -433,7 +377,7 @@ def embed_tandem_repeat(seq: str, period: int = 4, copies: int = 8,
 
 def embed_ltr_element(seq: str, ltr_len: int = 80, interior_len: int = 500,
                       pos: int | None = None, seed: int = 1) -> str:
-    """LTR retrotransposon (Gypsy/Copia): DTR ≥50 bp + RT/integrase coding interior."""
+    """LTR retrotransposon with DTRs and an RT/integrase-like interior."""
     rnd = random.Random(seed)
     pos = pos if pos is not None else rnd.randint(0, max(0, len(seq) // 4))
     ltr      = rand_seq(ltr_len,      gc=0.52, seed=seed + 2)  # LTR ~52% GC
@@ -445,7 +389,7 @@ def embed_ltr_element(seq: str, ltr_len: int = 80, interior_len: int = 500,
 
 def embed_tir_element(seq: str, tir_len: int = 35, interior_len: int = 300,
                       pos: int | None = None, seed: int = 1) -> str:
-    """TIR DNA transposon (Tc1/Mariner or MITE): inverted terminal repeats ≥30 bp."""
+    """TIR DNA transposon with inverted terminal repeats."""
     rnd = random.Random(seed)
     pos = pos if pos is not None else rnd.randint(0, max(0, len(seq) // 4))
     tir  = rand_seq(tir_len, gc=0.48, seed=seed + 4)
@@ -471,7 +415,7 @@ def embed_line_helitron(seq: str, element_len: int = 400,
 
 def embed_sine(seq: str, sine_len: int = 150,
                pos: int | None = None, seed: int = 1) -> str:
-    """SINE: short (≤500 bp), high-GC 5' domain, terminal repeat."""
+    """SINE-like insertion with a short high-GC 5' domain and terminal repeat."""
     rnd = random.Random(seed)
     pos = pos if pos is not None else rnd.randint(0, max(0, len(seq) // 4))
     tr       = rand_seq(15, gc=0.60, seed=seed + 7)
@@ -486,8 +430,8 @@ def embed_starship(seq: str, body_len: int = 3000, cargo_len: int = 1200,
                    seed: int = 1) -> str:
     """Starship element (Ascomycota only).
 
-    Hull GC = clade_gc − 0.12 (AT-rich relative to background).
-    Cargo GC ≈ genic GC (clade_gc ± 0.02, clamped 0.42–0.55).
+    Hull GC is clade_gc - 0.12, AT-rich relative to background.
+    Cargo GC is near genic GC, clamped to 0.42-0.55.
     Ref: Urquhart et al. 2023 Current Biology.
 
     NOT appropriate for Glomeromycota or Basidiomycota (not confirmed there).
@@ -507,7 +451,7 @@ def embed_starship(seq: str, body_len: int = 3000, cargo_len: int = 1200,
 def embed_hgt_island(seq: str, island_len: int = 600,
                      donor_gc: float = 0.55, pos: int | None = None,
                      seed: int = 1) -> str:
-    """HGT island: GC-shifted window (±0.10 from host, published range ±0.05-0.10).
+    """HGT island with a GC-shifted donor-like window.
 
     Ref: Slot & Rokas 2011 Science; Marcet-Houben & Gabaldon 2010.
     """
@@ -520,7 +464,7 @@ def embed_hgt_island(seq: str, island_len: int = 600,
 
 def apply_rip(seq: str, window: int = 500, fraction: float = 0.3,
               seed: int = 1) -> str:
-    """Apply RIP (Repeat-Induced Point mutation): CpA → TpA transitions.
+    """Apply RIP-like CpA-to-TpA transitions.
 
     RIP exclusively targets the CpA dinucleotide context on the forward strand.
     This is measured by the RIP product index (TpA/CpA > 1.5) and RIP substrate
@@ -547,31 +491,30 @@ def embed_element_by_class(seq: str, ec: str, clade_gc: float = 0.45,
     if ec == "TE_SINE":  return embed_sine(seq, seed=seed)
     if ec == "STARSHIP": return embed_starship(seq, clade_gc=clade_gc, seed=seed)
     if ec == "HGT":
-        donor = max(0.25, min(0.72, clade_gc + 0.10))  # ±0.10 deviation
+        donor = max(0.25, min(0.72, clade_gc + 0.10))
         return embed_hgt_island(seq, donor_gc=donor, seed=seed)
     if ec == "RIP":      return apply_rip(seq, seed=seed)
     return seq  # NONE
 
 
-# ── Long-read platform presets ────────────────────────────────────────────
+# Long-read platform presets.
 # Applied when --long-read-platform is set; override individual --long-read-*
 # flags so simulated reads match each platform's actual characteristics.
 #
 # PacBio HiFi CCS (Revio / Sequel IIe):
-#   ≥Q20 per-read accuracy (error rate ≈ 0.1 %).  Reads 10–25 kb.
-#   Downstream: minimap2 map-hifi → samtools sort+index → sniffles2 / cuteSV
+#   Q20+ per-read accuracy (error rate around 0.1%). Reads 10-25 kb.
+#   Downstream: minimap2 map-hifi, samtools sort/index, sniffles2 or cuteSV
 #   (HiFi cluster params) / SVIM.
 #
 # ONT R10.4.1 standard simplex (PromethION / GridION / MinION Mk1C):
-#   ~Q20 median accuracy (error rate ≈ 1 %).  Reads 10–30 kb, median ~15 kb.
-#   Downstream: minimap2 map-ont → sniffles2 --long-read-model ont_r10_q20
-#   (Sniffles2 ≥v2.2) / cuteSV / SVIM.
+#   Around Q20 median accuracy (error rate around 1%). Reads 10-30 kb.
+#   Downstream: minimap2 map-ont, then Sniffles2, cuteSV, or SVIM.
 #   WhatsHap phase + haplotag is applicable for diploid / dikaryotic fungi
 #   (Puccinia, Leptosphaeria, Zymoseptoria tritici) once SNP calls are made
 #   via bcftools mpileup | bcftools call or Clair3 from the same BAM.
 #
 # ONT R9.4.1 (legacy):
-#   ~Q15 median accuracy (error rate ≈ 5 %).  Still common in public ENA data.
+#   Around Q15 median accuracy (error rate around 5%). Still common in ENA.
 #   Same minimap2 map-ont preset as R10.4.1; lower SV recall in repeat-rich
 #   regions (relevant for AMF / two-speed pathogen scenarios).
 #
@@ -650,10 +593,10 @@ def write_truth_vcf(path: Path, rows: list[list[str]]) -> None:
                       f"\t{info}\tGT\t" + "\t".join(gts) + "\n")
 
 
-# ── main ──────────────────────────────────────────────────────────────────
+# Main.
 
 def main() -> None:  # noqa: C901
-    ap = argparse.ArgumentParser(description="Fungal SV simulator — TOL pipeline")
+    ap = argparse.ArgumentParser(description="Fungal SV simulator for the TOL pipeline")
     ap.add_argument("--phylum",                  default="Ascomycota")
     ap.add_argument("--n-genomes",   type=int,   default=4)
     ap.add_argument("--n-reps",      type=int,   default=2)
@@ -684,6 +627,10 @@ def main() -> None:  # noqa: C901
                     help="Alias for compatibility; query_truth.tsv is always written.")
     ap.add_argument("--n-svs-per-contig", type=int, default=1,
                     help="Number of on-reference SVs to embed per query contig (currently fixed at 1).")
+    ap.add_argument("--off-ref-contigs", type=int, default=1,
+                    help="Number of leading query contigs to replace with off-reference sequence.")
+    ap.add_argument("--pangenome-stress", action="store_true",
+                    help="Make OFF_REF contigs donor-derived from a non-conspecific scenario so they are absent from the same-scenario reference but present in the broader pangenome.")
     ap.add_argument("--tol-query-window-bp", type=int, default=2000000,
                     help="Streaming window size in bp (passed through for provenance only).")
     ap.add_argument("--threads", type=int, default=32)
@@ -700,7 +647,7 @@ def main() -> None:  # noqa: C901
     ap.add_argument("--long-read-platform", default="ont-r10",
                     choices=["hifi", "ont-r10", "ont-r9", "generic"],
                     help="Long-read sequencing platform preset.  Overrides individual "
-                         "--long-read-* flags: hifi=PacBio HiFi CCS (≥Q20, 15 kb), "
+                         "--long-read-* flags: hifi=PacBio HiFi CCS (Q20+, 15 kb), "
                          "ont-r10=ONT R10.4.1 simplex (~Q20, 10 kb), "
                          "ont-r9=ONT R9.4.1 (~Q15, 8 kb), "
                          "generic=use explicit --long-read-* values.")
@@ -743,6 +690,18 @@ def main() -> None:  # noqa: C901
     off_ref_seed_base = 900_000
     scenario_backbones: dict[tuple[str, float, int], str] = {}
 
+    def get_scenario_backbone(scen_name: str, contig_idx: int, gc_value: float) -> str:
+        key = (scen_name, gc_value, contig_idx)
+        backbone = scenario_backbones.get(key)
+        if backbone is None:
+            backbone = rand_seq(
+                seq_len,
+                gc=gc_value,
+                seed=1000 + scenarios.index(scen_name) * 131 + contig_idx,
+            )
+            scenario_backbones[key] = backbone
+        return backbone
+
     for i in range(n_genomes):
         scen = scenarios[i % len(scenarios)]
         m    = dict(SCENARIOS[scen])
@@ -764,15 +723,7 @@ def main() -> None:  # noqa: C901
         elem_classes = _SCENARIO_ELEMENTS.get(scen, ["NONE"])
         homologous_bases: list[str] = []
         for c in range(int(args.n_contigs)):
-            backbone_key = (scen, gc, c)
-            backbone = scenario_backbones.get(backbone_key)
-            if backbone is None:
-                backbone = rand_seq(
-                    seq_len,
-                    gc=gc,
-                    seed=1000 + scenarios.index(scen) * 131 + c,
-                )
-                scenario_backbones[backbone_key] = backbone
+            backbone = get_scenario_backbone(scen, c, gc)
             homologous_bases.append(
                 mutate_sequence(backbone, args.divergence, seed=40_000 + i * 313 + c)
             )
@@ -781,16 +732,29 @@ def main() -> None:  # noqa: C901
             base = homologous_bases[c]
             name = f"ctg{c + 1}"
 
-            if i >= n_reps and c == 0:
+            if i >= n_reps and c < max(0, int(args.off_ref_contigs)):
                 orc_gc = off_ref_gc_for_scenario(gc)
-                base   = rand_seq(len(base), gc=orc_gc,
-                                  seed=off_ref_seed_base + i * 31 + c)
+                if args.pangenome_stress and len(scenarios) > 1:
+                    donor_scen = scenarios[(scenarios.index(scen) + 1 + c) % len(scenarios)]
+                    donor_meta = dict(SCENARIOS[donor_scen])
+                    donor_gc = scenario_gc(donor_meta, args.gc)
+                    if donor_scen == "giant_amf":
+                        donor_gc = 0.285
+                    donor = get_scenario_backbone(donor_scen, c, donor_gc)
+                    base = mutate_sequence(
+                        donor,
+                        args.divergence,
+                        seed=off_ref_seed_base + i * 31 + c,
+                    )
+                else:
+                    base = rand_seq(len(base), gc=orc_gc,
+                                    seed=off_ref_seed_base + i * 31 + c)
                 ec = elem_classes[0] if elem_classes else "NONE"
                 if ec != "NONE":
                     base = embed_element_by_class(base, ec, clade_gc=gc,
                                                   seed=off_ref_seed_base + i * 31 + c + 500)
-                name = (f"ctg1__sv_OFF_REF__pos__1__len__{len(base)}"
-                        if args.write_hint_contigs else "ctg1")
+                name = (f"ctg{c + 1}__sv_OFF_REF__pos__1__len__{len(base)}"
+                        if args.write_hint_contigs else f"ctg{c + 1}")
                 query_truth_rows.append([
                     asm, name, "OFF_REF", "1", str(len(base)), scen,
                     m["phylum"], m["cls"], m["order"], m["family"], m["genus"],
@@ -798,11 +762,11 @@ def main() -> None:  # noqa: C901
                 ])
                 if args.write_query_annotations:
                     query_annotation_rows.append(
-                        [asm, "ctg1", ec if ec != "NONE" else "HGT",
+                        [asm, f"ctg{c + 1}", ec if ec != "NONE" else "HGT",
                          m["architecture"], str(len(base))]
                     )
 
-            elif i >= n_reps and c > 0:
+            elif i >= n_reps:
                 sv_types = parse_biases(m.get("expected_sv_bias", "INS"))
                 rng      = random.Random(5000 + i * 131 + c)
                 svtype   = rng.choice(sv_types)
@@ -925,10 +889,13 @@ def main() -> None:  # noqa: C901
               unique_stress)
     write_tsv(out / "simulation_params.tsv",
               ["n_genomes","n_reps","n_queries","scenario_count",
-               "divergence","n_svs_per_contig","window_bp","write_hint_contigs","query_mode",
+               "divergence","n_svs_per_contig","off_ref_contigs","pangenome_stress",
+               "window_bp","write_hint_contigs","query_mode",
                "lr_platform","lr_read_len","lr_error_rate","lr_coverage"],
               [[str(n_genomes), str(n_reps), str(len(queries)), str(len(scenarios)),
-                str(args.divergence), "1", str(seq_len), str(int(args.write_hint_contigs)), query_emit_mode,
+                str(args.divergence), str(args.n_svs_per_contig),
+                str(args.off_ref_contigs), str(int(args.pangenome_stress)),
+                str(seq_len), str(int(args.write_hint_contigs)), query_emit_mode,
                 args.long_read_platform, str(args.long_read_len),
                 str(args.long_read_error_rate), str(args.long_read_coverage)]])
 
@@ -938,6 +905,55 @@ def main() -> None:  # noqa: C901
                "mate_contig","mate_pos","mate_end","mate_svlen"],
               query_truth_rows)
     write_truth_vcf(out / "truth" / "all_queries.truth.ref.vcf", query_truth_rows)
+
+    # Pangenome truth: one record per (query_asm, embedded_SV, non-conspecific
+    # rep_asm) triple. Match condition: qasm + clade-asm + svtype-compatible
+    # + q-pos within TOL.
+    pangenome_rows: list[list[str]] = []
+    rep_asm_to_scenario: dict[str, str] = {}
+    for rep_path in rep_asms:
+        rep_asm = Path(rep_path).stem
+        rep_asm_to_scenario[rep_asm] = re.sub(r"_asm\d+$", "", rep_asm)
+    for row in query_truth_rows:
+        if len(row) < 15:
+            continue
+        scen = row[5]
+        for rep_asm, rep_scen in rep_asm_to_scenario.items():
+            if rep_scen == scen:
+                continue  # conspecific rep covered by single-ref truth
+            pangenome_rows.append(list(row) + [rep_asm])
+
+    def write_pangenome_truth_vcf(path: Path, rows: list[list[str]]) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "w") as out:
+            out.write("##fileformat=VCFv4.3\n##source=test_amf_simulator_pangenome\n")
+            for tag, desc, t in [
+                ("SVTYPE", "SV type", "String"),
+                ("SVLEN", "SV length", "Integer"),
+                ("END", "End position", "Integer"),
+                ("SCENARIO", "Simulation scenario", "String"),
+                ("QUERY_ASM", "Query assembly", "String"),
+                ("TARGET_REF", "Non-conspecific panel ref the call is expected against", "String"),
+                ("PHYLUM", "Phylum", "String"), ("CLASS", "Class", "String"),
+                ("ORDER", "Order", "String"), ("FAMILY", "Family", "String"),
+                ("GENUS", "Genus", "String"),
+            ]:
+                out.write(f'##INFO=<ID={tag},Number=1,Type={t},Description="{desc}">\n')
+            out.write("#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\n")
+            for idx, row in enumerate(rows, start=1):
+                q_asm, q_contig, svtype = row[0], row[1], row[2]
+                pos_i = int(row[3]); svlen_i = int(row[4]); scen = row[5]
+                phylum, cls, order, family, genus = row[6:11]
+                target_ref = row[15]
+                chrom = normalize_query_contig_name(q_contig)
+                end_i = pos_i if svtype.startswith("TRA") else pos_i + max(svlen_i - 1, 0)
+                info = (f"SVTYPE={svtype};SVLEN={svlen_i};END={end_i}"
+                        f";SCENARIO={scen};QUERY_ASM={q_asm};TARGET_REF={target_ref}"
+                        f";PHYLUM={phylum};CLASS={cls};ORDER={order}"
+                        f";FAMILY={family};GENUS={genus}")
+                out.write(f"{chrom}\t{pos_i}\tpan{idx}\tN\t<{svtype}>\t60\tPASS\t{info}\n")
+
+    write_pangenome_truth_vcf(out / "truth" / "all_queries.truth.pangenome.vcf", pangenome_rows)
 
     if args.write_query_annotations:
         write_tsv(out / "graph_annotations_denovo.tsv",

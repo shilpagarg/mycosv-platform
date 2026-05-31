@@ -1,6 +1,4 @@
 #!/usr/bin/env python3
-# Designed for Linux
-
 from __future__ import annotations
 
 import csv
@@ -165,7 +163,7 @@ def parse_vcf_records(path: Path,
             pred_ctx = call_context.get((qasm, raw_chrom), {}) if is_pred and qasm else {}
             scenario = info.get("SCENARIO", "")
             if is_pred and not scenario and qasm:
-                # Try the qasm verbatim, then stem variants — the binary's
+                # Try the qasm verbatim, then stem variants - the binary's
                 # QASM may carry a file extension while query_metadata.tsv
                 # is keyed on the bare asm name.
                 for alias in _asm_aliases(qasm):
@@ -182,7 +180,7 @@ def parse_vcf_records(path: Path,
             # actual reference coordinates in REFPOS/REFEND.  The truth VCF
             # always uses reference coordinates, so for read-mode predictions
             # with REFPOS available we must score against the reference-space
-            # position — otherwise the position-tolerance check compares
+            # position - otherwise the position-tolerance check compares
             # unitig-local pos (often near the unitig start) to a truth pos
             # tens-of-kb downstream and rejects every otherwise-perfect hit.
             ref_pos_raw = info.get("REFPOS", "")
@@ -254,7 +252,7 @@ def _span_contain_applies(truth: dict[str, Any], pred: dict[str, Any], tol: int)
     breakpoint AND the type group supports span-based matching.
 
     MycoSV's MEM-chain caller emits coarse blocks spanning the genomic
-    interval between consecutive anchors — for INV/TRA always, and for DEL/DUP
+    interval between consecutive anchors - for INV/TRA always, and for DEL/DUP
     whenever the chain gap aggregates several fine-grained events. Read-level
     and assembly comparators emit the embedded per-event breakpoints. Allowing
     span-containment lets one chain-level pred match a single fine-grained
@@ -319,8 +317,8 @@ def compatible(truth: dict[str, Any], pred: dict[str, Any]) -> bool:
         pos_within_tol = abs(truth["pos"] - pred["pos"]) <= tol
         # For INV/TRA the caller reports the whole chain block; for DEL/DUP it
         # reports the whole chain gap. The truth variant lives somewhere inside
-        # that block. Accept span-containment as a valid local-pos match —
-        # otherwise large embedded variants (truth.pos ≫ pred.pos) are
+        # that block. Accept span-containment as a valid local-pos match -
+        # otherwise large embedded variants (truth.pos >> pred.pos) are
         # spuriously rejected.
         if not (pos_within_tol or span_match):
             return False
@@ -353,7 +351,7 @@ def compatible(truth: dict[str, Any], pred: dict[str, Any]) -> bool:
 
 
 def distance(truth: dict[str, Any], pred: dict[str, Any]) -> int:
-    # For INV/TRA — and coarse DEL/DUP chain blocks — the caller emits
+    # For INV/TRA - and coarse DEL/DUP chain blocks - the caller emits
     # whole-block coordinates so the local pos can be far from the truth's
     # embedded breakpoint; using raw pos_d would bias matching against
     # well-aligned mates. When the pred span legitimately contains the truth
@@ -418,7 +416,7 @@ def _collapse_off_ref_per_qasm(pred_rows: list[dict[str, Any]]) -> list[dict[str
     and inflates FP by K-1, swamping the overall precision figure.
 
     Keep the highest-confidence representative per (qasm, type=OFF_REF)
-    bucket — preferring DIVERGED tier over NOVEL since DIVERGED OFF_REF is
+    bucket - preferring DIVERGED tier over NOVEL since DIVERGED OFF_REF is
     the stronger anchored claim.
     """
     if not pred_rows:
@@ -431,7 +429,7 @@ def _collapse_off_ref_per_qasm(pred_rows: list[dict[str, Any]]) -> list[dict[str
             continue
         qasm = row.get("qasm", "")
         if not qasm:
-            # Without a qasm we cannot dedup safely — keep as-is so the
+            # Without a qasm we cannot dedup safely - keep as-is so the
             # diagnostic stays visible rather than silently dropping rows.
             out.append(row)
             continue
@@ -476,7 +474,7 @@ def _collapse_redundant_inv_tra(pred_rows: list[dict[str, Any]]) -> list[dict[st
     Cluster INV by (qasm, ref_contig) on midpoint distance, and TRA by
     (qasm, frozenset(ref_contig, chr2)) on the per-end distances (with
     mate-side swap considered).  Keep the highest-quality representative
-    per cluster — the matcher then assigns it to the truth row.
+    per cluster - the matcher then assigns it to the truth row.
     """
     if not pred_rows:
         return pred_rows
@@ -660,7 +658,7 @@ def score_pr(truth_vcf: Path,
         },
         "hint_leak_diagnostic": {
             "hint_leaked_predictions": len(hint_leaked_preds),
-            "note": "non-zero means hint path is still active — results are compromised",
+            "note": "non-zero means hint path is still active - results are compromised",
         },
         "by_svtype": {},
         "by_scenario": {},
@@ -791,7 +789,7 @@ def _normalize_asm_token(raw: str) -> str:
     Mirrors run_real_fungal_benchmark.normalize_name so a sanitized manifest
     sample (``GCF_000512605_2``) and the raw QASM the binary writes
     (``GCF_000512605.2_ASM51260v3_genomic.fna``) collapse to comparable
-    tokens — the latter normalizes to ``GCF_000512605_2_ASM51260v3_...``,
+    tokens - the latter normalizes to ``GCF_000512605_2_ASM51260v3_...``,
     which startswith the former + "_".
     """
     cleaned = re.sub(r"[^0-9A-Za-z]+", "_", raw.strip()).strip("_")
@@ -801,8 +799,8 @@ def _normalize_asm_token(raw: str) -> str:
 def _resolve_owner_sample(qasm: str, norm_samples: list[tuple[int, str]]) -> int:
     """Return the index of the manifest sample that owns this QASM, or -1.
 
-    Match is exact-normalized first, then prefix either way — the same rule
-    run_real_fungal_benchmark.qasm_matches_observed uses — so the raw
+    Match is exact-normalized first, then prefix either way - the same rule
+    run_real_fungal_benchmark.qasm_matches_observed uses - so the raw
     filename-stem QASM resolves back to its sanitized manifest column
     instead of being treated as a brand-new sample.
     """
@@ -829,7 +827,7 @@ def expand_to_multisample_vcf(
     provenance buried in the QASM (pred) or QUERY_ASM (truth) INFO field.
     For multi-query benchmarks the user-facing expectation is one column
     per query asm with GT 1/1 only for the owning sample. This walks the
-    file twice (cheap — VCFs here are small): pass 1 to enumerate sample
+    file twice (cheap - VCFs here are small): pass 1 to enumerate sample
     names, pass 2 to rewrite rows. Returns the destination path.
 
     When ``sample_names`` is supplied (the manifest sample list) it is the
@@ -848,7 +846,7 @@ def expand_to_multisample_vcf(
     have_manifest = bool(samples)
     norm_samples = [(i, _normalize_asm_token(s)) for i, s in enumerate(samples)]
     if not have_manifest:
-        # No manifest sample list — fall back to enumerating QASM values
+        # No manifest sample list - fall back to enumerating QASM values
         # straight from the file (each distinct QASM is its own column).
         with src_vcf.open(encoding="utf-8") as fh:
             for line in fh:
@@ -864,7 +862,7 @@ def expand_to_multisample_vcf(
                     samples.append(asm)
         norm_samples = [(i, _normalize_asm_token(s)) for i, s in enumerate(samples)]
     if not samples:
-        # Nothing to expand and no manifest sample list — copy through as-is.
+        # Nothing to expand and no manifest sample list - copy through as-is.
         dst_vcf.write_text(src_vcf.read_text(encoding="utf-8"), encoding="utf-8")
         return dst_vcf
     # Exact-name index covers the no-manifest path (QASM == column name);

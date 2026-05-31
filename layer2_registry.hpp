@@ -1,5 +1,5 @@
 #pragma once
-// layer2_registry.hpp — v14
+// layer2_registry.hpp - v14
 // Clade Graph Registry (Layer 2)
 //
 // Core responsibilities
@@ -41,7 +41,7 @@ namespace fs = std::filesystem;
 
 namespace tol {
 
-// ── G2: free-RAM adaptive cache sizing ───────────────────────────────────
+// G2: free-RAM adaptive cache sizing
 inline size_t adaptive_cache_bytes() {
 #if defined(__unix__) || defined(__APPLE__)
     long pages = sysconf(_SC_AVPHYS_PAGES);
@@ -53,7 +53,7 @@ inline size_t adaptive_cache_bytes() {
     return size_t(8) << 30;
 }
 
-// ── CRC-32 (IEEE 802.3) ───────────────────────────────────────────────────
+// CRC-32 (IEEE 802.3)
 inline uint32_t crc32_file(const std::string& path) {
     static const std::array<uint32_t, 256> T = []() {
         std::array<uint32_t, 256> t{};
@@ -74,7 +74,7 @@ inline uint32_t crc32_file(const std::string& path) {
     return crc ^ 0xFFFFFFFFu;
 }
 
-// ── Manifest types ────────────────────────────────────────────────────────
+// Manifest types
 struct CladeDescriptor {
     std::string         cladeName, cladeRank, phylum, graphPath;
     size_t              genomeCount    = 0;
@@ -189,7 +189,7 @@ inline std::vector<CladeDescriptor> load_manifest(const std::string& path) {
     return out;
 }
 
-// ── LRU cache entry (DS-1: holds list iterator for O(1) eviction) ─────────
+// LRU cache entry (DS-1: holds list iterator for O(1) eviction)
 using LruList = std::list<std::string>;
 
 struct CacheEntry {
@@ -200,7 +200,7 @@ struct CacheEntry {
 };
 
 // =========================================================================
-// CladeGraphRegistry — DS-1 O(1) LRU + DS-2 load-once future guard
+// CladeGraphRegistry - DS-1 O(1) LRU + DS-2 load-once future guard
 // =========================================================================
 class CladeGraphRegistry {
 public:
@@ -238,13 +238,13 @@ public:
             clades_.push_back(desc);
             flush_manifest_locked();
             ++totalRegistered_;
-            // M7: do NOT cache on register — keep RAM free for query phase.
+            // M7: do NOT cache on register - keep RAM free for query phase.
         }
     }
 
     // DS-2 + DS-1: load-once future guard; O(1) LRU touch.
     std::shared_ptr<CladeGraph> get(const std::string& cladeName) {
-        // ── Fast path: already cached ────────────────────────────────────
+        // Fast path: already cached
         {
             std::unique_lock wl(mu_);
             auto cit = cache_.find(cladeName);
@@ -258,7 +258,7 @@ public:
         }
         ++cacheMisses_;
 
-        // ── DS-2: get-or-create shared_future sentinel ───────────────────
+        // DS-2: get-or-create shared_future sentinel
         std::shared_future<std::shared_ptr<CladeGraph>> fut;
         bool isOwner = false;
         {
@@ -294,7 +294,7 @@ public:
                 // (possible if the outer fast-path check races).
                 auto pit2 = pending_.find(cladeName);
                 if (pit2 != pending_.end()) {
-                    // Another owner beat us — become a non-owner waiter.
+                    // Another owner beat us - become a non-owner waiter.
                     fut = pit2->second;
                     isOwner = false;
                 } else {
@@ -375,7 +375,7 @@ private:
         }
     }
 
-    // Disk load — called OUTSIDE any lock (DS-2).
+    // Disk load - called OUTSIDE any lock (DS-2).
     std::shared_ptr<CladeGraph> load_from_disk_unlocked(const std::string& cladeName) {
         CladeDescriptor descCopy;
         {
@@ -390,7 +390,7 @@ private:
             const uint32_t actual = crc32_file(descCopy.graphPath);
             if (actual != descCopy.crc32)
                 throw std::runtime_error(
-                    "GBZ CRC mismatch for " + cladeName + " — delete & rebuild index");
+                    "GBZ CRC mismatch for " + cladeName + " - delete & rebuild index");
         }
         return std::make_shared<CladeGraph>(gbz_io::load(descCopy.graphPath));
     }
@@ -399,7 +399,7 @@ private:
     // would-be post-insertion size.
     // The full write-lock is held throughout (required for list/map
     // consistency).  The eviction itself is O(K) where K is the number of
-    // entries evicted — no full Fenwick rebuild needed.
+    // entries evicted - no full Fenwick rebuild needed.
     void insert_into_cache(const std::string& cladeName,
                             std::shared_ptr<CladeGraph> g) {
         const size_t sz = g->compressed_bytes();
@@ -422,7 +422,7 @@ private:
         // cacheCurrentBytes_ was already incremented above.
     }
 
-    // DS-1: O(1) LRU eviction — back of list is oldest.
+    // DS-1: O(1) LRU eviction - back of list is oldest.
     void evict_lru_locked() {
         if (cache_.empty()) return;
         const std::string& oldest = lruList_.back();

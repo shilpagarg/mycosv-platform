@@ -1,30 +1,30 @@
 #ifndef FUNGI_TOL_LAYER1_CLADE_GRAPH_HPP
 #define FUNGI_TOL_LAYER1_CLADE_GRAPH_HPP
 
-// layer1_clade_graph.hpp — Layer 1: per-clade pangenome graph data structures.
+// layer1_clade_graph.hpp - Layer 1: per-clade pangenome graph data structures.
 //
 // Data-structure inventory (DS numbers match design doc):
-//   DS-7   PathPositionIndex  — order-statistics for TraIntra detection
-//   DS-8   is_inversion_flex  — quick-reject for impossible inversions
-//   DS-10  ReferenceLCAIndex  — Euler-tour sparse-table O(1) LCA
-//   DS-11  classify_triallelic — triallelic topology classification
-//   DS-12  PantreeVariantClass — pantree/NON_REF annotation
-//   DS-13  SuffixArray + LCP  — O(N log N) build, O(|q| log N) MEM query
-//   DS-15  VEBTree            — O(log log U) predecessor/successor
-//   DS-16  MergeSortTree      — O(log² N) interval stabbing
-//   DS-17  FenwickTree        — O(log N) prefix-sum / rank queries
-//   DS-18  ChainTreap         — O(N log N) MEM seed chaining
+//   DS-7   PathPositionIndex  - order-statistics for TraIntra detection
+//   DS-8   is_inversion_flex  - quick-reject for impossible inversions
+//   DS-10  ReferenceLCAIndex  - Euler-tour sparse-table O(1) LCA
+//   DS-11  classify_triallelic - triallelic topology classification
+//   DS-12  PantreeVariantClass - pantree/NON_REF annotation
+//   DS-13  SuffixArray + LCP  - O(N log N) build, O(|q| log N) MEM query
+//   DS-15  VEBTree            - O(log log U) predecessor/successor
+//   DS-16  MergeSortTree      - O(log^2 N) interval stabbing
+//   DS-17  FenwickTree        - O(log N) prefix-sum / rank queries
+//   DS-18  ChainTreap         - O(N log N) MEM seed chaining
 //
 // Repeat / TE / STARSHIP / HGT / RIP annotators (new in v14):
-//   detect_tandem_repeat      — period 2–12, ≥5 copies, ≥50 bp
-//   detect_ltr_element        — direct terminal repeats ≥50 bp + high-GC interior
-//   detect_tir_element        — inverted terminal repeats ≥30 bp
-//   detect_line_helitron      — AT-rich + poly-A/T tails (LINE/Helitron)
-//   detect_sine               — short + high-GC + terminal repeat
-//   detect_starship           — AT-rich hull (GC < cladeGc-0.10) + ~genic cargo ≥1 kb
-//   detect_hgt_island         — GC deviation >±0.10 over ≥500 bp
-//   detect_rip_window         — lightweight RIP-product index in a 500 bp window
-//   classify_repeat_element   — master dispatcher returning ElementClass
+//   detect_tandem_repeat      - period 2-12, >=5 copies, >=50 bp
+//   detect_ltr_element        - direct terminal repeats >=50 bp + high-GC interior
+//   detect_tir_element        - inverted terminal repeats >=30 bp
+//   detect_line_helitron      - AT-rich + poly-A/T tails (LINE/Helitron)
+//   detect_sine               - short + high-GC + terminal repeat
+//   detect_starship           - AT-rich hull (GC < cladeGc-0.10) + ~genic cargo >=1 kb
+//   detect_hgt_island         - GC deviation >+/-0.10 over >=500 bp
+//   detect_rip_window         - lightweight RIP-product index in a 500 bp window
+//   classify_repeat_element   - master dispatcher returning ElementClass
 
 #include <algorithm>
 #include <array>
@@ -50,7 +50,7 @@
 namespace tol {
 
 // =========================================================================
-// SyncmerParams — seeding / sketching parameters
+// SyncmerParams - seeding / sketching parameters
 // Defined in layer 1 to break the circular dependency: layer3 includes this
 // header and needs SyncmerParams, but fungi_tol_bridge includes layer3.
 // =========================================================================
@@ -66,7 +66,7 @@ struct SyncmerParams {
 };
 
 // =========================================================================
-// BaseBlockSegmenter — Hong & Buhler (2016) open syncmer seeding.
+// BaseBlockSegmenter - Hong & Buhler (2016) open syncmer seeding.
 //
 // A k-mer is a syncmer iff the minimum-hash s-mer among its (k - s + 1)
 // constituent s-mers occurs at offset `t` inside the k-mer. Hashing is
@@ -154,7 +154,7 @@ struct BaseBlockSegmenter {
 };
 
 // =========================================================================
-// CladeGraph — per-clade pangenome graph (nodes, oriented edges, paths).
+// CladeGraph - per-clade pangenome graph (nodes, oriented edges, paths).
 // Built by build_clade_graph() below (collapses ImportSegments into nodes via
 // sketch-Jaccard buckets, reconstructs per-asm/contig paths, aggregates
 // oriented edge counts, and tallies bubble / block contexts that downstream
@@ -629,10 +629,10 @@ inline CladeGraph build_clade_graph(
 }
 
 // =========================================================================
-// ── REPEAT / TE / STARSHIP / HGT / RIP ANNOTATORS ────────────────────────
+// REPEAT / TE / STARSHIP / HGT / RIP ANNOTATORS
 // =========================================================================
 
-// ElementClass — annotation label for an off-reference or on-reference region.
+// ElementClass - annotation label for an off-reference or on-reference region.
 enum class ElementClass {
     NONE,
     REPEAT,       // tandem repeat
@@ -659,7 +659,7 @@ inline const char* element_class_name(ElementClass ec) {
     }
 }
 
-// ── GC content helper ─────────────────────────────────────────────────────
+// GC content helper
 inline double gc_content(std::string_view seq) {
     if (seq.empty()) return 0.0;
     size_t gc = 0;
@@ -668,7 +668,7 @@ inline double gc_content(std::string_view seq) {
     return static_cast<double>(gc) / static_cast<double>(seq.size());
 }
 
-// ── detect_tandem_repeat ─────────────────────────────────────────────────
+// detect_tandem_repeat
 // Strict period-regularity detector. For each period p, a run counts
 // consecutive positions where seq[i] == seq[i - p]. A run of
 // (minCopies - 1) * p positions spans minCopies copies of the p-mer unit;
@@ -699,11 +699,11 @@ inline bool detect_tandem_repeat(std::string_view seq,
     return false;
 }
 
-// ── detect_ltr_element ───────────────────────────────────────────────────
+// detect_ltr_element
 // Looks for direct terminal repeat (DTR) at both ends.
 // DTR is detected by checking that the first ltrLen bases of seq match the
-// last ltrLen bases with ≤ mismatchRate mismatches.
-// High-GC interior heuristic: GC of the middle 50% must be ≥ gcThresh.
+// last ltrLen bases with <= mismatchRate mismatches.
+// High-GC interior heuristic: GC of the middle 50% must be >= gcThresh.
 inline bool detect_ltr_element(std::string_view seq,
                                 int    ltrLen       = 50,
                                 double mismatchRate = 0.10,
@@ -727,7 +727,7 @@ inline bool detect_ltr_element(std::string_view seq,
                                  static_cast<size_t>(midEnd - midStart))) >= gcThresh;
 }
 
-// ── detect_tir_element ───────────────────────────────────────────────────
+// detect_tir_element
 // Inverted terminal repeats: first tirLen bases complement-match last tirLen
 // bases in reverse order.
 inline bool detect_tir_element(std::string_view seq,
@@ -763,8 +763,8 @@ inline bool detect_tir_element(std::string_view seq,
     return true;
 }
 
-// ── detect_line_helitron ─────────────────────────────────────────────────
-// AT-rich (GC < 0.42) overall + poly-A or poly-T run ≥ polyRunLen at
+// detect_line_helitron
+// AT-rich (GC < 0.42) overall + poly-A or poly-T run >= polyRunLen at
 // either terminus.
 inline bool detect_line_helitron(std::string_view seq,
                                   double gcThresh  = 0.42,
@@ -793,9 +793,9 @@ inline bool detect_line_helitron(std::string_view seq,
     return false;
 }
 
-// ── detect_sine ──────────────────────────────────────────────────────────
-// Short (≤ 500 bp) + high-GC interior (≥ 0.50) + terminal repeat
-// (first/last 15 bp match with ≤ 2 mismatches).
+// detect_sine
+// Short (<= 500 bp) + high-GC interior (>= 0.50) + terminal repeat
+// (first/last 15 bp match with <= 2 mismatches).
 inline bool detect_sine(std::string_view seq) {
     const int n = static_cast<int>(seq.size());
     if (n < 80 || n > 500) return false;
@@ -812,12 +812,12 @@ inline bool detect_sine(std::string_view seq) {
     return true;
 }
 
-// ── detect_starship ──────────────────────────────────────────────────────
+// detect_starship
 // Starship mega-element (Ascomycota only; not confirmed in Glomeromycota or
 // Basidiomycota).
 //
 // Signature: AT-rich hull relative to clade background + GC-rich "cargo"
-// sub-region ≥ 1 kb in the interior.
+// sub-region >= 1 kb in the interior.
 //
 // Hull criterion: sequence GC < (cladeGc - overallGcDrop)
 //   overallGcDrop = 0.10 (Urquhart et al. 2023: hull is ~10% below background)
@@ -860,9 +860,9 @@ inline bool starship_supported_phylum(std::string_view phylum) {
     return phylum == "Ascomycota";
 }
 
-// ── detect_hgt_island ────────────────────────────────────────────────────
+// detect_hgt_island
 // Horizontal gene transfer island: GC content deviates from clade background
-// by > ±gcDeviation over a sliding window of ≥ minLen bases.
+// by > +/-gcDeviation over a sliding window of >= minLen bases.
 //
 // cladeGc: background GC of the clade (computed externally or passed as 0.45).
 inline bool detect_hgt_island(std::string_view seq,
@@ -880,7 +880,7 @@ inline bool detect_hgt_island(std::string_view seq,
     return false;
 }
 
-// ── detect_rip_window ────────────────────────────────────────────────────
+// detect_rip_window
 // RIP (Repeat-Induced Point mutation): lightweight RIP-product proxy in a
 // sliding window.  RIP leaves a C->T / G->A signature in repeated DNA, commonly
 // summarized with dinucleotide indices such as TpA/CpA or composite RIP
@@ -916,7 +916,7 @@ inline bool detect_rip_window(std::string_view seq,
     return false;
 }
 
-// ── classify_repeat_element ──────────────────────────────────────────────
+// classify_repeat_element
 // Master dispatcher.  Tests in order of specificity (most specific first).
 // Returns the first match, or ElementClass::NONE if nothing fires.
 //
@@ -952,7 +952,7 @@ inline ElementClass classify_repeat_element(std::string_view seq,
 }
 
 // =========================================================================
-// DS-7: PathPositionIndex  — order-statistics treap for TraIntra detection
+// DS-7: PathPositionIndex  - order-statistics treap for TraIntra detection
 // =========================================================================
 struct PathPositionIndex {
     std::vector<size_t> orderStats;  // sorted path positions
@@ -988,7 +988,7 @@ struct PathPositionIndex {
 enum class TraIntra { LINEAR, TRA_INTRA, TRA_INTER };
 
 // =========================================================================
-// DS-8: is_inversion_flex  — quick-reject for impossible inversions
+// DS-8: is_inversion_flex  - quick-reject for impossible inversions
 // =========================================================================
 // Accept inversions only when allele lengths differ within the relative tolerance.
 inline bool is_inversion_flex(size_t refLen, size_t altLen,
@@ -1000,7 +1000,7 @@ inline bool is_inversion_flex(size_t refLen, size_t altLen,
 }
 
 // =========================================================================
-// DS-10: ReferenceLCAIndex  — Euler tour + sparse-table O(1) RMQ LCA
+// DS-10: ReferenceLCAIndex  - Euler tour + sparse-table O(1) RMQ LCA
 // =========================================================================
 struct ReferenceLCAIndex {
     std::vector<int>              eulerTour;
@@ -1047,7 +1047,7 @@ struct ReferenceLCAIndex {
 };
 
 // =========================================================================
-// DS-11: classify_triallelic — topology of two overlapping SV intervals
+// DS-11: classify_triallelic - topology of two overlapping SV intervals
 // =========================================================================
 enum class TriallelicTopology {
     PROPERLY_TRIALLELIC,
@@ -1122,7 +1122,7 @@ struct SuffixArray {
     std::vector<std::string> contigName;
 
     // Build from (name, seq) pairs.  Each contig is separated by a unique
-    // sentinel (char values 1–30) so cross-contig matches never fire.
+    // sentinel (char values 1-30) so cross-contig matches never fire.
     //
     // Sentinel IDs stay in 1-30 (all < 32) so find_mems reliably stops
     // extension at every contig boundary and cannot form cross-contig MEMs.
@@ -1189,7 +1189,7 @@ struct SuffixArray {
     //   For each query position i, find the SA entry that gives the longest
     //   prefix match with query[i..] using binary search.  The binary search
     //   comparison handles sentinels (chars < 32) correctly: a sentinel at
-    //   text[pos+len] means the SA suffix is exhausted before the query —
+    //   text[pos+len] means the SA suffix is exhausted before the query -
     //   lexicographically the suffix is less than the query extension, so we
     //   should move RIGHT (lo = mid + 1).
     //
@@ -1228,22 +1228,22 @@ struct SuffixArray {
 
                 // Binary search direction:
                 //   After matching len chars, the next characters decide.
-                //   Case A: query exhausted (len == qn-i) → suffix >= query prefix.
+                //   Case A: query exhausted (len == qn-i) -> suffix >= query prefix.
                 //           Go left: hi = mid - 1.
-                //   Case B: ref suffix exhausted OR hit sentinel (< 32) → the SA
+                //   Case B: ref suffix exhausted OR hit sentinel (< 32) -> the SA
                 //           entry is lex-less than any query extension.
                 //           Go right: lo = mid + 1.
                 //   Case C: both have a character to compare.
-                //           text[rpos+len] < query[i+len] → SA entry is lex-less.
+                //           text[rpos+len] < query[i+len] -> SA entry is lex-less.
                 //           Go right: lo = mid + 1.
                 //           Otherwise go left: hi = mid - 1.
                 if (i + len >= qn) {
-                    // query exhausted: suffix ≥ query prefix here → go left
+                    // query exhausted: suffix >= query prefix here -> go left
                     hi = mid - 1;
                 } else if (rpos + len >= n ||
                            static_cast<unsigned char>(
                                text[static_cast<size_t>(rpos + len)]) < 32u) {
-                    // sentinel or end-of-text: SA suffix is lex-smaller → go right
+                    // sentinel or end-of-text: SA suffix is lex-smaller -> go right
                     lo = mid + 1;
                 } else if (text[static_cast<size_t>(rpos + len)] <
                            query[static_cast<size_t>(i + len)]) {
@@ -1403,11 +1403,11 @@ using VEBTree25 = VEBTree<25>;
 // =========================================================================
 // DS-16: MergeSortTree for interval stabbing queries  (Willard 1985)
 //
-// build():       O(N log N) — inserts each interval's hi into the segment
+// build():       O(N log N) - inserts each interval's hi into the segment
 //                tree node for its lo rank; sorts each node's list.
-// stab_count(p): O(log² N) — walks O(log N) nodes covering [0..rank(p)],
+// stab_count(p): O(log^2 N) - walks O(log N) nodes covering [0..rank(p)],
 //                binary-searches each node's sorted hi list for hi >= p.
-// overlapping(): O(N) linear scan — correct and safe for the typical
+// overlapping(): O(N) linear scan - correct and safe for the typical
 //                call count per assembly (<1 000).
 // =========================================================================
 struct MergeSortTree {
@@ -1439,7 +1439,7 @@ struct MergeSortTree {
         for (auto& v : tree_) std::sort(v.begin(), v.end());
     }
 
-    // O(log² N): count intervals [lo,hi] where lo <= p AND hi >= p.
+    // O(log^2 N): count intervals [lo,hi] where lo <= p AND hi >= p.
     // Algorithm: intervals are indexed by their lo rank in the segment tree.
     // All nodes covering the range [0 .. rank(p)] hold intervals with lo <= p.
     // Within each such node the hi list is sorted; binary search counts hi >= p.
@@ -1455,7 +1455,7 @@ struct MergeSortTree {
         return count;
     }
 
-    // O(N) scan — correct and safe for typical call counts (< 1 000 per assembly).
+    // O(N) scan - correct and safe for typical call counts (< 1 000 per assembly).
     std::vector<int> overlapping(int qlo, int qhi) const {
         std::vector<int> out;
         for (int i = 0; i < n_; ++i) {
@@ -1544,7 +1544,7 @@ struct FenwickTree {
 };
 
 // =========================================================================
-// DS-18: ChainTreap — O(N log N) MEM seed chaining  (Aragon & Seidel 1989)
+// DS-18: ChainTreap - O(N log N) MEM seed chaining  (Aragon & Seidel 1989)
 // =========================================================================
 struct ChainTreap {
     struct Node {
@@ -1552,7 +1552,7 @@ struct ChainTreap {
         float score = 0.0f, best = 0.0f;
         // subtreeBest = max(best) over this node's whole subtree. Maintained
         // on insert/rotation so find_pred_score can prune entire subtrees
-        // that cannot improve the running best — turning the predecessor
+        // that cannot improve the running best - turning the predecessor
         // search from O(n) (full left-subtree walk) into ~O(log n) amortised
         // and the whole chain build from O(n^2) into ~O(n log n). On
         // chromosome-scale fungal query contigs the O(n^2) walk was the
@@ -1636,13 +1636,13 @@ private:
             rPos - nd.rPos <= maxGap && qPos - nd.qPos <= maxGap) {
             if (nd.best > best) { best = nd.best; bestIdx = node; }
         }
-        // Left subtree (all rPos ≤ nd.rPos): worth visiting only if nd.rPos
-        // itself is still within the gap band's lower bound — otherwise every
+        // Left subtree (all rPos <= nd.rPos): worth visiting only if nd.rPos
+        // itself is still within the gap band's lower bound - otherwise every
         // left node is too far back.
         if (nd.rPos >= rPos - maxGap)
             find_pred_rec(nd.left, rPos, qPos, maxGap, best, bestIdx);
-        // Right subtree (all rPos ≥ nd.rPos): only when nd.rPos < rPos, since
-        // nodes with rPos ≥ rPos can never be predecessors.
+        // Right subtree (all rPos >= nd.rPos): only when nd.rPos < rPos, since
+        // nodes with rPos >= rPos can never be predecessors.
         if (nd.rPos < rPos)
             find_pred_rec(nd.right, rPos, qPos, maxGap, best, bestIdx);
     }
@@ -1684,7 +1684,7 @@ private:
 };
 
 // =========================================================================
-// SvTypeFromChain — classify a MEM chain → INS/DEL/INV/DUP/TRA/NONE
+// SvTypeFromChain - classify a MEM chain -> INS/DEL/INV/DUP/TRA/NONE
 // =========================================================================
 struct SvTypeFromChain {
     enum class Type { NONE, INS, DEL, INV, DUP, TRA };
@@ -1719,7 +1719,7 @@ struct SvTypeFromChain {
         // and the mate break at the start of the terminal MEM on the target
         // contig. rBreakStart/rBreakEnd are returned in local contig coordinates
         // (mate-contig space) so VCF POS2 is interpretable as a position on
-        // the named CHR2 contig — not the concatenated suffix-array offset.
+        // the named CHR2 contig - not the concatenated suffix-array offset.
         if (c0 >= 0 && cN1 >= 0 && c0 != cN1) {
             res.type        = Type::TRA;
             res.qBreakStart = chain[0].qPos + chain[0].len;
@@ -1788,16 +1788,16 @@ struct SvTypeFromChain {
         const int delta = qGap - rGap;
 
         // The query span the chain physically covers. A genuine tandem
-        // duplication — its extra copy lives inside the query contig — cannot
+        // duplication - its extra copy lives inside the query contig - cannot
         // be larger than this. Cumulative rGap, by contrast, sums EVERY noisy
         // backward MEM pair across the chain; on repeat-rich query genomes
-        // (arbuscular mycorrhizal fungi) that aggregate explodes to many× the
-        // contig length and produced 100–300 kb "DUP" calls on 20 kb contigs.
+        // (arbuscular mycorrhizal fungi) that aggregate explodes to many times the
+        // contig length and produced 100-300 kb "DUP" calls on 20 kb contigs.
         const int qChainSpan = chain[static_cast<size_t>(N-1)].qPos +
                                chain[static_cast<size_t>(N-1)].len - chain[0].qPos;
 
         // Coherence guard for the per-pair DUP signal: a genuine tandem
-        // duplication RE-TRAVERSES the duplicated window — after the backward
+        // duplication RE-TRAVERSES the duplicated window - after the backward
         // rPos jump the chain continues forward THROUGH the same reference
         // region. A lone repeat MEM, by contrast, jumps back once and is
         // immediately followed by a large compensating FORWARD leap back onto
@@ -1814,7 +1814,7 @@ struct SvTypeFromChain {
         }
 
         // DUP: cumulative reference overlap, OR a single backward rPos jump
-        // ≥ minSvLen accompanied by a non-negative query gap (tandem-dup
+        // >= minSvLen accompanied by a non-negative query gap (tandem-dup
         // signature: q advances by ~svLen while r returns to the original
         // copy's coordinates). Both forms are bounded by qChainSpan so a
         // noise-inflated rGap can never masquerade as a chromosome-scale DUP.
@@ -1861,7 +1861,7 @@ struct SvTypeFromChain {
         if (std::abs(delta) < minSvLen) return res;
 
         // INS / DEL: find the consecutive MEM pair with the dominant local gap
-        // mismatch — that is where the SV actually sits, not necessarily chain[0].
+        // mismatch - that is where the SV actually sits, not necessarily chain[0].
         // With 1% genome divergence MEM chains have many short anchors so using
         // chain[0] always places the breakpoint near contig start (wrong).
         {
@@ -1889,7 +1889,7 @@ struct SvTypeFromChain {
         // An insertion's novel sequence is physically present in the query
         // contig, so |svLen| cannot exceed the query span the chain covers.
         // A larger value means `delta` is an artifact of many small gaps
-        // summed across a noisy chain, not a single event — reject it rather
+        // summed across a noisy chain, not a single event - reject it rather
         // than emit a chromosome-scale phantom INS.
         if (delta > 0 && res.svLen > qChainSpan) return Result{};
         if (delta > 0) {
@@ -1905,11 +1905,11 @@ struct SvTypeFromChain {
 
     // classify_all: emit ALL local INS/DEL gaps in the chain rather than only the
     // dominant one. The original classify() returns a single Result, which on real
-    // diverged fungal genomes collapses 50–500 small SVs per query down to ~1–17
-    // calls (assembly-mode F1 0.007–0.04 on compact_yeast). This walker keeps the
-    // global TRA/INV/DUP semantics — those still return a single event — but for
+    // diverged fungal genomes collapses 50-500 small SVs per query down to ~1-17
+    // calls (assembly-mode F1 0.007-0.04 on compact_yeast). This walker keeps the
+    // global TRA/INV/DUP semantics - those still return a single event - but for
     // INS/DEL it scans every consecutive MEM pair and emits an event whenever the
-    // per-pair (qGap - rGap) difference is ≥ minSvLen, ignoring pairs that cross
+    // per-pair (qGap - rGap) difference is >= minSvLen, ignoring pairs that cross
     // a contig boundary (TRA territory), flip strand (INV territory), or jump
     // backward in r (DUP territory). All event coordinates are returned in local
     // contig space, same convention as classify().
@@ -1995,7 +1995,7 @@ struct SvTypeFromChain {
 };
 
 // =========================================================================
-// PangenomeBubbleSvCaller — bubble-walking SV caller over a CladeGraph.
+// PangenomeBubbleSvCaller - bubble-walking SV caller over a CladeGraph.
 //
 // Walks every per-(asm,contig) path against a REF path (the longest path by
 // total node-sequence length, alphabetical tiebreak). Each ALT node is
@@ -2003,7 +2003,7 @@ struct SvTypeFromChain {
 // divergent node. A bubble closes whenever:
 //   (a) a REF-anchor is hit with a non-empty divergent buffer, OR
 //   (b) the REF-anchor's position is not exactly lastRefIdx + 1
-//       (skipped REF span → DEL signature; backward jump → DUP signature).
+//       (skipped REF span -> DEL signature; backward jump -> DUP signature).
 //
 // Classification (per bubble):
 //   INV  : refLen == altLen > 0 and revcomp(altSeq) == refSeq
@@ -2015,7 +2015,7 @@ struct SvTypeFromChain {
 // Identical bubbles seen on multiple ALT paths are collapsed into one record
 // with `supportingPaths` listing each contributing genome path.
 //
-// TRA: not emitted — CladeGraph paths here are per (asm, contig), so a
+// TRA: not emitted - CladeGraph paths here are per (asm, contig), so a
 // genuine cross-contig translocation lives in a different path and isn't a
 // single bubble. The MEM/chain-based path (SvTypeFromChain) covers TRA.
 // =========================================================================
@@ -2033,11 +2033,11 @@ struct PangenomeBubbleSV {
     std::vector<std::string> supportingPaths;
     bool                     isComplex       = false;
     // TRA: at least one divergent node is also used on a contig other than
-    // the ALT path's own contig — material has moved across reference
+    // the ALT path's own contig - material has moved across reference
     // contigs. `traPartnerContigs` lists the foreign contigs implicated.
     std::vector<std::string> traPartnerContigs;
     // OFF_REF: ALT k-mer overlap with the union of REF-path sequences is
-    // below 5% — bubble represents sequence largely absent from the clade
+    // below 5% - bubble represents sequence largely absent from the clade
     // reference set (Path-C novelty candidate). The chain-based caller's
     // score_cross_clade_novelty() can subsequently qualify this as HGT /
     // NOVEL_WEAK / DIVERGED vs other clades.
@@ -2062,7 +2062,7 @@ struct PangenomeBubbleSvCaller {
 
     // Inline FNV-1a k-mer hashing for the OFF_REF overlap check. Keeping it
     // local avoids pulling fungi_tol_bridge.hpp into layer1 (which would
-    // create a header cycle: bridge already includes layer3 → layer1).
+    // create a header cycle: bridge already includes layer3 -> layer1).
     static void kmer_hashes_into(std::unordered_set<uint64_t>& out,
                                  const std::string& s, int k) {
         if (k <= 0 || static_cast<int>(s.size()) < k) return;
@@ -2134,7 +2134,7 @@ struct PangenomeBubbleSvCaller {
         }
 
         // Per-node contig set (across all paths). A node whose set exceeds
-        // {altContig} signals cross-contig material movement → TRA.
+        // {altContig} signals cross-contig material movement -> TRA.
         std::unordered_map<int, std::unordered_set<std::string>> nodeContigs;
         nodeContigs.reserve(g.nodes.size() * 2);
         for (const auto& p : g.paths) {
@@ -2250,7 +2250,7 @@ struct PangenomeBubbleSvCaller {
             }
 
             // Classification priority:
-            //   TRA  (cross-contig signal — overrides others)
+            //   TRA  (cross-contig signal - overrides others)
             //   INV  (length-matched reverse-complement allele)
             //   DUP  (tandem expansion of REF span)
             //   INS / DEL  (length-delta sign)

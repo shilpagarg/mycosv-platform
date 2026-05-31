@@ -106,7 +106,7 @@ def read_table(path: Optional[str]) -> Optional[pd.DataFrame]:
     if p.stat().st_size == 0:
         return pd.DataFrame()
     sep = "\t" if p.suffix.lower() in {".tsv", ".txt"} else ","
-    # Tolerate ragged rows that slip through upstream merging — pandas' default
+    # Tolerate ragged rows that slip through upstream merging - pandas' default
     # C parser bails on the first row whose field count differs from the
     # header. Falling back to the python engine with on_bad_lines='skip'
     # drops only the offending rows instead of aborting the whole report.
@@ -1047,7 +1047,7 @@ def plot_wins_matrix(real_df: pd.DataFrame, outdir: Path) -> List[FigureRecord]:
     rs["svtype"] = rs["svtype"].astype(str)
     rs["method"] = rs["method"].astype(str)
 
-    # ── (A) F1 heatmap, mean across queries ─────────────────────────────
+    # Panel A: F1 heatmap, mean across queries.
     pivot = rs.pivot_table(
         index="method", columns="svtype", values="f1", aggfunc="mean",
     )
@@ -1094,7 +1094,7 @@ def plot_wins_matrix(real_df: pd.DataFrame, outdir: Path) -> List[FigureRecord]:
             ),
         ))
 
-    # ── (B) Wins bar: % queries where mycosv ≥ comparator ───────────────
+    # Panel B: wins bar, percentage of queries where mycosv >= comparator.
     if "query_asm" in rs.columns:
         wide = rs.pivot_table(
             index=["query_asm", "truth_label", "svtype"], columns="method",
@@ -1168,7 +1168,7 @@ def plot_wins_matrix(real_df: pd.DataFrame, outdir: Path) -> List[FigureRecord]:
                     ),
                 ))
 
-            # ── (C) Per-query F1 scatter: mycosv vs each comparator ────
+            # Panel C: per-query F1 scatter, mycosv vs each comparator.
             cmps = [c for c in wide.columns if c != "mycosv"]
             if cmps:
                 ncols = min(3, len(cmps))
@@ -1220,7 +1220,7 @@ def build_wins_matrix_section(
     # Don't run real_df through harmonize_columns: the wins matrix needs the
     # raw `truth_label`, `svtype`, `method`, `f1`, and `query_asm` columns
     # written by run_real_fungal_benchmark.write_agreement_summary, and
-    # harmonize_columns aliases `svtype` → `sv_type` which would break the
+    # harmonize_columns aliases `svtype` to `sv_type`, which would break the
     # downstream filter.
     figs = plot_wins_matrix(df, outdir)
     if not figs:
@@ -1322,8 +1322,8 @@ def _join_novel_to_biology(
     if bio_df is None or bio_df.empty:
         return novel_only.copy()
     bio = bio_df.copy()
-    # harmonize_columns() may have renamed the join keys: query_asm → sample,
-    # query_contig → chrom, pos → start, svtype → sv_type. Try both the
+    # harmonize_columns() may have renamed the join keys: query_asm to sample,
+    # query_contig to chrom, pos to start, svtype to sv_type. Try both the
     # original and the harmonized names so the join works in both code paths.
     candidate_keys = [
         "query_asm", "sample",
@@ -1343,7 +1343,7 @@ def _join_novel_to_biology(
     if not join_cols:
         return novel_only
     # query_asm is spelled differently in the two tables, so replace it with a
-    # canonical accession key derived on both sides — otherwise every row's
+    # canonical accession key derived on both sides - otherwise every row's
     # assembly key mismatches and the left join yields all-NaN biology columns.
     asm_cols = [c for c in ("query_asm", "sample") if c in join_cols]
     if asm_cols:
@@ -1435,7 +1435,7 @@ def _novel_q2_two_speed(joined: pd.DataFrame, outdir: Path) -> Optional[FigureRe
     df = joined[joined[ec_col].astype(str).isin(_TE_ELEMENT_CLASSES)].copy()
     if df.empty:
         return None
-    # Stratify by architecture (two_speed, te_rich, smut_pathogen, …) when
+    # Stratify by architecture (two_speed, te_rich, smut_pathogen, ...) when
     # the metadata column is present; otherwise fall back to scenario or to
     # the harmonized "phenotype" column (architecture/scenario/lifestyle all
     # map to phenotype via COLUMN_ALIASES).
@@ -1817,12 +1817,12 @@ def build_evidence_panorama_section(
     tier_colors = {
         "strong":         "#1b7837",  # comparator + read evidence
         "moderate":       "#7fbf7b",  # one of the two
-        "intrinsic_only": "#f1a340",  # MycoSV cluster only — the real-but-unvalidatable bucket
+        "intrinsic_only": "#f1a340",  # MycoSV cluster only - the real-but-unvalidatable bucket
         "weak":           "#998ec3",  # very low intrinsic, rare
     }
 
     figs: List[FigureRecord] = []
-    # ── (A) per query, all SV types summed ───────────────────────────────
+    # Panel A: per query, all SV types summed.
     by_query = df.groupby(["query_asm", "tier"], as_index=False)["n_calls"].sum()
     pivot_q = by_query.pivot(index="query_asm", columns="tier", values="n_calls").fillna(0)
     for tier in tier_order:
@@ -1857,7 +1857,7 @@ def build_evidence_panorama_section(
         ),
     ))
 
-    # ── (B) per (query × svtype) grid ────────────────────────────────────
+    # Panel B: per-query and per-SV-type grid.
     by_q_svt = df.groupby(["query_asm", "svtype", "tier"], as_index=False)["n_calls"].sum()
     pivot_sv = by_q_svt.pivot_table(
         index=["query_asm", "svtype"], columns="tier",

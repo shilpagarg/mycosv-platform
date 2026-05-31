@@ -1,6 +1,4 @@
 #!/usr/bin/env python3
-# Designed for Linux
-
 import run_real_fungal_benchmark as rrfb
 from pathlib import Path
 import csv
@@ -176,7 +174,7 @@ def test_stream_gene_annotations_to_tsv_expands_aliases(tmp_path: Path):
     by not retaining cross-source rows. We assert (a) and (b) here; (c) is what
     the original implementation got wrong (it built every row in memory before
     write_tsv'ing), so a regression on (a/b) is the only thing a unit test
-    can catch — memory blowup needs the live 2000-source workload to surface.
+    can catch - memory blowup needs the live 2000-source workload to surface.
     """
     gff = tmp_path / "ref_asm_genomic.gff.gz"
     gff_text = (
@@ -203,7 +201,7 @@ def test_stream_gene_annotations_to_tsv_expands_aliases(tmp_path: Path):
     with out.open(encoding="utf-8") as fh:
         reader = csv.DictReader(fh, delimiter="\t")
         rows = list(reader)
-    # 2 genes × (3 ref aliases + 2 QA aliases + 1 QB alias) = 12 rows.
+    # 2 genes x (3 ref aliases + 2 QA aliases + 1 QB alias) = 12 rows.
     assert len(rows) == 12
     owners_by_gene: dict[str, set[str]] = {}
     for row in rows:
@@ -214,7 +212,7 @@ def test_stream_gene_annotations_to_tsv_expands_aliases(tmp_path: Path):
 
 def test_stream_gene_annotations_to_tsv_handles_empty_source(tmp_path: Path):
     """A GBFF with no gene/CDS features (common for unannotated NCBI WGS
-    assemblies) must not abort the streaming write — earlier sources' rows
+    assemblies) must not abort the streaming write - earlier sources' rows
     should stay on disk and the function must just keep going. Without this
     behaviour prepare_million_real silently produced zero-row TSVs whenever
     its 2000-source mix had even one barren GBFF.
@@ -672,7 +670,7 @@ def test_calls_compatible_accepts_chain_level_del_containing_fine_truth():
 def test_chain_level_del_only_claims_one_truth_when_many_nested():
     # Five small truth DEL events sit inside one large mycosv chain DEL.
     # Span-contain must NOT inflate TP by letting the single pred match all
-    # five truths — the greedy match consumes the pred after the first claim
+    # five truths - the greedy match consumes the pred after the first claim
     # so TP=1, FN=4. Guards against over-counting.
     truths = [
         NormalizedCall("q1", "ctg", 101_000 + i * 1500, 101_100 + i * 1500,
@@ -719,9 +717,9 @@ def test_consensus_truth_does_not_use_same_source_bridge_as_support():
 
 
 def test_calls_compatible_keeps_strict_len_check_for_same_scale_del():
-    # Two co-located DEL calls of similar magnitude — pred 100 bp, truth 80 bp.
+    # Two co-located DEL calls of similar magnitude - pred 100 bp, truth 80 bp.
     # Span-contain does NOT apply (pred is not >= 2x truth), so the strict
-    # length check still gates the match. tol_frac=0.10 → |Δ|/80=0.25, fail.
+    # length check still gates the match. tol_frac=0.10 gives 20/80=0.25, fail.
     truth = NormalizedCall("q1", "ctg", 50_000, 50_080, "DEL", 80, "truth",
                             coord_space="reference", ref_contig="chr1")
     pred  = NormalizedCall("q1", "ctg", 50_000, 50_100, "DEL", 100, "mycosv",
@@ -850,7 +848,7 @@ def test_validate_uses_per_svtype_flank_window(tmp_path: Path, monkeypatch):
     assert by_type["DEL"] == 500, by_type   # 2500 // 5
     assert by_type["DUP"] == 500, by_type
     assert by_type["INV"] == 2000, by_type  # 10000 // 5
-    # INS: 500 // 5 = 100 < user floor 250 → keep 250
+    # INS: 500 // 5 = 100, below user floor 250; keep 250.
     assert by_type["INS"] == 250, by_type
 
 
@@ -2038,7 +2036,7 @@ def test_prepare_million_real_holds_out_queries_and_strips_them_from_index(
     bench_refs = [line.split("\t")[bench_ref_idx] for line in qm_lines[1:]]
     assert len(set(qasms)) == 2, qasms
     # Each held-out query's benchmark_ref_fasta must be one of the OTHER
-    # rows' FASTA paths — never the query's own — so we don't leak truth.
+    # rows' FASTA paths - never the query's own - so we don't leak truth.
     for line in qm_lines[1:]:
         cells = line.split("\t")
         own_path_in_qlist = any(cells[qasm_idx] in ref for ref in bench_refs)
@@ -2324,21 +2322,21 @@ def test_benchmark_mycosv_only_validates_mycosv_reference_calls(tmp_path: Path, 
     assert "mycosv" in readval.read_text(encoding="utf-8")
     assert (vcf.with_suffix(".multisample.vcf")).exists()
     # Older versions also wrote a typo-named duplicate "alls.multisample.vcf";
-    # that copy has been removed — the canonical artefact is calls.multisample.vcf.
+    # that copy has been removed - the canonical artefact is calls.multisample.vcf.
     assert not (vcf.with_name("alls.multisample.vcf")).exists()
     assert (args.out_dir / "biology_findings.tsv").exists()
     summary = json.loads((args.out_dir / "benchmark_summary.json").read_text(encoding="utf-8"))
     assert summary["queries"]["q1"]["read_validation"]["mycosv_reference"]["read_validated"] == 1
 
 
-# ────────────────────────────────────────────────────────────────────────────
+# Additional benchmark-summary tests.
 # Reference-free read-level validation (validate_calls_reference_free).
 #
 # These tests monkeypatch tool_path / _extract_query_window /
 # _align_reads_to_junction_fasta / _samtools_count_breakpoint_support so they
 # exercise the dispatch logic + per-call return rows without needing real
 # minimap2 or samtools binaries on the test host.
-# ────────────────────────────────────────────────────────────────────────────
+# End-to-end summary validation.
 
 
 def test_reference_free_validation_emits_status_when_tools_missing(tmp_path: Path, monkeypatch):

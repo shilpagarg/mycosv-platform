@@ -14,7 +14,7 @@
 #
 # IMPORTANT: we intentionally do NOT use `set -e` at the script level for the
 # real-data stage. A single panel/network/tool failure must not abort the rest
-# of the matrix — each panel is guarded with `|| true` and its log is kept for
+# of the matrix - each panel is guarded with `|| true` and its log is kept for
 # inspection. Fatal errors per stage are still reported in the summary.
 
 set -u
@@ -128,8 +128,8 @@ REAL_HEAVY_SINGLE_REF_CACHE_MB="${REAL_HEAVY_SINGLE_REF_CACHE_MB:-1024}"
 REAL_HEAVY_MAX_REF_MEMORY_MB="${REAL_HEAVY_MAX_REF_MEMORY_MB:-1024}"
 REAL_HEAVY_MAX_ASSEMBLY_QUERY_CONTIGS="${REAL_HEAVY_MAX_ASSEMBLY_QUERY_CONTIGS:-5000}"
 REAL_HEAVY_MAX_ASSEMBLY_QUERY_BP="${REAL_HEAVY_MAX_ASSEMBLY_QUERY_BP:-350000000}"
-# AMF (Gigaspora, Rhizophagus) assemblies are inherently fragmented — public
-# Gigaspora drafts ship with 50–100k+ contigs because the genomes are large
+# AMF (Gigaspora, Rhizophagus) assemblies are inherently fragmented - public
+# Gigaspora drafts ship with 50-100k+ contigs because the genomes are large
 # (~700 Mbp) and repeat-rich. The default 5000-contig cap was rejecting every
 # AMF query, leaving the panel with a single Rhizophagus assembly. Use a much
 # higher AMF-specific cap so the panel actually exercises >1 query.
@@ -157,7 +157,7 @@ REAL_PREPARE_TIMEOUT="${REAL_PREPARE_TIMEOUT:-2h}"
 REPORT_TIMEOUT="${REPORT_TIMEOUT:-30m}"
 
 # Per-panel/per-mode wall-clock budget. A single benchmark invocation that
-# overruns this limit is killed and the next mode/panel still runs — without
+# overruns this limit is killed and the next mode/panel still runs - without
 # it, one slow panel (typically AMF assembly mode where cactus chews on
 # ~1 Gbp Rhizophagus genomes) consumes the SLURM time budget and starves
 # every subsequent panel in the matrix. Override via env var when running
@@ -172,16 +172,16 @@ BENCHMARK_TIMEOUT_READS="${BENCHMARK_TIMEOUT_READS:-3h}"
 # Ten hours empirically clears the matrix.
 BENCHMARK_TIMEOUT_TE_RICH_PATHOGEN_ASSEMBLY="${BENCHMARK_TIMEOUT_TE_RICH_PATHOGEN_ASSEMBLY:-10h}"
 # AMF assembly mode aligns ~1 Gbp Rhizophagus / Gigaspora genomes; even with
-# cactus/pggb/anchorwave skipped, minigraph + svim_asm + MycoSV needs ≥8h.
+# cactus/pggb/anchorwave skipped, minigraph + svim_asm + MycoSV needs 8h or more.
 BENCHMARK_TIMEOUT_AMF_LARGE_ASSEMBLY="${BENCHMARK_TIMEOUT_AMF_LARGE_ASSEMBLY:-8h}"
 
 # Bound public-read comparator inputs. MycoSV caps read consumption internally,
 # but tools such as SVIM/Sniffles/cuteSV/Delly/Manta align the FASTQ path they
 # are given. These caps keep public ENA runs from dominating wall time.
 # 20 000 long reads on a ~80 Mbp Puccinia / ~700 Mbp Gigaspora genome is
-# 0.02–2× coverage — svim / sniffles / cuteSV produce 0 SV calls at that depth
+# 0.02-2x coverage. svim / sniffles / cuteSV produce 0 SV calls at that depth
 # and mycosv reading the same capped FASTQ collapses to OFF_REF-only output.
-# Bumped to 200 000 (≥25× on ~60–80 Mbp pathogens; ~3× on Gigaspora) so the
+# Bumped to 200 000 (25x or more on ~60-80 Mbp pathogens; ~3x on Gigaspora) so the
 # comparators have signal to call. Override via env for tighter wall-time budgets.
 MAX_COMPARATOR_SHORT_READS="${MAX_COMPARATOR_SHORT_READS:-500000}"
 MAX_COMPARATOR_LONG_READS="${MAX_COMPARATOR_LONG_READS:-200000}"
@@ -204,13 +204,13 @@ HEAVY_COMPARATOR_SKIP_PANELS="${HEAVY_COMPARATOR_SKIP_PANELS:-amf_large,te_rich_
 REAL_PANELS_DEFAULT="${REAL_PANELS_DEFAULT:-compact_yeast,amf_large,te_rich_pathogen,two_speed_pathogen}"
 
 # Long-read platform used for both simulated and real experiments.
-#   hifi    PacBio HiFi CCS (Revio / Sequel IIe) — 15 kb reads, ≥Q20 accuracy.
-#           minimap2 map-hifi → sniffles2 / cuteSV (HiFi params) / SVIM.
-#   ont-r10 ONT R10.4.1 standard simplex — 10 kb, ~Q20 on PromethION/GridION.
-#           minimap2 map-ont → sniffles2 --long-read-model ont_r10_q20 (v2.2+).
+#   hifi    PacBio HiFi CCS (Revio / Sequel IIe): 15 kb reads, Q20+ accuracy.
+#           minimap2 map-hifi, then sniffles2 / cuteSV (HiFi params) / SVIM.
+#   ont-r10 ONT R10.4.1 standard simplex: 10 kb, ~Q20 on PromethION/GridION.
+#           minimap2 map-ont, then sniffles2 --long-read-model ont_r10_q20.
 #           WhatsHap phase+haplotag: applicable for dikaryotic fungi such as
 #           Puccinia spp., Leptosphaeria maculans, Zymoseptoria tritici.
-#   ont-r9  ONT R9.4.1 legacy — 8 kb, ~Q15.  Still prevalent in public ENA data.
+#   ont-r9  ONT R9.4.1 legacy - 8 kb, ~Q15.  Still prevalent in public ENA data.
 LONG_READ_PLATFORM="${LONG_READ_PLATFORM:-ont-r10}"
 
 # Create experiment directories
@@ -273,8 +273,8 @@ SIM_SCENARIO_SET="compact_yeast,two_speed_pathogen_extreme,arbuscular_mf"
 # 1. SIMULATED BENCHMARK (precision/recall at million scale)
 #
 # Per-scenario query budget controls runtime. With QUERIES_PER_SCENARIO=20 and
-# 3 scenarios → 60 query genomes (+ refs). At n_contigs=10 that is ~600 truth
-# SVs per mode — fast turnaround for testing. Override with the env var
+# 3 scenarios gives 60 query genomes plus refs. At n_contigs=10 that is ~600 truth
+# SVs per mode, a fast turnaround for testing. Override with the env var
 # SIM_QUERIES_PER_SCENARIO to scale up (e.g. 200 for ~6000 SVs).
 # ============================================================================
 
@@ -286,7 +286,7 @@ if [[ "$EXPERIMENT_TYPE" == "all" || "$EXPERIMENT_TYPE" == "simulated" ]]; then
   echo -e "${YELLOW}[1/4] Running simulated benchmark (million-scale routing)...${NC}"
   echo "      Modes: assembly, short-reads, long-reads"
   echo "      Scenarios: ${SIM_SCENARIO_SET} (covers INS/DEL/DUP/INV/TRA)"
-  echo "      Queries per scenario: ${SIM_QUERIES_PER_SCENARIO} → ${TOTAL_QUERIES} query genomes (+ 3 refs), 10 contigs each"
+  echo "      Queries per scenario: ${SIM_QUERIES_PER_SCENARIO} -> ${TOTAL_QUERIES} query genomes (+ 3 refs), 10 contigs each"
   echo "      Output: ${SIM_DIR}/benchmarks"
   mkdir -p "${SIM_DIR}/benchmarks"
 
@@ -355,8 +355,8 @@ if [[ "$EXPERIMENT_TYPE" == "all" || "$EXPERIMENT_TYPE" == "million-real" ]]; th
   MILLION_REAL_NCBI_SOURCE="${MILLION_REAL_NCBI_SOURCE:-ncbi-best}"
   MILLION_REAL_MYCOSV_USE_FULL_READS="${MILLION_REAL_MYCOSV_USE_FULL_READS:-0}"
 
-  # ── 2a) prepare: download assemblies, build the routing index, hold out
-  # ────── MILLION_REAL_QUERIES assemblies for the MycoSV-only benchmark.
+  # 2a) Prepare: download assemblies, build the routing index, and hold out
+  # MILLION_REAL_QUERIES assemblies for the MycoSV-only benchmark.
   # python3 -u keeps stdout line-buffered under tee so progress is visible.
   prepare_cmd=(python3 -u run_real_fungal_benchmark.py prepare-million-real
       --out-dir "${MILLION_REAL_DIR}"
@@ -385,21 +385,18 @@ if [[ "$EXPERIMENT_TYPE" == "all" || "$EXPERIMENT_TYPE" == "million-real" ]]; th
     rc=$?
     if [[ "${rc}" == "124" || "${rc}" == "137" ]]; then
       mark_failure "million_real.index_build.timeout(${MILLION_REAL_PREPARE_TIMEOUT})"
-      echo -e "${RED}✗ million-real prepare exceeded ${MILLION_REAL_PREPARE_TIMEOUT} — skipping 2b${NC}"
+      echo -e "${RED}✗ million-real prepare exceeded ${MILLION_REAL_PREPARE_TIMEOUT}; skipping 2b${NC}"
     else
       mark_failure "million_real.index_build"
     fi
   fi
   echo ""
 
-  # ── 2b) Benchmark on the held-out queries: indexing was done in 2a, so
-  # ────── reuse that index (no rebuild). Per-mode comparator subset chosen
-  # ────── for bounded wall time (assembly: minigraph+svim_asm, long-reads:
-  # ────── sniffles+cutesv, short-reads: delly). Set MILLION_REAL_MYCOSV_ONLY=1
-  # ────── to skip every comparator and only exercise indexing → alignment →
-  # ────── SV calling → TE classification → biology candidates →
-  # ────── biology_findings.tsv → novel_mycosv_calls.tsv. Visualization
-  # ────── (step 4) picks all of these up via MILLION_REAL_DIR scan.
+  # 2b) Benchmark held-out queries using the index built in 2a. The per-mode
+  # comparator subset is bounded for wall time: assembly uses minigraph+svim_asm,
+  # long-reads uses sniffles+cutesv, and short-reads uses delly.
+  # MILLION_REAL_MYCOSV_ONLY=1 skips comparators and runs the MycoSV pipeline
+  # through biology_findings.tsv and novel_mycosv_calls.tsv for visualization.
   if [[ "${prepare_million_succeeded}" == "1" \
         && -f "${MILLION_REAL_DIR}/query_manifest.tsv" \
         && $(wc -l < "${MILLION_REAL_DIR}/query_manifest.tsv") -gt 1 ]]; then
@@ -413,12 +410,10 @@ if [[ "$EXPERIMENT_TYPE" == "all" || "$EXPERIMENT_TYPE" == "million-real" ]]; th
       val_flag="--no-validate-with-reads"
     fi
 
-    # ── Modes to bench. assembly is always on; reads modes are added if
-    # ────── prepare-million-real materialised matching query rows. The
-    # ────── benchmark step itself filters by mode and writes a
-    # ────── NO_QUERIES_FOR_MODE.txt marker when none exist, so it's safe
-    # ────── to invoke unconditionally — but skipping the call avoids a
-    # ────── spurious comparator-pre-flight burst per missing mode.
+    # Modes to bench. assembly is always on; reads modes are added when
+    # prepare-million-real materialised matching query rows. The benchmark step
+    # can write NO_QUERIES_FOR_MODE.txt, but skipping missing modes avoids a
+    # comparator preflight burst.
     declare -A million_real_modes_present
     million_real_modes_present[assembly]=0
     million_real_modes_present[short-reads]=0
@@ -477,7 +472,7 @@ if [[ "$EXPERIMENT_TYPE" == "all" || "$EXPERIMENT_TYPE" == "million-real" ]]; th
             # third comparator (anchorwave) is whole-genome-alignment-based,
             # algorithmically independent from minigraph/svim_asm, and lets
             # the leave-one-out comparator-variance benchmark fire (it
-            # needs K >= 3 — see score_loo_consensus in run_real_fungal_benchmark.py).
+            # needs K >= 3 - see score_loo_consensus in run_real_fungal_benchmark.py).
             # Cactus is opt-in via MILLION_REAL_RUN_CACTUS=1 (slowest
             # comparator, often > 24 h on the AMF panel). Disable
             # anchorwave with MILLION_REAL_RUN_ANCHORWAVE=0 if it stalls
@@ -578,7 +573,7 @@ if [[ "$EXPERIMENT_TYPE" == "all" || "$EXPERIMENT_TYPE" == "real" ]]; then
 
   for panel in "${PANELS[@]}"; do
     echo ""
-    echo "  ── Processing panel: ${panel} ──"
+    echo " Processing panel: ${panel}"
     PANEL_DIR="${REAL_DIR}/${panel}"
     mkdir -p "${PANEL_DIR}"
 
@@ -667,7 +662,7 @@ if [[ "$EXPERIMENT_TYPE" == "all" || "$EXPERIMENT_TYPE" == "real" ]]; then
       if [[ "${mode}" == "assembly" ]] && [[ ",${HEAVY_COMPARATOR_SKIP_PANELS}," == *",${panel},"* ]]; then
         benchmark_threads="${REAL_HEAVY_ASSEMBLY_THREADS}"
         # AMF panels need a much looser fragmentation cap because Gigaspora /
-        # Rhizophagus assemblies legitimately have 50–100k+ contigs. Apply the
+        # Rhizophagus assemblies legitimately have 50-100k+ contigs. Apply the
         # AMF-specific cap only for amf_large; the other heavy panels (te_rich,
         # two_speed) keep the tighter default to stop noisy MAG/contaminant
         # drafts sneaking through.
@@ -711,7 +706,7 @@ if [[ "$EXPERIMENT_TYPE" == "all" || "$EXPERIMENT_TYPE" == "real" ]]; then
       fi
       # Per-panel/per-mode timeout overrides. te_rich_pathogen (Puccinia ~80 Mbp,
       # ~85% TE content) consistently overruns the global 3h assembly cap even
-      # after we drop cactus/pggb/anchorwave — minigraph + svim_asm + MycoSV's
+      # after we drop cactus/pggb/anchorwave - minigraph + svim_asm + MycoSV's
       # own SA walker against multiple references is the bottleneck. Allow each
       # panel/mode to claim its own budget without bumping the global default
       # for fast panels like compact_yeast.
@@ -738,7 +733,7 @@ if [[ "$EXPERIMENT_TYPE" == "all" || "$EXPERIMENT_TYPE" == "real" ]]; then
         mark_success "real.${panel}.${mode}"
       else
         rc=$?
-        # GNU `timeout` exits 124 on TERM and 137 on KILL — surface that as
+        # GNU `timeout` exits 124 on TERM and 137 on KILL - surface that as
         # a structured failure tag so the summary makes the bottleneck
         # obvious instead of just printing "stage failed".
         if [[ "${rc}" == "124" || "${rc}" == "137" ]]; then

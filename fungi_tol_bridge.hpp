@@ -1,7 +1,7 @@
 #ifndef FUNGI_TOL_BRIDGE_HPP
 #define FUNGI_TOL_BRIDGE_HPP
 
-// fungi_tol_bridge.hpp — v15
+// fungi_tol_bridge.hpp - v15
 //
 // Integration layer for hierarchical fungal SV calling. Key responsibilities:
 //  - annotate DEL and OFF_REF sequence with repeat/TE/HGT element classes;
@@ -45,7 +45,7 @@
 
 namespace fs = std::filesystem;
 
-// ── gz-transparent FASTA stream ──────────────────────────────────────────
+// gz-transparent FASTA stream
 // Opens a plain or .gz FASTA file for line-by-line reading.
 // .gz files are piped through "gzip -dc" without writing a decompressed copy.
 struct FastaStream {
@@ -74,7 +74,7 @@ struct FastaStream {
     std::istream& get() { return *is_; }
 };
 
-// ── VariantCallBridge ────────────────────────────────────────────────────
+// VariantCallBridge
 struct VariantCallBridge {
     std::string qAsm;
     std::string qContig;
@@ -107,7 +107,7 @@ struct VariantCallBridge {
     // Routed taxonomic context for VCF/TSV/GFA reporting
     std::string cladeRank           = ".";
     std::string phylum              = ".";
-    // Query input mode — provenance label written to TSV/VCF
+    // Query input mode - provenance label written to TSV/VCF
     std::string queryMode           = "assembly";
     // Probabilistic multi-evidence fusion summary for downstream ranking/reporting.
     double      fusedPosteriorAlt   = 0.50;
@@ -115,9 +115,9 @@ struct VariantCallBridge {
     double      fusedEffectiveDepth = 0.0;
     int         fusedLayersUsed     = 0;
     // Evidence support backing this call:
-    //   assembly    → anchor count / fused evidence layers, filled before output
-    //   long-reads  → cluster size (_n<N> in contig name), exact read count
-    //   short-reads → min k-mer frequency along unitig path (_mf<N>), coverage proxy
+    //   assembly    -> anchor count / fused evidence layers, filled before output
+    //   long-reads  -> cluster size (_n<N> in contig name), exact read count
+    //   short-reads -> min k-mer frequency along unitig path (_mf<N>), coverage proxy
     int         readSupport         = -1;
     // Sequence carried by the variant allele/affected segment when compact
     // enough for VCF INFO output. For INS/DUP/INV/OFF_REF this is query
@@ -142,7 +142,7 @@ namespace tol {
 
 using ::VariantCallBridge;
 
-// ── FederatedOptions ──────────────────────────────────────────────────────
+// FederatedOptions
 struct FederatedOptions {
     SyncmerParams primarySketchParams;
     SyncmerParams fallbackSketchParams;
@@ -226,7 +226,7 @@ inline FederatedOptions make_federated_opts(
     return fo;
 }
 
-// ── CladeGraphDescriptor (bridge-side) ───────────────────────────────────
+// CladeGraphDescriptor (bridge-side)
 struct CladeGraphDescriptor {
     std::string cladeName;
     std::string cladeRank;
@@ -238,7 +238,7 @@ struct CladeGraphDescriptor {
     std::vector<std::string> fastaPaths;
 };
 
-// ── sanitize_name ─────────────────────────────────────────────────────────
+// sanitize_name
 // Shared sanitizer contract.  layer2 and layer3 keep local mirrors to avoid
 // circular includes; keep their accepted character set in sync with this one.
 inline std::string sanitize_name(const std::string& s) {
@@ -255,7 +255,7 @@ inline std::string sanitize_filename(const std::string& s) {
     return sanitize_name(s);
 }
 
-// ── split_tab / split_csv ─────────────────────────────────────────────────
+// split_tab / split_csv
 // Registry manifests written with CRLF line endings put a stray '\r' on the
 // last cell of every line. Strip it so downstream path lookups see clean cells.
 inline std::vector<std::string> split_tab(const std::string& line) {
@@ -281,7 +281,7 @@ inline std::vector<std::string> split_csv(const std::string& s) {
 }
 
 
-// ── read_fasta_local ──────────────────────────────────────────────────────
+// read_fasta_local
 inline std::unordered_map<std::string, std::string>
 read_fasta_local(const std::string& path) {
     FastaStream fs(path);
@@ -305,7 +305,7 @@ read_fasta_local(const std::string& path) {
     return out;
 }
 
-// ── for_each_fasta_record ────────────────────────────────────────────────
+// for_each_fasta_record
 // Streaming variant of read_fasta_local: hands each (name, seq) pair to
 // `fn` one at a time, reusing the same buffers between records. Callers
 // that do not need every contig held in memory at once (e.g. the full-base
@@ -341,7 +341,7 @@ inline bool for_each_fasta_record(const std::string& path, Fn&& fn) {
     return any;
 }
 
-// ── Rolling-hash k-mer overlap ────────────────────────────────────────────
+// Rolling-hash k-mer overlap
 // Uses FNV-1a rolling hash so the unordered_set<string> allocation is
 // eliminated.  Build: O(N).  Lookup: O(k) per query k-mer.
 // For the AMF case (N~100 Mb) this cuts peak memory from ~500 MB to ~8 MB.
@@ -395,7 +395,7 @@ inline double kmer_overlap_fraction(const std::string& a, const std::string& b, 
     size_t inter = 0;
     for (uint64_t h : *small)
         if (big->count(h)) ++inter;
-    // Jaccard: |A ∩ B| / |A ∪ B|
+    // Jaccard: |A  intersect  B| / |A  union  B|
     const size_t uni = ha.size() + hb.size() - inter;
     return uni == 0 ? 0.0 : static_cast<double>(inter) / static_cast<double>(uni);
 }
@@ -448,7 +448,7 @@ inline std::string infer_novelty_tier(double overlapFraction) {
     return novelty_tier_name(score_off_ref_novelty(overlapFraction));
 }
 
-// ── ManifestRegistry ──────────────────────────────────────────────────────
+// ManifestRegistry
 class ManifestRegistry {
 public:
     explicit ManifestRegistry(std::string dir = {}) : dir_(std::move(dir)) {}
@@ -502,7 +502,7 @@ private:
     std::vector<CladeGraphDescriptor> descs_;
 };
 
-// ── ManifestRow / read_manifest_rows ─────────────────────────────────────
+// ManifestRow / read_manifest_rows
 struct ManifestRow {
     std::string asmName;
     std::string phylum;
@@ -878,7 +878,7 @@ inline std::string cached_seed_sequence_for_build(
     return seq;
 }
 
-// ── BuilderFastaHashCache ────────────────────────────────────────────────
+// BuilderFastaHashCache
 // Process-global, thread-safe map FASTA-path -> minimizer hashes of the
 // FASTA's leading 512 bp seed. Each FASTA is opened (and gzip-decoded)
 // exactly once across the whole multi-rank index build. Upper-rank shards
@@ -893,11 +893,11 @@ struct BuilderFastaHashCache {
         return inst;
     }
 
-    // Returns ≤`limit` minimizer hashes computed over the FASTA's first
+    // Returns <=`limit` minimizer hashes computed over the FASTA's first
     // 512 bp seed using FNV-1a k-mer hashing (matches the inline hashing
     // in build_compact_manifest_graph). Recomputes on every call only if
     // the per-(path, k, limit) tuple was never cached; otherwise O(1) +
-    // a vector copy of ≤limit uint64.
+    // a vector copy of <=limit uint64.
     std::vector<uint64_t> hashes_for(const std::string& path, int k, size_t limit) {
         const Key key{path, static_cast<int32_t>(std::max(3, k)),
                       static_cast<uint32_t>(std::max<size_t>(1, limit))};
@@ -913,7 +913,7 @@ struct BuilderFastaHashCache {
             h = minimizer_hashes_for_sequence(seed, kk, limit);
         }
         std::lock_guard<std::mutex> lk(mu_);
-        // bounded cache: 200k entries × ~120 B/entry + ≤64×8B hashes ≈ 100 MB max
+        // bounded cache: 200k entries x ~120 B/entry + <=64x8B hashes ~ 100 MB max
         if (cache_.size() < 200000) cache_.emplace(key, h);
         return h;
     }
@@ -966,7 +966,7 @@ inline CladeGraph build_compact_manifest_graph(const CladeGraphDescriptor& d,
     // Centroid roll-up: reuse minimizer hashes already computed for this
     // FASTA at any lower rank (BuilderFastaHashCache is process-global).
     // Seed sequences are only fetched for the reservoir-sampled `samples`
-    // that need a node payload (≤sampleLimit per shard, typically 64).
+    // that need a node payload (<=sampleLimit per shard, typically 64).
     const int kBase = std::max(3, sp.k);
     auto& hashCache = BuilderFastaHashCache::instance();
 
@@ -1037,7 +1037,7 @@ inline CladeGraph build_compact_manifest_graph(const CladeGraphDescriptor& d,
     return g;
 }
 
-// ── binary index helpers ───────────────────────────────────────────────────
+// binary index helpers
 template <class T>
 inline void write_pod_bin(std::ostream& out, const T& value) {
     out.write(reinterpret_cast<const char*>(&value), static_cast<std::streamsize>(sizeof(T)));
@@ -1214,7 +1214,7 @@ inline CladeGraph build_manifest_backed_graph_from_rows(const CladeGraphDescript
             // Stream contigs one at a time instead of materializing the
             // whole genome as an unordered_map<string,string>. For a 30 MB
             // fungal genome this cuts transient RSS by ~30 MB per worker
-            // and avoids the unordered_map's ~1.5x overhead — important
+            // and avoids the unordered_map's ~1.5x overhead - important
             // when up to 32 genomes pass through per full-base shard and
             // up to 4 such shards run concurrently (tiered worker pool).
             any = for_each_fasta_record(
@@ -1266,7 +1266,7 @@ inline CladeGraph build_full_manifest_graph_from_shard(const CladeGraphDescripto
     return build_manifest_backed_graph_from_rows(d, read_manifest_rows(shardPath));
 }
 
-// ── write_graph_payload / write_routing_payload ───────────────────────────
+// write_graph_payload / write_routing_payload
 inline CladeGraph write_graph_payload(const CladeGraphDescriptor& d,
                                 const CladeGraph& sourceGraph) {
     CladeGraph g = sourceGraph;
@@ -1368,11 +1368,11 @@ inline BuiltShardArtifacts build_single_manifest_shard(
     return built;
 }
 
-// ── rank ordering helper ─────────────────────────────────────────────────
+// rank ordering helper
 // Sort shards so lower ranks (species first) build before upper ranks
 // (phylum last). This populates BuilderFastaHashCache during species/genus
 // processing, so upper-rank compact shards reuse cached hashes instead of
-// re-reading FASTAs — the biggest wall-clock win for runs with deep
+// re-reading FASTAs - the biggest wall-clock win for runs with deep
 // taxonomic redundancy.
 inline int shard_rank_order(const std::string& rank) {
     if (rank == "species") return 0;
@@ -1381,12 +1381,12 @@ inline int shard_rank_order(const std::string& rank) {
     if (rank == "order") return 3;
     if (rank == "class") return 4;
     if (rank == "phylum") return 5;
-    return 6;  // unknown / root — process last
+    return 6;  // unknown / root - process last
 }
 
-// True if this shard will use full-base-graph mode (rowCount ≤ cap AND
+// True if this shard will use full-base-graph mode (rowCount <= cap AND
 // baseGraphBuild requested). Full-base shards are the memory-heavy ones
-// (~1–2 GB peak per shard with 30 MB fungal genomes); they get scheduled
+// (~1-2 GB peak per shard with 30 MB fungal genomes); they get scheduled
 // onto a separate worker lane with limited concurrency.
 inline bool shard_is_heavy(const ManifestShardInfo& s,
                            size_t maxCladeGenomes,
@@ -1394,13 +1394,13 @@ inline bool shard_is_heavy(const ManifestShardInfo& s,
     return baseGraphBuild && s.rowCount <= maxCladeGenomes && s.rowCount >= 2;
 }
 
-// ── build_partitioned_shards (tiered worker pool) ───────────────────────
+// build_partitioned_shards (tiered worker pool)
 // Two-lane scheduler that bounds peak RSS:
-//   • heavy lane: at most max(1, indexThreads/4) workers; runs the
-//     full-base-graph shards (≤cap genomes, reads each FASTA in full,
+//   - heavy lane: at most max(1, indexThreads/4) workers; runs the
+//     full-base-graph shards (<=cap genomes, reads each FASTA in full,
 //     ~1 GB peak per shard).
-//   • light lane: the remaining workers; runs compact-mode shards
-//     (>cap genomes; only the 512 bp seed per FASTA is read, ≤50 MB
+//   - light lane: the remaining workers; runs compact-mode shards
+//     (>cap genomes; only the 512 bp seed per FASTA is read, <=50 MB
 //     peak per shard).
 // Shards are also rank-sorted so species/genus process before phylum
 // (warms the BuilderFastaHashCache for centroid roll-up at upper ranks).
@@ -1431,7 +1431,7 @@ inline std::vector<BuiltShardArtifacts> build_partitioned_shards(
         const int ra = shard_rank_order(shards[a].cladeRank);
         const int rb = shard_rank_order(shards[b].cladeRank);
         if (ra != rb) return ra < rb;
-        // Within a rank, smaller shards first → keeps memory steady and
+        // Within a rank, smaller shards first -> keeps memory steady and
         // gets centroids into the cache quickly.
         if (shards[a].rowCount != shards[b].rowCount)
             return shards[a].rowCount < shards[b].rowCount;
@@ -1524,7 +1524,7 @@ inline void write_external_routing_store_from_artifacts(
     ExternalMemoryCentroidStore(storePath).prepare_skip_index();
 }
 
-// ── build_tol_index_from_manifest ─────────────────────────────────────────
+// build_tol_index_from_manifest
 inline void build_tol_index_from_manifest(const std::string& manifestPath,
                                           const std::string& indexDir,
                                           const std::string& registryDir,
@@ -1571,7 +1571,7 @@ inline void build_tol_index_from_manifest(const std::string& manifestPath,
                   << " partitioned manifest groups\n";
 }
 
-// ── build_multi_rank_index_from_manifest ─────────────────────────────────
+// build_multi_rank_index_from_manifest
 // Builds one routing shard + graph payload per (rank, clade) pair so the
 // multi-rank query path can route at phylum/class/order/family/genus/species
 // independently.  The extended manifest (9 columns) is required.
@@ -1625,7 +1625,7 @@ inline void build_multi_rank_index_from_manifest(
                   << " partitioned manifest groups\n";
 }
 
-// ── TolGlobal ─────────────────────────────────────────────────────────────
+// TolGlobal
 class TolGlobal {
 public:
     struct RefSeq {
@@ -1733,9 +1733,9 @@ public:
         // occupies 150 Mb in RAM, not 900 Mb.
         //
         // Deduplication rule:
-        //   • (fasta, contig, cladeName) — deduplicate within the same clade
+        //   - (fasta, contig, cladeName) - deduplicate within the same clade
         //     so a contig listed twice under the same descriptor is not doubled.
-        //   • (fasta, contig, DIFFERENT cladeNames) — allowed: different rank
+        //   - (fasta, contig, DIFFERENT cladeNames) - allowed: different rank
         //     levels must produce separate RefSeq entries with distinct cladeRank
         //     values so hierarchical_call_assembly_multirank can filter by rank.
         std::unordered_map<std::string,
@@ -1833,7 +1833,7 @@ public:
 
     // Synthetic decoy centroids written by augment_routing_store() in the
     // million-real flow carry these prefixes. They have random 64-bit hashes
-    // and no backing FASTA — if a decoy wins a routing top-K slot by a
+    // and no backing FASTA - if a decoy wins a routing top-K slot by a
     // coincidental hash collision (small Jaccard denominator inflates ratio),
     // that slot is wasted and effective real-clade coverage shrinks. We strip
     // them here AND request extra slots upstream so the post-filter still
@@ -1870,7 +1870,7 @@ public:
         const std::string_view routeView(routeSeq.data(), routeSeq.size());
 
         // Over-fetch when the external store is in play so the real-clade
-        // floor still meets topK after decoys are filtered. 4× headroom
+        // floor still meets topK after decoys are filtered. 4x headroom
         // matches the worst-case decoy contamination we've seen in routing
         // probes on the 1M-centroid store.
         const size_t fetchK = (externalCentroidStore_ != nullptr) ? topK * 4 : topK;
@@ -1915,7 +1915,7 @@ private:
     mutable std::mutex mu_;
 };
 
-// ── MultiRankIndex ────────────────────────────────────────────────────────
+// MultiRankIndex
 class MultiRankIndex {
 public:
     static MultiRankIndex& instance() {
@@ -2137,7 +2137,7 @@ inline void refine_local_chain_breakpoint(SvTypeFromChain::Result& r,
     }
 }
 
-// ── make_insdel_call ──────────────────────────────────────────────────────
+// make_insdel_call
 inline VariantCallBridge make_insdel_call(const std::string& qAsm,
                                           const std::string& qContig,
                                           const TolGlobal::RefSeq& ref,
@@ -2176,7 +2176,7 @@ inline VariantCallBridge make_insdel_call(const std::string& qAsm,
     return v;
 }
 
-// ── make_offref_call ──────────────────────────────────────────────────────
+// make_offref_call
 // Classifies the element type and stores it in elementClass.
 inline VariantCallBridge make_offref_call(const std::string& qAsm,
                                           const std::string& qContig,
@@ -2337,15 +2337,15 @@ discover_graph_native_offref_windows(const std::string& seq,
             out.push_back(std::move(ow));
         }
     }
-    // NOVEL_WEAK at sparse k-mer sampling (k≤9, ≤1024 ref hashes) is a noise
+    // NOVEL_WEAK at sparse k-mer sampling (k<=9, <=1024 ref hashes) is a noise
     // band: ANY shared low-complexity / homopolymer / common-motif k-mer lands
     // a random fungal window in 0 < overlap < 0.05. Drop *isolated*
-    // single-window NOVEL_WEAK tiles — they uniformly fill the per-contig
+    // single-window NOVEL_WEAK tiles - they uniformly fill the per-contig
     // kMaxOffRefWindows=256 cap with SUPPORT=0 BSCORE=8 stubs (3,584 phantom
     // calls on the F. falciforme vs F. oxysporum benchmark). Genuine
     // NOVEL_WEAK regions span >1 window and survive merging, so keep those.
     // NOVEL/DIVERGED/OFF_REF_KNOWN single-window calls are still informative
-    // (overlap==0 or ≥0.05) and pass through unchanged.
+    // (overlap==0 or >=0.05) and pass through unchanged.
     if (!out.empty()) {
         std::vector<OffRefWindowCall> kept;
         kept.reserve(out.size());
@@ -2377,7 +2377,7 @@ inline VariantCallBridge make_offref_window_call(const std::string& qAsm,
     return v;
 }
 
-// ── try_mem_chain_call ────────────────────────────────────────────────────
+// try_mem_chain_call
 // The order permutation is tracked explicitly so chain-to-MEM recovery is O(N)
 // instead of quadratic.
 static bool try_mem_chain_call(
@@ -2747,7 +2747,7 @@ static bool try_mem_chain_call(
     return true;
 }
 
-// ── multi-ref suffix-array cache ──────────────────────────────────────────
+// multi-ref suffix-array cache
 // try_mem_chain_call_multi builds a SuffixArray over the concatenated top-K
 // reference contigs. The ref set is selected from the query contig's
 // k-mer-similar shortlist, so consecutive query contigs of the same genome
@@ -2759,7 +2759,7 @@ static bool try_mem_chain_call(
 // single process-wide cache guarded by a mutex, not thread_local, so the cache
 // is bounded once for the whole process. Returned values are shared_ptr, so a
 // thread keeps its SA
-// alive even if another thread evicts that entry concurrently — only the
+// alive even if another thread evicts that entry concurrently - only the
 // lookup/insert is serialised, the (expensive) SA *use* is lock-free.
 struct MultiRefSaCache {
     struct Entry {
@@ -2816,7 +2816,7 @@ struct MultiRefSaCache {
         }
         // Build outside the lock so concurrent threads building *different*
         // ref sets do not serialise on each other. A duplicate concurrent
-        // build of the same key is harmless — last writer wins, both callers
+        // build of the same key is harmless - last writer wins, both callers
         // get a valid SA.
         auto sa = std::make_shared<SuffixArray>();
         sa->build(refContigs);
@@ -2842,11 +2842,11 @@ struct MultiRefSaCache {
     }
 };
 
-// ── try_mem_chain_call_multi ──────────────────────────────────────────────
+// try_mem_chain_call_multi
 // Multi-emit variant of try_mem_chain_call. Uses SvTypeFromChain::classify_all
 // to extract every per-pair INS/DEL gap inside a MEM chain instead of only the
 // dominant one. On diverged real fungal genomes this is the difference between
-// ~5% recall (single-emit) and capturing the 50–500 small SVs per chain that
+// ~5% recall (single-emit) and capturing the 50-500 small SVs per chain that
 // minigraph/svim_asm/cactus surface from the alignment ops.
 static bool try_mem_chain_call_multi(
         const std::string& qAsm,
@@ -3229,10 +3229,10 @@ static bool try_mem_chain_call_multi(
                 ? saRefs[static_cast<size_t>(primaryContigIdx)]
                 : (saRefs.empty() ? nullptr : saRefs.front());
 
-        // ── TRA recall fix: cross-contig translocation as an ADDITIONAL event ──
+        // TRA recall fix: cross-contig translocation as an ADDITIONAL event
         //   A translocation-bearing query contig still produces a strong
         //   primary chain (the bulk of the contig aligns cleanly), so the
-        //   `events.empty()` TRA fallback above never fires for real TRAs — it
+        //   `events.empty()` TRA fallback above never fires for real TRAs - it
         //   only ever caught contigs with NO alignment at all (i.e. noise).
         //   Here we scan the forward MEMs that landed on a reference contig
         //   OTHER than the primary one: a coherent off-contig cluster spanning
@@ -3489,7 +3489,7 @@ static bool try_mem_chain_call_multi(
     return !outCalls.empty();
 }
 
-// ── per-contig checkpoint hook ───────────────────────────────────────────
+// per-contig checkpoint hook
 // Thread-local: lets the caller (main.cpp process_query) inject a flush
 // callback that runs the moment each contig is fully processed inside
 // hierarchical_call_assembly, so checkpointing preserves completed contigs
@@ -3541,7 +3541,7 @@ struct ContigFlushGuard {
     }
 };
 
-// ── hierarchical_call_assembly ────────────────────────────────────────────
+// hierarchical_call_assembly
 inline std::vector<VariantCallBridge>
 hierarchical_call_assembly(const std::string& qAsm,
                            const std::unordered_map<std::string, std::string>& contigs,
@@ -3594,7 +3594,7 @@ hierarchical_call_assembly(const std::string& qAsm,
                    routedClades.find(ref.asmName) != routedClades.end();
         };
 
-        // ── Path A: DS-13+DS-18 MEM chain ──────────────────────────────
+        // Path A: DS-13+DS-18 MEM chain
         std::vector<const TolGlobal::RefSeq*> cands;
         auto it = byContig.find(name);
         if (it != byContig.end())
@@ -3692,11 +3692,11 @@ hierarchical_call_assembly(const std::string& qAsm,
             continue;
         }
 
-        // ── Path B: length-delta fallback ─────────────────────────────
+        // Path B: length-delta fallback
         // Primary: name-based lookup (fast, used for assembly contigs).
         // Secondary: k-mer-overlap best match across all refs when the name
-        // lookup misses — required for reads-mode pseudo-contigs (lr_pc0,
-        // sr_unitig3…) whose names have no correspondence with reference names.
+        // lookup misses - required for reads-mode pseudo-contigs (lr_pc0,
+        // sr_unitig3...) whose names have no correspondence with reference names.
         {
             const TolGlobal::RefSeq* best = nullptr;
             int bestDelta = std::numeric_limits<int>::max();
@@ -3769,7 +3769,7 @@ hierarchical_call_assembly(const std::string& qAsm,
             }
         }
 
-        // ── Path C: OFF_REF novelty scoring with cross-clade HGT detection ─
+        // Path C: OFF_REF novelty scoring with cross-clade HGT detection
         // Track same-clade and other-clade overlaps separately so that a region
         // absent from same-clade refs but present in another clade can be flagged
         // as a candidate HGT event via score_cross_clade_novelty().
@@ -3784,7 +3784,7 @@ hierarchical_call_assembly(const std::string& qAsm,
         std::string bestOtherAsmName = "OFF_REFERENCE";
         std::string bestOtherCladeRank = ".";
         std::string bestOtherPhylum = ".";
-        // Path C novelty k: was clamped to 5–9, which made k-mer Jaccard
+        // Path C novelty k: was clamped to 5-9, which made k-mer Jaccard
         // saturate for any two fungal sequences (4^7 = 16384 keys vs 30+ Mb
         // of reference) so the NOVEL tier almost never fired. Raise the
         // ceiling to 17 so the sketch can actually discriminate, and use
@@ -3837,7 +3837,7 @@ hierarchical_call_assembly(const std::string& qAsm,
             ? score_cross_clade_novelty(sameCladeOverlap, otherCladeOverlap)
             : score_off_ref_novelty(std::max(sameCladeOverlap, otherCladeOverlap));
         const std::string tier = novelty_tier_name(noveltyTier);
-        // Emit all four tiers including OFF_REF_KNOWN — see note in
+        // Emit all four tiers including OFF_REF_KNOWN - see note in
         // discover_graph_native_offref_windows.
         if (tier == "NOVEL" || tier == "NOVEL_WEAK" || tier == "DIVERGED" ||
             tier == "OFF_REF_KNOWN") {
@@ -3863,13 +3863,13 @@ hierarchical_call_assembly(const std::string& qAsm,
     return out;
 }
 
-// ── hierarchical_call_assembly_multirank ─────────────────────────────────
+// hierarchical_call_assembly_multirank
 // Routes independently at each Linnaean rank by restricting the reference
 // set to contigs whose cladeRank matches the current rank, then merges all
 // results and deduplicates by (contig, pos) keeping the call with the
 // highest blockScore.
 //
-// Rank order: phylum → class → order → family → genus → species.
+// Rank order: phylum -> class -> order -> family -> genus -> species.
 // The species-level pass is identical to hierarchical_call_assembly so this
 // function is a strict superset of the single-rank path.
 inline std::vector<VariantCallBridge>
@@ -3877,7 +3877,7 @@ hierarchical_call_assembly_multirank(
         const std::string& qAsm,
         const std::unordered_map<std::string, std::string>& contigs,
         const FederatedOptions& fo,
-        size_t /*routingTopN — fo.routingTopN is used*/) {
+        size_t /*routingTopN - fo.routingTopN is used*/) {
 
     const auto& global   = TolGlobal::instance();
     const auto& allRefs  = global.all_refs();
@@ -3895,7 +3895,7 @@ hierarchical_call_assembly_multirank(
     };
     constexpr int kNRanks = 6;
 
-    // Deduplicate by (contig, pos) — key → index in merged, keyed on best blockScore
+    // Deduplicate by (contig, pos) - key -> index in merged, keyed on best blockScore
     std::unordered_map<std::string, size_t> bestByKey;
     std::vector<VariantCallBridge> merged;
 
@@ -3907,7 +3907,7 @@ hierarchical_call_assembly_multirank(
                 c.alignmentMode += ";rank=" + rankStr;
             // Dedup key must include SV type, svlen bucket, AND refAsm.
             // Earlier history: the (qContig:pos) key collapsed a co-located
-            // INS+DEL — common at TE breakpoints — into a single record,
+            // INS+DEL - common at TE breakpoints - into a single record,
             // dropping every secondary co-located event across ranks. Adding
             // type+svlen fixed that. But omitting refAsm collapses the
             // SAME-type same-position SV against different refs into one
@@ -4102,7 +4102,7 @@ hierarchical_call_assembly_multirank(
                 std::string bestOtherCladeRank = ".";
                 std::string bestOtherPhylum = ".";
                 // Same Path C novelty-k change as in hierarchical_call_assembly:
-                // raise the clamp from 5–9 to 11–17 and combine Jaccard with
+                // raise the clamp from 5-9 to 11-17 and combine Jaccard with
                 // best-containment so HGT/STARSHIP blocks bordered by host
                 // sequence are not masked by long flanks.
                 const int k = std::max(11, std::min(fo.fallbackSketchParams.k > 0
@@ -4179,17 +4179,17 @@ hierarchical_call_assembly_multirank(
     return merged;
 }
 
-// ── Ancestral alignment helpers ───────────────────────────────────────────
+// Ancestral alignment helpers
 
-// AncestralManifestContext: holds the manifest path and the clade→rank/phylum
+// AncestralManifestContext: holds the manifest path and the clade->rank/phylum
 // lookup table built from it.  Populated by load_ancestral_manifest_context.
 struct AncestralManifestContext {
     std::string manifestPath;
-    // clade name → (rank, phylum) — built from the manifest at load time
+    // clade name -> (rank, phylum) - built from the manifest at load time
     std::unordered_map<std::string, std::pair<std::string,std::string>> cladeInfo;
 };
 
-// Parse the manifest at `path` to build clade→(rank,phylum) lookups.
+// Parse the manifest at `path` to build clade->(rank,phylum) lookups.
 // Supports both the 5-column (asm phylum clade rank fasta) and 9-column
 // (asm phylum class order family genus clade rank fasta) formats.
 inline AncestralManifestContext load_ancestral_manifest_context(const std::string& path) {
@@ -4374,18 +4374,18 @@ inline std::string ancestral_breakpoint_descriptor(const VariantCallBridge& c,
 // write_ancestral_alignments_for_assembly
 //
 // Writes one row per SV call with:
-//   query_asm    — assembly name
-//   query_contig — contig that carries the call
-//   clade        — routed reference clade
-//   clade_rank   — Linnaean rank of that clade (from manifest)
-//   phylum       — phylum of that clade (from manifest)
-//   variant_type — SV type
-//   breakpoints  — number of distinct breakpoints implied by the call:
-//                    TRA  → 2  (two chromosomal breakpoints per translocation)
-//                    INV  → 2  (two inversion breakpoints)
-//                    OFF_REF → 1 if enableAncestralRecomb, else 0
-//                    INS/DEL/DUP → 1
-//   segment_bp   — total sequence span of the call
+//   query_asm    - assembly name
+//   query_contig - contig that carries the call
+//   clade        - routed reference clade
+//   clade_rank   - Linnaean rank of that clade (from manifest)
+//   phylum       - phylum of that clade (from manifest)
+//   variant_type - SV type
+//   breakpoints  - number of distinct breakpoints implied by the call:
+//                    TRA  -> 2  (two chromosomal breakpoints per translocation)
+//                    INV  -> 2  (two inversion breakpoints)
+//                    OFF_REF -> 1 if enableAncestralRecomb, else 0
+//                    INS/DEL/DUP -> 1
+//   segment_bp   - total sequence span of the call
 inline void write_ancestral_alignments_for_assembly(
         const std::string& qAsm,
         const std::unordered_map<std::string, std::string>& contigs,
@@ -4444,7 +4444,7 @@ inline void write_ancestral_alignments_for_assembly(
 
 
 
-// ── Full ancestral sequence reconstruction ───────────────────────────────
+// Full ancestral sequence reconstruction
 // Lightweight per-call ancestral reconstruction over the query/reference span.
 // The model is intentionally simple: for each aligned position, retain the
 // shared base when query and reference agree, otherwise emit the majority base
@@ -4499,7 +4499,7 @@ reconstruct_full_ancestral_sequence(const std::string& querySeq,
                 push(anc, 0.65);
             }
         } else if (hasR) {
-            // Query-specific deletion relative to reference → ancestral base is likely retained.
+            // Query-specific deletion relative to reference -> ancestral base is likely retained.
             push(r, 0.80);
         } else if (hasQ && call.type != "INS") {
             // Only keep query-only sequence for non-insertion contexts.
@@ -4518,7 +4518,7 @@ reconstruct_full_ancestral_sequence(const std::string& querySeq,
     return out;
 }
 
-// ── try_mem_chain_call_public ─────────────────────────────────────────────
+// try_mem_chain_call_public
 #endif
 // Non-static public wrapper so callers outside this translation unit (e.g.
 // reads_mode_sv_calls in main.cpp) can access the MEM chain caller without

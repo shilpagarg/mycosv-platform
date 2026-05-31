@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# install_tools.sh — install MycoSV comparator tools without Bioconda.
+# install_tools.sh - install MycoSV comparator tools without Bioconda.
 #
 # Installs the comparator pre-flight dependency closure from GitHub source trees,
 # GitHub-hosted release artifacts, or official GitHub/OCI containers for very

@@ -1,7 +1,7 @@
 #ifndef FUNGI_TOL_TAXONOMY_RANKS_HPP
 #define FUNGI_TOL_TAXONOMY_RANKS_HPP
 
-// taxonomy_ranks.hpp — Single authoritative vocabulary for Linnaean ranks.
+// taxonomy_ranks.hpp - Single authoritative vocabulary for Linnaean ranks.
 //
 // ALL rank strings used by manifest readers, routing shards, and hier_rows
 // iteration pass through rank_from_string / rank_to_string so a typo is
@@ -13,7 +13,7 @@
 
 namespace tol {
 
-// ── TaxonomyRank ──────────────────────────────────────────────────────────
+// TaxonomyRank
 enum class TaxonomyRank {
     phylum,
     class_rank,   // stored on disk as "class" (reserved C++ word)
@@ -24,7 +24,7 @@ enum class TaxonomyRank {
     unknown,      // catch-all for unrecognised strings
 };
 
-// ── rank_to_string ────────────────────────────────────────────────────────
+// rank_to_string
 inline const char* rank_to_string(TaxonomyRank r) {
     switch (r) {
         case TaxonomyRank::phylum:     return "phylum";
@@ -37,7 +37,7 @@ inline const char* rank_to_string(TaxonomyRank r) {
     }
 }
 
-// ── rank_from_string ──────────────────────────────────────────────────────
+// rank_from_string
 // Returns TaxonomyRank::unknown for unrecognised strings so callers can warn.
 inline TaxonomyRank rank_from_string(const std::string& s) {
     if (s == "phylum")  return TaxonomyRank::phylum;

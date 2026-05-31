@@ -1,12 +1,12 @@
 #ifndef FUNGI_TOL_HIERARCHICAL_ENGINE_HPP
 #define FUNGI_TOL_HIERARCHICAL_ENGINE_HPP
 
-// hierarchical_engine.hpp — Off-reference novelty scoring and variant stamping.
+// hierarchical_engine.hpp - Off-reference novelty scoring and variant stamping.
 //
 // Responsibilities:
-//   • OffRefNoveltyTier enum + helpers (score_off_ref_novelty, novelty_tier_name)
-//   • make_off_reference_call_scored<V>() — stamps off-ref fields on any call record
-//   • UncoveredWindow — half-open [start,end) interval of query bases with no ref match
+//   - OffRefNoveltyTier enum + helpers (score_off_ref_novelty, novelty_tier_name)
+//   - make_off_reference_call_scored<V>() - stamps off-ref fields on any call record
+//   - UncoveredWindow - half-open [start,end) interval of query bases with no ref match
 
 #include <cmath>
 #include <string>
@@ -14,13 +14,13 @@
 
 namespace tol {
 
-// ── OffRefNoveltyTier ─────────────────────────────────────────────────────
+// OffRefNoveltyTier
 // Thresholds based on k-mer Jaccard overlap fraction with the best matching
 // reference contig.  Boundaries chosen empirically on fungal genome benchmarks:
-//   NOVEL      : overlap == 0   → truly sequence-novel (new clade, HGT island …)
-//   NOVEL_WEAK : 0 < overlap < 0.05  → very diverged, likely new species
-//   DIVERGED   : 0.05–0.20          → diverged within same genus/family
-//   OFF_REF_KNOWN: ≥ 0.20           → known off-reference (Starship, TE, RIP …)
+//   NOVEL      : overlap == 0   -> truly sequence-novel (new clade, HGT island ...)
+//   NOVEL_WEAK : 0 < overlap < 0.05  -> very diverged, likely new species
+//   DIVERGED   : 0.05-0.20          -> diverged within same genus/family
+//   OFF_REF_KNOWN: >= 0.20           -> known off-reference (Starship, TE, RIP ...)
 enum class OffRefNoveltyTier {
     NOVEL,
     NOVEL_WEAK,
@@ -64,7 +64,7 @@ inline OffRefNoveltyTier score_cross_clade_novelty(
     return score_off_ref_novelty(sameCladeOverlap);
 }
 
-// ── UncoveredWindow ───────────────────────────────────────────────────────
+// UncoveredWindow
 // Half-open interval [start, end) in query coordinates with no reference MEMs.
 // Collected during MEM-chain construction; later used to classify
 // REPEAT / TE / STARSHIP / HGT / RIP annotation classes.
@@ -74,17 +74,17 @@ struct UncoveredWindow {
     size_t length() const { return end > start ? end - start : 0; }
 };
 
-// ── make_off_reference_call_scored ───────────────────────────────────────
+// make_off_reference_call_scored
 // Stamps off-reference fields onto any call record V that has the same
 // fields as VariantCallBridge.  Template so it works with both the bridge
 // struct and future specialisations.
 //
 // Sets:
-//   annotation        ← novelty tier name
-//   type              ← "OFF_REF"
-//   pantreeClass      ← "NON_REF"
-//   isNonRefVariant   ← true
-//   triallelicTopology← "." if currently empty
+//   annotation        <- novelty tier name
+//   type              <- "OFF_REF"
+//   pantreeClass      <- "NON_REF"
+//   isNonRefVariant   <- true
+//   triallelicTopology<- "." if currently empty
 template <class Variant>
 inline Variant make_off_reference_call_scored(Variant v, OffRefNoveltyTier tier) {
     v.annotation       = novelty_tier_name(tier);
@@ -97,7 +97,7 @@ inline Variant make_off_reference_call_scored(Variant v, OffRefNoveltyTier tier)
 
 
 
-// ── Probabilistic evidence fusion ────────────────────────────────────────
+// Probabilistic evidence fusion
 // A depth-aware fusion model that combines read- and assembly-level evidence
 // on the log-likelihood scale. The implementation is deliberately lightweight
 // and header-only so it can be used in harnesses without any external math

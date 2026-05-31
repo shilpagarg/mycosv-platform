@@ -1,6 +1,4 @@
 #!/usr/bin/env python3
-# Designed for Linux
-
 from __future__ import annotations
 
 import argparse
@@ -96,6 +94,14 @@ def mode_specific_caller_args(mode: str, genome_size_hint: int) -> list[str]:
     args: list[str] = []
     if mode != "assembly" and genome_size_hint > 0:
         args.extend(["--genome-size-hint", str(genome_size_hint)])
+    if mode == "assembly":
+        # Stricter than binary defaults: synthetic cross-scenario panels emit
+        # too many low-confidence OFF_REF cross-clade calls otherwise.
+        args.extend([
+            "--min-block-score", "12.0",
+            "--min-anchors-per-block", "3",
+            "--max-calls-per-contig", "50",
+        ])
     if mode == "short-reads":
         args.extend([
             "--sr-kmer-size", "21",
@@ -123,7 +129,7 @@ def ensure_sv_volume(n_genomes: int, n_reps: int, n_contigs: int, total_len: int
     n_reps = max(n_reps, n_scen)
     if queries_per_scenario is not None and queries_per_scenario > 0:
         # Explicit per-scenario query budget overrides the SV-volume heuristic.
-        # Useful for fast testing: e.g. 20 queries × 3 scenarios = 60 query genomes.
+        # Useful for fast testing: e.g. 20 queries x 3 scenarios = 60 query genomes.
         n_genomes = n_reps + queries_per_scenario * n_scen
     else:
         query_genomes = max(0, n_genomes - n_reps)
@@ -275,6 +281,202 @@ def write_summary(path: Path, rows: list[dict[str, object]]) -> None:
         writer.writerows(rows)
 
 
+def _scenario_from_asm(asm_name: str) -> str:
+    head, sep, tail = asm_name.rpartition("_asm")
+    return head if sep and tail.isdigit() else asm_name
+
+
+def _metric_triplet(tp: int, fp: int, fn: int) -> tuple[float, float, float]:
+    precision = tp / (tp + fp) if (tp + fp) else 0.0
+    recall = tp / (tp + fn) if (tp + fn) else 0.0
+    f1 = 2.0 * precision * recall / (precision + recall) if (precision + recall) else 0.0
+    return precision, recall, f1
+
+
+def _load_asm_scenarios(sim_dir: Path) -> dict[str, str]:
+    asm_scenario: dict[str, str] = {}
+    base_manifest = sim_dir / "base_manifest.tsv"
+    if base_manifest.exists():
+        with base_manifest.open(encoding="utf-8") as fh:
+            for row in csv.DictReader(fh, delimiter="\t"):
+                asm = row.get("#asm_name") or row.get("asm_name") or ""
+                if asm:
+                    asm_scenario[asm] = _scenario_from_asm(asm)
+    query_meta = sim_dir / "query_metadata.tsv"
+    if query_meta.exists():
+        with query_meta.open(encoding="utf-8") as fh:
+            for row in csv.DictReader(fh, delimiter="\t"):
+                qasm = row.get("query_asm") or ""
+                scen = row.get("scenario") or ""
+                if qasm and scen:
+                    asm_scenario[qasm] = scen
+    return asm_scenario
+
+
+def _load_sim_truth(query_truth_tsv: Path) -> tuple[dict[str, list[dict[str, object]]], list[str]]:
+    truth_by_query: dict[str, list[dict[str, object]]] = {}
+    scenario_order: list[str] = []
+    with query_truth_tsv.open(encoding="utf-8") as fh:
+        for row in csv.DictReader(fh, delimiter="\t"):
+            qasm = row["query_asm"]
+            scen = row["scenario"]
+            if scen not in scenario_order:
+                scenario_order.append(scen)
+            truth_by_query.setdefault(qasm, []).append(
+                {
+                    "scenario": scen,
+                    "contig": row["query_contig"],
+                    "type": row["svtype"],
+                    "pos": int(row["pos"]),
+                    "svlen": abs(int(row["svlen"])),
+                }
+            )
+    return truth_by_query, scenario_order
+
+
+def _load_hits_for_two_axis(hits_tsv: Path, asm_scenario: dict[str, str]) -> dict[str, list[dict[str, object]]]:
+    hits_by_query: dict[str, list[dict[str, object]]] = {}
+    if not hits_tsv.exists():
+        return hits_by_query
+    with hits_tsv.open(encoding="utf-8") as fh:
+        for row in csv.DictReader(fh, delimiter="\t"):
+            if row.get("annotation") == "NOVEL_WEAK":
+                continue
+            qasm = row.get("query_asm") or ""
+            if not qasm:
+                continue
+            try:
+                pos = int(float(row.get("pos") or 0))
+                svlen = abs(int(float(row.get("svlen") or 0)))
+            except ValueError:
+                continue
+            same_scenario = asm_scenario.get(row.get("ref_asm", "")) == asm_scenario.get(qasm)
+            hits_by_query.setdefault(qasm, []).append(
+                {
+                    "query_contig": row.get("query_contig", ""),
+                    "type": row.get("type", ""),
+                    "pos": pos,
+                    "svlen": svlen,
+                    "same_scenario": same_scenario,
+                }
+            )
+    return hits_by_query
+
+
+def _truth_hit_match(pred: dict[str, object], truth: dict[str, object], window_bp: int) -> bool:
+    if pred["type"] != truth["type"]:
+        return False
+    if pred["query_contig"] != truth["contig"]:
+        return False
+    if abs(int(pred["pos"]) - int(truth["pos"])) > window_bp:
+        return False
+    # Match the relaxed SV-type handling used in sv_pr_utils: insertion-like,
+    # off-reference, translocation, inversion, and duplication calls may have
+    # caller-dependent span conventions.
+    if pred["type"] not in {"OFF_REF", "INS", "TRA", "INV", "DUP"}:
+        if abs(int(pred["svlen"]) - int(truth["svlen"])) > window_bp:
+            return False
+    return True
+
+
+def compute_two_axis_sim_metrics(
+    sim_dir: Path,
+    hits_tsv: Path,
+    out_tsv: Path,
+    window_bp: int,
+) -> list[dict[str, object]]:
+    """Write Table-S-style single-reference and pangenome-axis metrics.
+
+    Single-reference axis: only same-scenario calls are eligible.
+    Pangenome axis: any routed call may recover truth; unmatched cross-scenario
+    calls are not counted as false positives because they are discovery calls
+    outside the conspecific-frame truth.
+    """
+    truth_by_query, scenario_order = _load_sim_truth(sim_dir / "query_truth.tsv")
+    asm_scenario = _load_asm_scenarios(sim_dir)
+    hits_by_query = _load_hits_for_two_axis(hits_tsv, asm_scenario)
+
+    def score(axis: str) -> tuple[dict[str, dict[str, int]], dict[str, int]]:
+        per: dict[str, dict[str, int]] = {
+            scen: {"truth": 0, "tp": 0, "fp": 0, "fn": 0}
+            for scen in scenario_order
+        }
+        total = {"truth": 0, "tp": 0, "fp": 0, "fn": 0}
+        for qasm, truth_rows in truth_by_query.items():
+            scen = str(truth_rows[0]["scenario"]) if truth_rows else "."
+            used: set[int] = set()
+            tp = fp = 0
+            for pred in hits_by_query.get(qasm, []):
+                if axis == "sr" and not bool(pred["same_scenario"]):
+                    continue
+                best_idx: int | None = None
+                best_dist: int | None = None
+                for idx, truth in enumerate(truth_rows):
+                    if idx in used:
+                        continue
+                    if not _truth_hit_match(pred, truth, window_bp):
+                        continue
+                    dist = abs(int(pred["pos"]) - int(truth["pos"]))
+                    if best_idx is None or best_dist is None or dist < best_dist:
+                        best_idx = idx
+                        best_dist = dist
+                if best_idx is None:
+                    if axis == "sr" or bool(pred["same_scenario"]):
+                        fp += 1
+                else:
+                    used.add(best_idx)
+                    tp += 1
+            fn = len(truth_rows) - len(used)
+            per.setdefault(scen, {"truth": 0, "tp": 0, "fp": 0, "fn": 0})
+            per[scen]["truth"] += len(truth_rows)
+            per[scen]["tp"] += tp
+            per[scen]["fp"] += fp
+            per[scen]["fn"] += fn
+            total["truth"] += len(truth_rows)
+            total["tp"] += tp
+            total["fp"] += fp
+            total["fn"] += fn
+        return per, total
+
+    sr_per, sr_total = score("sr")
+    pg_per, pg_total = score("pg")
+    rows: list[dict[str, object]] = []
+    for scen in scenario_order + ["PANEL"]:
+        sr = sr_total if scen == "PANEL" else sr_per[scen]
+        pg = pg_total if scen == "PANEL" else pg_per[scen]
+        sr_p, sr_r, sr_f1 = _metric_triplet(sr["tp"], sr["fp"], sr["fn"])
+        pg_p, pg_r, pg_f1 = _metric_triplet(pg["tp"], pg["fp"], pg["fn"])
+        rows.append(
+            {
+                "scenario": scen,
+                "truth": sr["truth"],
+                "sr_tp": sr["tp"],
+                "sr_fp": sr["fp"],
+                "sr_fn": sr["fn"],
+                "sr_precision": sr_p,
+                "sr_recall": sr_r,
+                "sr_f1": sr_f1,
+                "pg_tp": pg["tp"],
+                "pg_fp": pg["fp"],
+                "pg_fn": pg["fn"],
+                "pg_precision": pg_p,
+                "pg_recall": pg_r,
+                "pg_f1": pg_f1,
+            }
+        )
+
+    out_tsv.parent.mkdir(parents=True, exist_ok=True)
+    with out_tsv.open("w", encoding="utf-8", newline="") as fh:
+        writer = csv.DictWriter(
+            fh,
+            fieldnames=list(rows[0].keys()) if rows else [],
+            delimiter="\t",
+        )
+        writer.writeheader()
+        writer.writerows(rows)
+    return rows
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(
         description="Run assembly/short-read/long-read query benchmarks against a million-scale hierarchical routing catalog."
@@ -293,6 +495,9 @@ def main() -> int:
     ap.add_argument("--n-reps", type=int, default=2)
     ap.add_argument("--total-len", type=int, default=8000)
     ap.add_argument("--n-contigs", type=int, default=2)
+    ap.add_argument("--off-ref-contigs", type=int, default=1)
+    ap.add_argument("--pangenome-stress", action="store_true",
+                    help="Forward to simulator: donor-derived OFF_REF contigs represented in non-conspecific references.")
     ap.add_argument("--divergence", type=float, default=0.01)
     ap.add_argument("--routing-top-n", type=int, default=4)
     ap.add_argument("--min-svlen", type=int, default=40)
@@ -314,7 +519,7 @@ def main() -> int:
     ap.add_argument("--long-read-platform", default="hifi,ont-r10",
                     help="Comma-separated list of long-read platform presets to run. "
                          "Each generates a separate long-reads_<platform>/ output directory. "
-                         "hifi=PacBio HiFi CCS (15 kb, ≥Q20), "
+                         "hifi=PacBio HiFi CCS (15 kb, Q20+), "
                          "ont-r10=ONT R10.4.1 simplex (10 kb, ~Q20), "
                          "ont-r9=ONT R9.4.1 (8 kb, ~Q15), "
                          "generic=simulator defaults. "
@@ -332,7 +537,7 @@ def main() -> int:
         if p not in _valid_lr_platforms:
             raise ValueError(f"Unknown long-read platform {p!r}; valid: {sorted(_valid_lr_platforms)}")
 
-    # Expand modes: long-reads → one iteration per platform; others run once.
+    # Expand long-read mode into one iteration per platform.
     # label      = output directory name and summary key (e.g. "long-reads_hifi")
     # actual_mode = query-mode flag passed to simulator/binary ("long-reads")
     # lr_plat    = platform preset forwarded to the simulator (empty for non-lr)
@@ -368,6 +573,8 @@ def main() -> int:
             "n_reps": args.n_reps,
             "total_len": args.total_len,
             "n_contigs": args.n_contigs,
+            "off_ref_contigs": args.off_ref_contigs,
+            "pangenome_stress": args.pangenome_stress,
             "divergence": args.divergence,
             "target_svs_per_scenario": args.target_svs_per_scenario,
             "queries_per_scenario": args.queries_per_scenario,
@@ -392,7 +599,7 @@ def main() -> int:
         if resuming:
             # Session was disconnected mid-run; the binary already wrote its output.
             # Reconstruct the minimal state needed for PR scoring and summary.
-            print(f"[resume] {label}: calls.vcf exists — skipping sim/build/query", flush=True)
+            print(f"[resume] {label}: calls.vcf exists - skipping sim/build/query", flush=True)
             store_path = idx_dir / "routing_centroids.bin"
             store_info = {
                 "real_centroids": 0,
@@ -417,17 +624,15 @@ def main() -> int:
                 "--n-reps", str(args.n_reps),
                 "--total-len", str(args.total_len),
                 "--n-contigs", str(args.n_contigs),
+                "--off-ref-contigs", str(args.off_ref_contigs),
                 "--out-dir", str(sim_dir),
                 "--scenario-set", args.scenario_set,
                 "--write-extended-manifest",
                 "--query-mode", actual_mode,
                 "--divergence", str(args.divergence),
-                # Platform preset for long-reads: controls read length, error rate,
-                # and coverage in the simulator (see _LR_PLATFORM_PRESETS in test_amf.py).
-                # hifi    → 15 kb, ≥Q20 — minimap2 map-hifi downstream
-                # ont-r10 → 10 kb, ~Q20 — minimap2 map-ont; WhatsHap applicable for
-                #           dikaryotic fungi (Puccinia, Leptosphaeria, Zymoseptoria)
-                # ont-r9  → 8 kb, ~Q15
+                *( ["--pangenome-stress"] if args.pangenome_stress else [] ),
+                # Long-read platform preset controls simulator read length,
+                # error rate, and coverage.
                 *( ["--long-read-platform", lr_plat] if lr_plat else [] ),
             ]
             sim_run = run(sim_cmd, cwd=ROOT)
@@ -484,10 +689,15 @@ def main() -> int:
             window_bp=args.window_bp,
         )
         write_pr_artifacts(summary, mode_dir / "pr_metrics.tsv", mode_dir / "pr_metrics.json")
+        two_axis_rows = compute_two_axis_sim_metrics(
+            sim_dir,
+            out_prefix.with_suffix(".hits.tsv"),
+            mode_dir / "pr_metrics_two_axis.tsv",
+            args.window_bp,
+        )
         overall = summary["overall"]
 
-        # Biology candidate analysis — classifies TE-linked / novel SVs and
-        # produces biology_candidates.tsv picked up by sv_visualization_report.py.
+        # Classify TE-linked and novel SVs for the visualization report.
         if DEFAULT_ANALYZE.exists():
             bio_dir = mode_dir / "biology"
             bio_dir.mkdir(parents=True, exist_ok=True)
@@ -541,6 +751,7 @@ def main() -> int:
             "query_stderr": query_run.stderr if query_run else "(resumed)",
             "store_info": store_info,
             "metrics": {k: v for k, v in summary.items() if k not in {"tp_records", "fp_records", "fn_records"}},
+            "two_axis_metrics": two_axis_rows,
             "query_seconds": query_seconds,
         }
 

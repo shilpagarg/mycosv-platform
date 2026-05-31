@@ -1,6 +1,4 @@
 #!/usr/bin/env python3
-# Designed for Linux
-
 from __future__ import annotations
 
 import argparse
@@ -33,7 +31,7 @@ MGE_TRANSPOSABLE = {"TE", "LTR_GYPSY", "LTR_COPIA", "DNA_TIR", "HELITRON", "MITE
                     "TE_LTR", "TE_TIR", "LINE", "SINE"}
 MGE_REPEAT_BASED = {"REPEAT", "RIP"}     # repeat/RIP elements (not strictly MGE)
 
-# Pezizomycotina classes — the only fungal subphylum where RIP (Repeat-Induced
+# Pezizomycotina classes - the only fungal subphylum where RIP (Repeat-Induced
 # Point mutation) operates. Outside this set the sequence-only RIP detector in
 # layer1_clade_graph.hpp can still fire on AT-rich / TpA-enriched repeats, but
 # the RIP label is biologically wrong (Saccharomycotina yeasts, Glomeromycota
@@ -905,7 +903,7 @@ def classify_candidate(
     # HGT candidates rank highest: cross-clade or Starship/integrative-island events
     # that are novel relative to the same-clade references.
     if hgt and ancestry_switch:
-        return 'hgt_candidate', 7, 'Cross-clade TRA or HGT-class insertion with multi-clade ancestry — strong candidate HGT signal.'
+        return 'hgt_candidate', 7, 'Cross-clade TRA or HGT-class insertion with multi-clade ancestry - strong candidate HGT signal.'
     if hgt:
         return 'hgt_candidate', 6, 'HGT-like element class or cross-clade translocation with novel sequence tier.'
     if expr_supported and te_like and ancestry_switch:
@@ -1040,8 +1038,8 @@ def choose_functional_example(
 # These functions read the per-shard biology_findings.tsv files produced by
 # the per-query analyzer and synthesize a guild-level view (AMF / EMF / yeast /
 # saprotrophic Pezizomycotina / endophyte / mushroom / truffle / etc.). They
-# explicitly stratify by *pangenome scope* — single-reference-equivalent vs
-# pangenome-only — so the "what would have been missed without a pangenome"
+# explicitly stratify by *pangenome scope* - single-reference-equivalent vs
+# pangenome-only - so the "what would have been missed without a pangenome"
 # fraction is computed per guild, per candidate axis, and tied back to ecology
 # (lifestyle / ecological_trait / substrate_or_host) and gene-expression links
 # (expression_supported / affected_gene). Triggered by --cross-guild-shard-dir;
@@ -1127,13 +1125,13 @@ def classify_guild(genus: str, species: str = '', lifestyle: str = '') -> str:
 # Class-based 4-way taxonomy used by the cross-guild biology figure (manuscript
 # Fig 2A). Resolution gates on subphylum/class, not phylum alone, because
 # Ascomycota contains both Pezizomycotina (filamentous, RIP-active) and
-# Saccharomycotina (yeasts, no RIP) — collapsing them loses the architectural
+# Saccharomycotina (yeasts, no RIP) - collapsing them loses the architectural
 # distinction the volcano is designed to surface.
 YEAST_CLASSES = {
     'saccharomycetes', 'pichiomycetes', 'dipodascomycetes',
     'schizosaccharomycetes', 'taphrinomycetes',
 }
-# Pezizomycotina classes — same set used by RIP_SUPPORTING_CLASSES, kept
+# Pezizomycotina classes - same set used by RIP_SUPPORTING_CLASSES, kept
 # separate so the two gates can evolve independently if needed.
 FILAMENTOUS_ASCO_CLASSES = {
     'sordariomycetes', 'eurotiomycetes', 'dothideomycetes', 'leotiomycetes',
@@ -1219,7 +1217,7 @@ def _shard_iter(shard_dir: Path):
     """Yield (query_asm, biology_findings_path) for shards that have one.
 
     Skips shards where the mycosv binary failed mid-run (MYCOSV_FAILED.txt
-    marker) — those produce a near-empty checkpoint that pollutes panel
+    marker) - those produce a near-empty checkpoint that pollutes panel
     aggregates with no_truth/zero-precision rows.
     """
     for q in sorted(p for p in shard_dir.iterdir() if p.is_dir()):
@@ -1404,7 +1402,7 @@ def run_cross_guild(shard_dir: Path, out_dir: Path) -> int:
             })
     print(f'[cross-guild] wrote {summary_path}', flush=True)
 
-    # ---- Per-guild × feature Fisher enrichment -----------------------------
+    # ---- Per-guild x feature Fisher enrichment -----------------------------
     # For each (guild, feature), test whether the feature is enriched in this
     # guild vs the rest of the panel (2x2 right-tailed Fisher).
     features = [
@@ -1455,7 +1453,7 @@ def run_cross_guild(shard_dir: Path, out_dir: Path) -> int:
                 })
     print(f'[cross-guild] wrote {enrichment_path}', flush=True)
 
-    # ---- Pangenome lift per guild × candidate axis -------------------------
+    # ---- Pangenome lift per guild x candidate axis -------------------------
     # The headline number for the writeup: "X% of HGT (RIP, TE, off-ref) in
     # guild Y would have been MISSED by single-reference methods."
     lift_path = out_dir / 'cross_guild_pangenome_lift.tsv'
@@ -1551,7 +1549,7 @@ def main() -> int:
 
     # Cross-guild mode short-circuits the per-shard pipeline. Used by the
     # combine phase to synthesize the panel-wide story; works for any number
-    # of shards (15-query and 165-query runs alike — just point it at the
+    # of shards (15-query and 165-query runs alike - just point it at the
     # by_query/ directory).
     if args.cross_guild_shard_dir is not None:
         shard_dir = args.cross_guild_shard_dir.resolve()
@@ -1570,7 +1568,7 @@ def main() -> int:
 
     # gene_annotations alone is now valid: it powers the nearest-gene fallback
     # so expression_gene / expression_distance_bp populate without an RNA-seq
-    # matrix. The reverse — expression_long without gene_annotations — still
+    # matrix. The reverse - expression_long without gene_annotations - still
     # cannot resolve gene-coord lookups and is an error.
     if args.expression_long_tsv and not args.gene_annotations:
         ap.error('--expression-long-tsv requires --gene-annotations to map gene_id -> contig coordinates')
@@ -1583,7 +1581,7 @@ def main() -> int:
     fungal_by_species, fungal_by_genus = load_fungaltraits_csv(args.fungaltraits_csv)
 
     expression = load_expression(args.expression_tsv)
-    # Always load gene_annotations even when no expression_long is supplied —
+    # Always load gene_annotations even when no expression_long is supplied -
     # it lets the per-candidate fallback below populate expression_gene /
     # expression_distance_bp from the nearest annotated gene, so the operator
     # at least sees which gene is closest to each breakpoint without needing

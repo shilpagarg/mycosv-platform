@@ -26,6 +26,7 @@ slurm*
 
 # 🔹 Python cache
 __pycache__/
+manuscipt/__pycache__/
 *.pyc
 
 # 🔹 Environment / config

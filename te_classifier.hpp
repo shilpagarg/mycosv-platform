@@ -1,10 +1,10 @@
 #pragma once
-// te_classifier.hpp — k-mer nearest-centroid TE classifier
+// te_classifier.hpp - k-mer nearest-centroid TE classifier
 //
 // Parses PanTEon/RepBase-format FASTA headers:
 //   >ID#Class/Order/Superfamily  (e.g. >TE1#DNA/TIR/Tc1-Mariner)
 //   >ID#Class/Superfamily        (e.g. >TE2#LTR/Copia)
-//   >ID  (unlabeled — skipped during training)
+//   >ID  (unlabeled - skipped during training)
 //
 // Builds per-superfamily CladeCentroid objects using FracMin sketching,
 // then organises them in a VPTree for O(log N) nearest-centroid lookup.
@@ -108,7 +108,7 @@ inline std::string centroid_key(const TELabel& lbl) {
 // =========================================================================
 // K-mer hashing (FNV-1a 64-bit, canonical k-mer)
 // TE classification uses FracMin sketching rather than syncmer seeding:
-// FracMin keeps all k-mer hashes ≤ p·2^64 which gives a denser, density-
+// FracMin keeps all k-mer hashes <= p*2^64 which gives a denser, density-
 // controlled sketch suited to short TE elements (~500 bp), whereas the
 // Hong-Buhler syncmer in BaseBlockSegmenter::syncmers is optimised for
 // long-genome routing centroids.
@@ -185,7 +185,7 @@ inline tol::CladeCentroid build_centroid(const std::string& label,
 }
 
 // =========================================================================
-// FASTA reader — yields (header, sequence) pairs
+// FASTA reader - yields (header, sequence) pairs
 // =========================================================================
 inline void read_fasta(const std::string& path,
                         const std::function<void(const std::string&, const std::string&)>& cb) {
@@ -231,7 +231,7 @@ public:
     // ---- Training -------------------------------------------------------
     // Parse labeled FASTA, accumulate sequences per superfamily, build VPTree.
     void train(const std::string& fasta_path, bool verbose = true) {
-        std::unordered_map<std::string, std::vector<std::string>> bucket; // key → seqs
+        std::unordered_map<std::string, std::vector<std::string>> bucket; // key -> seqs
 
         size_t total = 0, labeled = 0;
         read_fasta(fasta_path, [&](const std::string& hdr, const std::string& seq) {
@@ -274,7 +274,7 @@ public:
         meta << "k=" << params_.k << '\n';
         meta << "fracmin_p=" << params_.fracmin_p << '\n';
         meta << "max_hashes=" << params_.max_hashes << '\n';
-        // Write centroid key → label decomposition
+        // Write centroid key -> label decomposition
         for (const auto& [key, lbl] : key_to_label_) {
             meta << "L\t" << key << '\t' << lbl.te_class << '\t'
                  << lbl.te_order << '\t' << lbl.superfamily << '\n';
@@ -336,7 +336,7 @@ public:
             p.pred_order       = it->second.te_order;
             p.pred_superfamily = it->second.superfamily;
         } else {
-            // Key is the centroid name itself — parse it
+            // Key is the centroid name itself - parse it
             const TELabel lbl = parse_label("#" + p.best_centroid_key);
             p.pred_class       = lbl.te_class;
             p.pred_order       = lbl.te_order;

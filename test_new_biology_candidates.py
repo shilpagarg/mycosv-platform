@@ -1,6 +1,4 @@
 #!/usr/bin/env python3
-# Designed for Linux
-
 from __future__ import annotations
 
 import csv

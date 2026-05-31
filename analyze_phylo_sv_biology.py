@@ -17,7 +17,7 @@ Inputs come from:
 
 Outputs (all in --out-dir):
   phylo_sv_distribution.tsv   -- SV counts by phylum/class/order/svtype
-  mge_architecture.tsv        -- MGE type × SV type co-occurrence per clade
+  mge_architecture.tsv        -- MGE type x SV type co-occurrence per clade
   hgt_propagation.tsv         -- TRA/OFF_REF events grouped by clade pair
   summary.json                -- machine-readable aggregation of all three
   plots/                      -- PNG figures for each question
@@ -137,7 +137,7 @@ def analyze_phylo_sv_distribution(
     taxonomy: dict[str, dict[str, str]],
 ) -> list[dict[str, Any]]:
     """SV counts aggregated by taxonomic rank."""
-    # Build taxid→lineage lookup keyed by species name too
+    # Build taxid-to-lineage lookup keyed by species name too.
     species_to_lineage: dict[str, dict[str, str]] = {}
     for lineage in taxonomy.values():
         sp = lineage.get("species", "")
@@ -179,7 +179,7 @@ def analyze_mge_architecture(
     asm_meta: dict[str, dict[str, str]],
     taxonomy: dict[str, dict[str, str]],
 ) -> list[dict[str, Any]]:
-    """MGE type × SV type co-occurrence; genome-scale architecture effects."""
+    """MGE type x SV type co-occurrence; genome-scale architecture effects."""
     species_to_lineage: dict[str, dict[str, str]] = {}
     for lineage in taxonomy.values():
         sp = lineage.get("species", "")
@@ -389,7 +389,7 @@ def make_plots(
         fig.savefig(plots_dir / "fig1_phylo_sv_distribution.svg")
         plt.close(fig)
 
-    # --- Plot 2: MGE architecture — stacked bar by phylum and MGE category ---
+    # --- Plot 2: MGE architecture - stacked bar by phylum and MGE category ---
     mge_phyla = sorted({r["phylum"] for r in mge_rows if r["phylum"] != "."})
     mge_cats = ["integrative", "transposable", "repeat"]
     mge_matrix: dict[str, dict[str, int]] = {ph: {c: 0 for c in mge_cats} for ph in mge_phyla}

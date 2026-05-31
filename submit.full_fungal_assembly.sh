@@ -114,7 +114,7 @@ echo "anchorwave:        $(command -v anchorwave || echo MISSING)"
 #
 # The lock file lives on node-local TMPDIR (or /tmp) because flock(2) on the
 # bmh01-rds NFS share returns ENOLCK ("No locks available") under array
-# contention — the prior run lost 8/15 shards to that exact failure. With the
+# contention. With the
 # lock local to the node, array tasks only contend with siblings on the same
 # node (rare for 32-CPU tasks) and a fresh binary mtime lets them no-op the
 # lock entirely.
@@ -122,7 +122,7 @@ MYCOSV_BIN="${MYCOSV_BIN:-${PROJECT_DIR}/fungi_graphsv_tol_bin}"
 BIN_LOCK="${BIN_LOCK:-${TMPDIR:-/tmp}/$(basename "${MYCOSV_BIN}").${USER}.lock}"
 if [[ -x "${MYCOSV_BIN}" && "${FORCE_PREBUILD:-0}" != "1" ]]; then
   BIN_MTIME=$(stat -c %Y "${MYCOSV_BIN}" 2>/dev/null || echo 0)
-  # Newest of main.cpp AND every *.hpp — must match the Python's _needs_build()
+  # Newest of main.cpp and every *.hpp. This must match Python _needs_build(),
   # which also checks headers. Comparing only main.cpp meant a newer .hpp left
   # the binary "stale" by the Python's reckoning, so each array task tried to
   # lock+rebuild on the NFS share and ~half hit ENOLCK ("No locks available").
@@ -231,7 +231,7 @@ if [[ "${BOOTSTRAP_ONLY:-0}" == "1" ]]; then
   else
     echo "[bootstrap] read-validation manifest already present at ${READ_MANIFEST_OUT}"
   fi
-  echo "[bootstrap] done at $(date) — prepared/ ready for array tasks"
+  echo "[bootstrap] done at $(date) - prepared/ ready for array tasks"
   exit 0
 fi
 
@@ -254,12 +254,12 @@ run_benchmark_dir() {
   #                 optional via RUN_PGGB / RUN_CACTUS. Reviewers (NM, NB)
   #                 expect head-to-head against modern pangenome graph callers
   #                 (Liao 2023 HPRC, Hickey 2024 Minigraph-Cactus, Garrison 2018 vg).
-  #   long-reads  : Sniffles2 / cuteSV / SVIM — the canonical PB/ONT SV callers
+  #   long-reads  : Sniffles2 / cuteSV / SVIM, the canonical PB/ONT SV callers
   #                 (Heller 2022 Genome Biol, Jiang 2020 GB, Heller 2019 Bioinf).
-  #   short-reads : Delly / Manta — canonical Illumina SV callers (Rausch 2012,
+  #   short-reads : Delly / Manta, canonical Illumina SV callers (Rausch 2012,
   #                 Chen 2016 Bioinf). Off by default; opt in with MODE=short-reads.
   # MODE is an env var so the same launcher handles assembly + reads modes
-  # without forking the script — per the project policy of editing existing
+  # without forking the script, following the project policy of editing existing
   # pipeline + heredocs rather than spawning new shell scripts.
   local mode="${MODE:-assembly}"
   local comparator_flags=()
@@ -505,6 +505,68 @@ shard_complete() {
   [[ -s "${shard_dir}/read_validation_summary.tsv" ]] || return 1
   return 0
 }
+
+# Simulation benchmark (16-scenario assembly-mode PR vs known ground truth).
+# Opt-in via RUN_SIMULATION=1; SIM_ONLY=1 short-circuits the real-data shard
+# loop. Divergence default 0.01 matches intra-species fungal genomes.
+RUN_SIMULATION="${RUN_SIMULATION:-0}"
+SIM_SCENARIOS="${SIM_SCENARIOS:-compact_yeast,core,hgt_receiver,cross_phylum_hgt_stress,lichenised,saprotrophic,arbuscular_mf,giant_amf,ectomycorrhizal,soil_endophyte,necrotrophic,pathogenic,rust_smut_te_heavy,two_speed_pathogen_extreme,smut,strict_endophyte}"
+SIM_OUT_DIR="${SIM_OUT_DIR:-${OUT_ROOT}/simulation}"
+SIM_QUERIES_PER_SCENARIO="${SIM_QUERIES_PER_SCENARIO:-5}"
+SIM_TOTAL_LEN="${SIM_TOTAL_LEN:-500000}"
+SIM_N_CONTIGS="${SIM_N_CONTIGS:-5}"
+SIM_OFF_REF_CONTIGS="${SIM_OFF_REF_CONTIGS:-1}"
+SIM_PANGENOME_STRESS="${SIM_PANGENOME_STRESS:-0}"
+SIM_N_REPS="${SIM_N_REPS:-2}"
+SIM_DIVERGENCE="${SIM_DIVERGENCE:-0.01}"
+SIM_N_CENTROIDS="${SIM_N_CENTROIDS:-3000}"
+
+if [[ "${RUN_SIMULATION}" == "1" ]]; then
+  echo
+  echo "=== Simulation benchmark (16 ecological scenarios; assembly mode) ==="
+  echo "  out:            ${SIM_OUT_DIR}"
+  echo "  scenarios:      ${SIM_SCENARIOS}"
+  echo "  per-scenario:   ${SIM_QUERIES_PER_SCENARIO} queries x ${SIM_N_CONTIGS} contigs x ${SIM_TOTAL_LEN} bp"
+  echo "  off-ref contigs:${SIM_OFF_REF_CONTIGS}; pangenome_stress=${SIM_PANGENOME_STRESS}"
+  echo "  divergence:     ${SIM_DIVERGENCE} (intra-species / closely-related-strain)"
+  mkdir -p "${SIM_OUT_DIR}"
+  sim_extra_flags=()
+  if [[ "${SIM_PANGENOME_STRESS}" == "1" ]]; then
+    sim_extra_flags+=(--pangenome-stress)
+  fi
+  python3 -u run_million_mode_query_benchmark.py \
+    --out-dir "${SIM_OUT_DIR}" \
+    --modes assembly \
+    --scenario-set "${SIM_SCENARIOS}" \
+    --n-centroids "${SIM_N_CENTROIDS}" \
+    --n-reps "${SIM_N_REPS}" \
+    --n-contigs "${SIM_N_CONTIGS}" \
+    --off-ref-contigs "${SIM_OFF_REF_CONTIGS}" \
+    --total-len "${SIM_TOTAL_LEN}" \
+    --queries-per-scenario "${SIM_QUERIES_PER_SCENARIO}" \
+    --divergence "${SIM_DIVERGENCE}" \
+    --threads "${THREADS}" \
+    --seed "${SEED}" \
+    "${sim_extra_flags[@]}" \
+    --skip-build \
+    || echo "[sim] WARN: simulation benchmark returned non-zero (continuing)" >&2
+  if [[ -s "${SIM_OUT_DIR}/assembly/pr_metrics_by_scenario.tsv" ]]; then
+    echo "[sim] PR-by-scenario:  ${SIM_OUT_DIR}/assembly/pr_metrics_by_scenario.tsv"
+    echo "[sim] truth VCF:       ${SIM_OUT_DIR}/assembly/sim/truth/all_queries.truth.ref.vcf"
+    echo "[sim] pangenome truth: ${SIM_OUT_DIR}/assembly/sim/truth/all_queries.truth.pangenome.vcf"
+    echo "[sim] calls VCF:       ${SIM_OUT_DIR}/assembly/calls.vcf"
+  else
+    echo "[sim] WARN: pr_metrics_by_scenario.tsv missing -- simulation may have failed" >&2
+  fi
+  # SIM_ONLY=1: skip the per-shard real-data loop. Usage:
+  #   sbatch -p interactive --time=02:00:00 --cpus-per-task=8 --mem=32G \
+  #     --export=ALL,RUN_SIMULATION=1,SIM_ONLY=1 submit.full_fungal_assembly.sh
+  if [[ "${SIM_ONLY:-0}" == "1" ]]; then
+    echo "[sim] SIM_ONLY=1 set; exiting without running per-shard real-data benchmark"
+    echo "finish:            $(date)"
+    exit 0
+  fi
+fi
 
 if [[ "${FULL_ASSEMBLY_SHARDS}" == "1" ]]; then
   mkdir -p "${ASM_OUT}"

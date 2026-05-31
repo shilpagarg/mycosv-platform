@@ -1,5 +1,5 @@
 #pragma once
-// layer3_routing_index.hpp — v14
+// layer3_routing_index.hpp - v14
 // Phylum-Sharded Routing Index  (Layer 3)
 //
 // DS-4   VP-tree nearest-clade routing  (Uhlmann 1991 / Yianilos 1993)
@@ -8,7 +8,7 @@
 // DS-19  Skip-list style sparse disk directory  (Pugh 1989) for million-scale
 //        centroid shortlist routing without materializing the full catalog
 //        in RAM.
-// DS-14  WaveletTree over BWT for O(k log σ) alphabet prefilter
+// DS-14  WaveletTree over BWT for O(k log sigma) alphabet prefilter
 //
 // route() snapshots phylum-shard pointers under one brief registryMu_ hold;
 // per-shard queries then run under only the shard shared_lock.
@@ -127,7 +127,7 @@ struct CompressedBucketBitmap {
 
 // =========================================================================
 // DS-14: WaveletTree alphabet pre-filter over DNA text
-// σ=4 (A=0,C=1,G=2,T=3); rank(c,i) in O(1) via prefix popcount table.
+// sigma=4 (A=0,C=1,G=2,T=3); rank(c,i) in O(1) via prefix popcount table.
 // =========================================================================
 struct WaveletTree {
     static constexpr int SIGMA     = 4;
@@ -199,7 +199,7 @@ struct WaveletTree {
 };
 
 // =========================================================================
-// CladeCentroid — FracMin sketch + Bloom filter + WaveletTree prefilter
+// CladeCentroid - FracMin sketch + Bloom filter + WaveletTree prefilter
 // =========================================================================
 struct CladeCentroid {
     std::string            cladeName;
@@ -297,7 +297,7 @@ inline CladeCentroid make_query_centroid_for_routing(std::string_view seq,
 }
 
 // =========================================================================
-// FracMinSketch — per-genome sketch for bootstrap clustering
+// FracMinSketch - per-genome sketch for bootstrap clustering
 // =========================================================================
 struct FracMinSketch {
     std::string            asmName, cladeName;
@@ -306,7 +306,7 @@ struct FracMinSketch {
 };
 
 // =========================================================================
-// DS-6: DSU  (Tarjan 1975) — path compression + union by rank
+// DS-6: DSU  (Tarjan 1975) - path compression + union by rank
 // =========================================================================
 struct DSU {
     // FIX: use int throughout and cast only at the vector subscript boundary
@@ -358,7 +358,7 @@ split_into_subclades(const std::vector<FracMinSketch>& sketches,
     static constexpr int kDims = 32;
     std::mt19937_64 rng(seed);
 
-    // Union of all hashes — used to sample pivot positions
+    // Union of all hashes - used to sample pivot positions
     std::vector<uint64_t> allH;
     allH.reserve(sketches.size() * 64);
     for (const auto& s : sketches)
@@ -367,7 +367,7 @@ split_into_subclades(const std::vector<FracMinSketch>& sketches,
     allH.erase(std::unique(allH.begin(), allH.end()), allH.end());
 
     if (allH.empty()) {
-        // No hashes — distribute round-robin
+        // No hashes - distribute round-robin
         std::vector<std::vector<size_t>> groups;
         for (int i = 0; i < N; ++i) {
             if (groups.empty() || groups.back().size() >= maxPerGroup)
@@ -576,7 +576,7 @@ private:
         for (int i = 0; i < static_cast<int>(right_inds.size()); ++i)
             inds[static_cast<size_t>(rLo + i)] = right_inds[static_cast<size_t>(i)];
 
-        // node ref may be invalidated by push_back in recursion — use saved index
+        // node ref may be invalidated by push_back in recursion - use saved index
         int lChild = build_node(inds, lLo, lHi);
         int rChild = build_node(inds, rLo, rHi);
         nodes_[static_cast<size_t>(nodeIdx)].left  = lChild;
@@ -614,7 +614,7 @@ private:
 };
 
 // =========================================================================
-// PhylumShardedRouter  — per-phylum VP-tree + Tier-B fallback
+// PhylumShardedRouter  - per-phylum VP-tree + Tier-B fallback
 //
 // route() captures shard pointers under one brief registryMu_ hold, then
 // releases it before any per-shard work.
@@ -721,7 +721,7 @@ public:
             if (it != routeCache_.end()) return it->second;
         }
 
-        // ── Snapshot shard pointers under ONE brief lock ─────────────────
+        // Snapshot shard pointers under ONE brief lock
         struct ShardSnapshot { PhylumShard* shard; bool isFallback; };
         std::vector<ShardSnapshot> snap;
         {
@@ -730,7 +730,7 @@ public:
             for (auto& [p, s] : shards_)   snap.push_back({ s.get(), false });
             for (auto& [p, s] : fbShards_)  snap.push_back({ s.get(), true  });
         }
-        // ── Per-shard queries with only per-shard shared_lock ────────────
+        // Per-shard queries with only per-shard shared_lock
         std::vector<std::pair<double, RouteResult>> all, fbAll;
         for (auto& [shard, isFb] : snap) {
             if (!shard) continue;
@@ -884,7 +884,7 @@ private:
 
 
 // =========================================================================
-// ExternalMemoryCentroidStore — streaming centroid operations for catalogs
+// ExternalMemoryCentroidStore - streaming centroid operations for catalogs
 // too large to keep resident in RAM. The store writes one compact centroid
 // record at a time and supports chunked sequential scans, which keeps peak
 // memory proportional to the chunk size rather than the full catalog size.

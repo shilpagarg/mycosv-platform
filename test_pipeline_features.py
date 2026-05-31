@@ -1,6 +1,4 @@
 #!/usr/bin/env python3
-# Designed for Linux
-
 from __future__ import annotations
 
 import hashlib
@@ -194,7 +192,7 @@ def test_simulator_writes_extended_rank_manifests(tmp_path: Path):
     for row in truth_text.strip().splitlines()[1:]:
         contig = row.split('\t')[contig_idx]
         assert '__sv_' not in contig, \
-            f'Hint suffix found in contig {contig!r} — hint-free mode broken'
+            f'Hint suffix found in contig {contig!r} - hint-free mode broken'
 
 
 
@@ -274,7 +272,7 @@ int main() {
     std::cout << "annot_INS\t"      << vars[0].pantreeClass << "\n";
     std::cout << "annot_OFFREF_NR\t" << (vars[1].isNonRefVariant ? "true" : "false") << "\n";
 
-    // classify_triallelic — INTERLOCKING (fixed capitalisation)
+    // classify_triallelic - INTERLOCKING (fixed capitalisation)
     auto t = tol::classify_triallelic(10, 20, 15, 25);
     std::cout << "triallelic_overlap\t"
               << (t == tol::TriallelicTopology::OVERLAPPING ? "OVERLAPPING" : "OTHER") << "\n";
@@ -292,7 +290,7 @@ int main() {
     ppi.insert_position(30);
     std::cout << "ppi_monotone\t"
               << (ppi.is_non_monotone() ? "non_monotone" : "monotone") << "\n";
-    ppi.insert_position(5); // inserts before 10 — now non-monotone at stored level
+    ppi.insert_position(5); // inserts before 10 - now non-monotone at stored level
     std::cout << "ppi_sorted\t"
               << (ppi.orderStats.front() == 5 ? "sorted" : "unsorted") << "\n";
 
@@ -303,7 +301,7 @@ int main() {
     std::cout << "inv_flex_diff\t"
               << (tol::is_inversion_flex(100, 200) ? "flex" : "notflex") << "\n";
 
-    // ReferenceLCAIndex: build_sparse_table call (smoke test — empty tour is safe)
+    // ReferenceLCAIndex: build_sparse_table call (smoke test - empty tour is safe)
     tol::ReferenceLCAIndex lca;
     lca.build_sparse_table();
     std::cout << "lca_build\tok\n";
@@ -860,7 +858,7 @@ def test_reads_modes_recover_supported_insertion_and_offref_end_to_end(tmp_path:
 
 
 # ---------------------------------------------------------------------------
-# Fallback path tests — plain contig names, algorithmically detectable SVs
+# Fallback path tests - plain contig names, algorithmically detectable SVs
 #
 # The length-fallback (simple_length_fallback_calls) detects INS and DEL
 # from the difference between query and reference contig lengths when both
@@ -868,7 +866,7 @@ def test_reads_modes_recover_supported_insertion_and_offref_end_to_end(tmp_path:
 # and let the fallback infer the event from length alone.
 #
 # OFF_REF detection: a query contig that has NO matching reference contig name
-# is NOT emitted as OFF_REF by the length fallback — it is simply skipped,
+# is NOT emitted as OFF_REF by the length fallback - it is simply skipped,
 # because the fallback has no alignment evidence.  OFF_REF calls are only
 # produced by the hierarchical engine's DS-9 novelty scorer.  The tests
 # below reflect this: off-reference contigs in fallback mode produce no call.
@@ -943,7 +941,7 @@ def test_length_fallback_no_call_for_unmatched_contig_name(tmp_path: Path):
     When a query contig has no reference contig with the same base name, the
     length fallback produces no INS/DEL call (there is no reference length to
     diff against).  The off-reference novelty scorer may still emit an OFF_REF
-    call if the sequence has low k-mer overlap with all references — that is
+    call if the sequence has low k-mer overlap with all references - that is
     correct and expected.  This test only asserts that no INS/DEL is emitted.
     """
     ref = tmp_path / 'ref.fa'
@@ -952,7 +950,7 @@ def test_length_fallback_no_call_for_unmatched_contig_name(tmp_path: Path):
     queries = tmp_path / 'queries.txt'
 
     write_fasta(ref, [('ctgRef', 'A' * 200)])
-    # Completely different contig name — no length-delta possible
+    # Completely different contig name - no length-delta possible
     write_fasta(query, [('ctgNovel', 'G' * 200)])
     refs.write_text(str(ref) + '\n')
     queries.write_text(str(query) + '\n')
@@ -975,7 +973,7 @@ def test_length_fallback_multiple_contigs_each_detected_independently(tmp_path: 
     queries = tmp_path / 'queries.txt'
 
     write_fasta(ref, [('ctg1', 'A' * 200), ('ctg2', 'C' * 200)])
-    # ctg1: 50 bp shorter → DEL; ctg2: 80 bp longer → INS
+    # ctg1 is 50 bp shorter: DEL; ctg2 is 80 bp longer: INS.
     write_fasta(query, [('ctg1', 'A' * 150), ('ctg2', 'C' * 280)])
     refs.write_text(str(ref) + '\n')
     queries.write_text(str(query) + '\n')
@@ -1027,7 +1025,7 @@ def test_vcf_header_contains_tra_info_fields(tmp_path: Path):
     refs = tmp_path / 'refs.txt'
     queries = tmp_path / 'queries.txt'
 
-    # ctg1 query is longer than ref — the length fallback emits an INS,
+    # ctg1 query is longer than ref - the length fallback emits an INS,
     # which is enough to produce a non-empty VCF with a full header.
     write_fasta(ref,   [('ctg1', 'A' * 200)])
     write_fasta(query, [('ctg1', 'A' * 280)])
@@ -1047,7 +1045,7 @@ def test_hint_encoded_query_name_is_preserved_verbatim_and_svlen_is_sequence_der
     """Verify two invariants when a hint-encoded FASTA is given to the caller.
 
     1. OUTPUT TRANSPARENCY: The VCF CHROM field is the verbatim contig name
-       from the input FASTA — the caller does not strip or normalise it.
+       from the input FASTA - the caller does not strip or normalise it.
        This makes any hint-encoded name visible to downstream tools so they
        can flag it as a hint leak in the diagnostic TSV.
 
@@ -1082,7 +1080,7 @@ def test_hint_encoded_query_name_is_preserved_verbatim_and_svlen_is_sequence_der
         info  = dict(x.split('=', 1) for x in parts[7].split(';') if '=' in x)
         svlen = int(info.get('SVLEN', 0))
 
-        # Invariant 1: CHROM is verbatim — hint suffix preserved
+        # Invariant 1: CHROM is verbatim - hint suffix preserved
         assert chrom == 'ctg1__sv_DEL__pos__50__len__60', (
             f'CHROM was altered from the input name. '
             f'Expected verbatim "ctg1__sv_DEL__pos__50__len__60", got {chrom!r}.')
@@ -1125,12 +1123,12 @@ def test_simulator_produces_on_ref_truth_records_with_plain_names(
 
     on_ref = [r for r in truth_lines[1:] if r.split('\t')[svtype_idx] != 'OFF_REF']
     assert len(on_ref) >= 2, \
-        f'Expected ≥2 on-reference truth records; got {len(on_ref)}'
+        f'Expected >=2 on-reference truth records; got {len(on_ref)}'
 
     for row in truth_lines[1:]:
         contig = row.split('\t')[contig_idx]
         assert '__sv_' not in contig, \
-            f'Hint suffix in contig name {contig!r} — --write-hint-contigs was not passed'
+            f'Hint suffix in contig name {contig!r} - --write-hint-contigs was not passed'
 
 
 def test_simulator_hint_mode_writes_sv_encoded_names(tmp_path: Path) -> None:
@@ -1450,7 +1448,7 @@ def test_ds13_svtype_from_chain_classifies_del_ins(tmp_path: Path):
 #include "layer1_clade_graph.hpp"
 int main(){
     // DEL: two MEMs with rGap >> qGap
-    // qPos: 0,50  rPos: 0,100  → rGap=50, qGap=0 → DEL of 50
+    // qPos: 0,50  rPos: 0,100  -> rGap=50, qGap=0 -> DEL of 50
     tol::SuffixArray sa;
     sa.build({{"ref1", std::string(200,'A')}});
     std::vector<tol::SuffixArray::Mem> chain_del = {{0,0,50},{50,100,50}};
@@ -1458,13 +1456,13 @@ int main(){
     auto res_del = tol::SvTypeFromChain::classify(chain_del, rev_del, sa, 20);
     std::cout << "del\t" << (res_del.type == tol::SvTypeFromChain::Type::DEL ? "DEL" : "OTHER") << "\n";
 
-    // INS: qGap >> rGap  → INS
+    // INS: qGap >> rGap  -> INS
     std::vector<tol::SuffixArray::Mem> chain_ins = {{0,0,20},{70,20,20}};
     std::vector<bool> rev_ins = {false, false};
     auto res_ins = tol::SvTypeFromChain::classify(chain_ins, rev_ins, sa, 20);
     std::cout << "ins\t" << (res_ins.type == tol::SvTypeFromChain::Type::INS ? "INS" : "OTHER") << "\n";
 
-    // INV: reverse-complement seed → INV
+    // INV: reverse-complement seed -> INV
     std::vector<tol::SuffixArray::Mem> chain_inv = {{0,0,30},{50,100,30}};
     std::vector<bool> rev_inv = {true, true};
     auto res_inv = tol::SvTypeFromChain::classify(chain_inv, rev_inv, sa, 20);
@@ -1490,9 +1488,9 @@ int main(){
     tol::WaveletTree wt;
     wt.build("ACGTACGT");
     // "ACGTACGT": A at pos 0,4  C at 1,5  G at 2,6  T at 3,7
-    // rank(A, 4): A in [0..3]="ACGT" → 1 occurrence
+    // rank(A, 4): A in [0..3]="ACGT" -> 1 occurrence
     std::cout << "rank_A\t" << wt.rank(0, 4) << "\n"; // 1
-    // rank(C, 8): C in [0..7] → 2 occurrences
+    // rank(C, 8): C in [0..7] -> 2 occurrences
     std::cout << "rank_C\t" << wt.rank(1, 8) << "\n"; // 2
     // has_char: A is present
     std::cout << "has_A\t" << (wt.has_char('A') ? "yes" : "no") << "\n"; // yes
@@ -1528,13 +1526,13 @@ int main(){
     veb.insert(10);
     veb.insert(30);
     veb.insert(50);
-    // successor of 10 → 30
+    // successor of 10 -> 30
     std::cout << "succ_10\t" << veb.successor(10) << "\n";
-    // predecessor of 30 → 10
+    // predecessor of 30 -> 10
     std::cout << "pred_30\t" << veb.predecessor(30) << "\n";
-    // any_in [20,40] → 30 is in range → true
+    // any_in [20,40] -> 30 is in range -> true
     std::cout << "any_20_40\t" << (veb.any_in(20, 40) ? "yes" : "no") << "\n";
-    // any_in [60,80] → nothing → false
+    // any_in [60,80] -> nothing -> false
     std::cout << "any_60_80\t" << (veb.any_in(60, 80) ? "yes" : "no") << "\n";
     // contains
     std::cout << "has_30\t" << (veb.contains(30) ? "yes" : "no") << "\n";
@@ -1563,13 +1561,13 @@ int main(){
     tol::MergeSortTree mst;
     // Intervals: [10,30], [20,40], [50,70]
     mst.build({{10,30},{20,40},{50,70}});
-    // stab at 25 → hits [10,30] and [20,40] → 2
+    // stab at 25 -> hits [10,30] and [20,40] -> 2
     std::cout << "stab_25\t" << mst.stab_count(25) << "\n";
-    // stab at 55 → hits [50,70] → 1
+    // stab at 55 -> hits [50,70] -> 1
     std::cout << "stab_55\t" << mst.stab_count(55) << "\n";
-    // stab at 45 → nothing → 0
+    // stab at 45 -> nothing -> 0
     std::cout << "stab_45\t" << mst.stab_count(45) << "\n";
-    // overlapping [15,35] → [10,30] and [20,40] → 2
+    // overlapping [15,35] -> [10,30] and [20,40] -> 2
     auto ov = mst.overlapping(15, 35);
     std::cout << "overlap_count\t" << ov.size() << "\n";
 }
@@ -1591,7 +1589,7 @@ def test_ds17_fenwick_tree_prefix_sum_and_findkth(tmp_path: Path):
 #include "layer1_clade_graph.hpp"
 int main(){
     tol::FenwickTree fen(5);
-    // Sizes: [10, 20, 30, 40, 50] → prefix sums: [10,30,60,100,150]
+    // Sizes: [10, 20, 30, 40, 50] -> prefix sums: [10,30,60,100,150]
     fen.update(0, 10);
     fen.update(1, 20);
     fen.update(2, 30);
@@ -1600,7 +1598,7 @@ int main(){
     std::cout << "psum_2\t" << fen.prefix_sum(2) << "\n"; // 10+20+30=60
     std::cout << "psum_4\t" << fen.prefix_sum(4) << "\n"; // 150
     std::cout << "range_1_3\t" << fen.range_sum(1, 3) << "\n"; // 20+30+40=90
-    // find_kth(55): smallest k where prefix_sum(k) >= 55 → k=2 (sum=60)
+    // find_kth(55): smallest k where prefix_sum(k) >= 55 -> k=2 (sum=60)
     std::cout << "kth_55\t" << fen.find_kth(55) << "\n";
 }
 ''')
@@ -1622,7 +1620,7 @@ def test_ds18_chain_treap_basic_chaining(tmp_path: Path):
 int main(){
     tol::ChainTreap treap;
     // Seeds: (qPos, rPos, len, score)
-    // Colinear chain: (0,0,20), (25,25,20), (50,50,20) → total score=60
+    // Colinear chain: (0,0,20), (25,25,20), (50,50,20) -> total score=60
     float s1 = treap.insert_and_chain(0,  0,  20, 20.0f, 100);
     float s2 = treap.insert_and_chain(25, 25, 20, 20.0f, 100);
     float s3 = treap.insert_and_chain(50, 50, 20, 20.0f, 100);
@@ -1646,7 +1644,7 @@ def test_mem_chain_detects_del_in_binary(tmp_path: Path):
     import subprocess
     ref = tmp_path / 'ref.fa'
     query = tmp_path / 'query.fa'
-    # 300bp ref; query is 300bp with a 60bp internal deletion → net 240bp
+    # 300 bp ref; query is 300 bp with a 60 bp internal deletion, net 240 bp.
     ref_seq   = 'ACGT' * 75   # 300bp
     # Remove positions 100-159 (60 bp deletion)
     query_seq = ref_seq[:100] + ref_seq[160:]  # 240bp

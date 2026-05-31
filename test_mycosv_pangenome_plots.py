@@ -63,9 +63,9 @@ def test_pangenome_plot_script_builds_summary_and_html(tmp_path: Path) -> None:
 def test_evaluate_panel_claims_gates_both_manuscript_claims(tmp_path: Path) -> None:
     plot = _load_plot_module()
     # rv_rows mimics aggregate_panel_read_validation output. Three queries:
-    #   q_high — 90 % MycoSV read-validation rate -> in 78-100 band
-    #   q_low  — 50 % rate                         -> below band
-    #   q_top  — 100 % rate                        -> in band
+    #   q_high - 90 % MycoSV read-validation rate -> in 78-100 band
+    #   q_low  - 50 % rate                         -> below band
+    #   q_top  - 100 % rate                        -> in band
     rv_rows = [
         {"query_asm": "q_high", "source": "mycosv",
          "yes": 90, "total": 100, "rate": 0.90,

@@ -1,15 +1,15 @@
 #ifndef QUERY_INPUT_HANDLER_HPP
 #define QUERY_INPUT_HANDLER_HPP
 
-// query_input_handler.hpp — v1
+// query_input_handler.hpp - v1
 // ============================================================
 // Generalises the query input layer so the same SV-calling pipeline
 // accepts any of three input types from the user:
 //
-//   ASSEMBLY    — pre-assembled contigs in FASTA (existing behaviour)
-//   LONG_READS  — ONT or PacBio reads in FASTA or FASTQ
+//   ASSEMBLY    - pre-assembled contigs in FASTA (existing behaviour)
+//   LONG_READS  - ONT or PacBio reads in FASTA or FASTQ
 //                 (typical coverage 5-50x, read length 1-100 kb)
-//   SHORT_READS — Illumina reads in FASTA or FASTQ
+//   SHORT_READS - Illumina reads in FASTA or FASTQ
 //                 (typical coverage 20-100x, read length 50-300 bp)
 //
 // The mode is either:
@@ -243,7 +243,7 @@ struct CoverageReport {
 };
 
 // ----------------------------------------------------------------
-// PreparedQuery — output of prepare_query()
+// PreparedQuery - output of prepare_query()
 // ----------------------------------------------------------------
 struct PreparedQuery {
     std::string sampleName;
@@ -849,14 +849,10 @@ long_reads_to_pseudocontigs(const std::vector<RawRead>& reads,
     std::vector<Candidate> candidates;
 
     // Step 1: canonical (k,w) minimizer anchors -> read-index multimap.
-    // Fixed-stride k-mer sampling does NOT co-locate between overlapping reads
-    // (each read samples positions offset by the overlap shift), so it only
-    // matched via repeated k-mer *sequences* -- which transitively merged the
-    // whole read set into one cluster. Switching to canonical minimizers makes
-    // anchors position- and strand-stable: two reads overlapping the same locus
-    // select the same minimizers in their shared span regardless of offset or
-    // strand, so the >=2-shared-anchor union below clusters by locus instead of
-    // by incidental sequence repeats.
+    // Minimizers are position- and strand-stable: overlapping reads at the
+    // same locus pick the same minimizers regardless of offset, so the
+    // >=2-shared-anchor union below clusters by locus rather than by
+    // incidental sequence repeats.
     const int clusterK = std::max(anchorK, 15);
     const size_t minimizerWindow = 100;  // k-mers per minimizer window
     const size_t maxMinimizersPerRead = maxAnchorsPerRead * 2;
@@ -916,7 +912,7 @@ long_reads_to_pseudocontigs(const std::vector<RawRead>& reads,
     }
 
     // Step 2: Union-Find (iterative path compression to avoid stack overflow on
-    // large read sets — a recursive find with 10M reads could overflow the stack)
+    // large read sets - a recursive find with 10M reads could overflow the stack)
     std::vector<uint32_t> parent(N);
     std::iota(parent.begin(), parent.end(), 0u);
     auto find = [&](uint32_t x) -> uint32_t {
@@ -934,19 +930,10 @@ long_reads_to_pseudocontigs(const std::vector<RawRead>& reads,
         a = find(a); b = find(b);
         if (a != b) parent[b] = a;
     };
-    // Union reads only when they share at least MIN_SHARED_ANCHORS distinct
-    // anchors. At lrAnchorK=12 most 12-mers are not genome-unique, so a single
-    // shared anchor transitively bridges unrelated loci: a star-union per
-    // anchor collapsed entire 60k-200k read subsets into ONE cluster -> one
-    // pseudo-contig, starving the caller of contigs (public ONT fungal runs
-    // emitted ~70-180 SVs where assembly mode emits ~1000). Requiring 2+
-    // co-occurring anchors keeps genuine read overlaps (which share many
-    // anchors) while dropping spurious single-k-mer bridges.
-    //
-    // Cost stays bounded: repetitive anchors above degreeCap are skipped, so
-    // each contributing anchor adds at most C(degreeCap,2) pairs, and the
-    // co-occurrence map is hard-capped to keep peak memory under the cgroup
-    // limit.
+    // Union reads only when they share >= MIN_SHARED_ANCHORS distinct anchors.
+    // A single shared k-mer transitively merges unrelated loci into one giant
+    // component; requiring two real overlaps keeps read clusters locus-scoped.
+    // Cost bounded: repeats above degreeCap skipped, pair map hard-capped.
     {
         constexpr uint8_t MIN_SHARED_ANCHORS = 2;
         const size_t degreeCap = largeBatch ? 48 : 128;
@@ -1280,7 +1267,7 @@ short_reads_to_pseudocontigs(const std::vector<RawRead>& reads,
 } // namespace detail
 
 // ================================================================
-// prepare_query — the single public entry point
+// prepare_query - the single public entry point
 //
 //  path      : FASTA or FASTQ file (not .gz)
 //  modeHint  : user-supplied mode; pass ASSEMBLY to trigger auto-detect

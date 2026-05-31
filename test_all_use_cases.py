@@ -1,19 +1,17 @@
 #!/usr/bin/env python3
-# Designed for Linux
-
-"""test_all_use_cases.py — Integration tests across all 16 ecological scenarios.
+"""Integration tests across the simulator's ecological scenarios.
 
 Tests that the AMF simulator produces correct outputs for every scenario in
 SCENARIOS and that each output contains the expected truth records.
 
 Coverage:
-  • All 16 ecological scenarios: compact_yeast → giant_amf → rust/smut → two-speed pathogen
-  • OFF_REF entries present for every query genome
-  • On-reference SV entries present (INS/DEL/DUP/INV/TRA)
-  • TRA breakpoints encoded in truth VCF (CHR2 + POS2)
-  • No hint suffixes (__sv_) in contig names when run in hint-free mode
-  • Scenario name present in both query_metadata.tsv and stress_case_catalog.tsv
-  • Repeat/TE annotation integration: scenario element classes written to
+  - All ecological scenarios: compact_yeast, AMF, rust/smut, HGT, pathogens.
+  - OFF_REF entries present for every query genome.
+  - On-reference SV entries present (INS/DEL/DUP/INV/TRA).
+  - TRA breakpoints encoded in truth VCF (CHR2 + POS2).
+  - No hint suffixes (__sv_) in contig names in hint-free mode.
+  - Scenario name present in query_metadata.tsv and stress_case_catalog.tsv.
+  - Repeat/TE annotation integration: scenario element classes written to
     graph_annotations_denovo.tsv when --write-query-annotations is passed
 """
 from __future__ import annotations
@@ -64,7 +62,7 @@ def run_sim_annotated(out_dir: Path, scenario: str) -> None:
     )
 
 
-# ── core correctness tests ─────────────────────────────────────────────────
+# Core correctness tests.
 
 def test_all_scenarios(tmp_path: Path) -> None:
     """All 13 scenarios produce correct metadata, stress catalog, and truth."""
@@ -130,10 +128,10 @@ def test_tra_breakpoints_in_vcf(tmp_path: Path) -> None:
             assert "END2="  in line,  f"TRA VCF missing END2: {line}"
 
 
-# ── architecture-specific tests ────────────────────────────────────────────
+# Architecture-specific tests.
 
 def test_compact_yeast_produces_small_svs(tmp_path: Path) -> None:
-    """compact_yeast scenario: all on-ref SVs must be ≤ 500 bp."""
+    """compact_yeast scenario: all on-ref SVs must be 500 bp or smaller."""
     out = tmp_path / "compact_yeast"
     run_sim(out, "compact_yeast")
     truth_lines = (out / "query_truth.tsv").read_text().strip().splitlines()
@@ -202,7 +200,7 @@ def test_annotation_output_contains_element_classes(tmp_path: Path) -> None:
             f"graph_annotations_denovo.tsv empty for {scen}"
 
 
-# ── two-speed pathogen / multi-scenario ───────────────────────────────────
+# Two-speed pathogen and multi-scenario tests.
 
 def test_two_speed_pathogen_inv_tra_ins(tmp_path: Path) -> None:
     """two_speed_pathogen_extreme must emit at least one of INV/TRA/INS."""

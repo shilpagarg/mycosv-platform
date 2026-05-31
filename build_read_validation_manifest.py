@@ -74,7 +74,7 @@ def _download_capped(url: str, dest: Path, *, max_bytes: int) -> tuple[bool, int
     """Stream `url` into `dest`, stopping after max_bytes. Idempotent.
 
     Returns (success, bytes_written). If the file already exists with non-zero
-    size we treat it as already-downloaded and skip — re-runs are cheap.
+    size we treat it as already-downloaded and skip - re-runs are cheap.
     """
     if dest.exists() and dest.stat().st_size > 0:
         return True, dest.stat().st_size
@@ -183,7 +183,7 @@ def main() -> int:
         })
         sys.stderr.write(f"[reads] {qasm}: {run_acc} {mode} {nbytes}B -> {dest}\n")
 
-    # Write manifest (only rows with usable paths — load_raw_read_validation_manifest
+    # Write manifest (only rows with usable paths - load_raw_read_validation_manifest
     # skips entries without a path).
     args.out_tsv.parent.mkdir(parents=True, exist_ok=True)
     with args.out_tsv.open("w", newline="") as fh:

@@ -64,7 +64,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 # ----------------------------------------------------- panel configuration
-# Shared base wish-list — AMF (Glomeromycota), EMF (Basidio + a few Asco),
+# Shared base wish-list - AMF (Glomeromycota), EMF (Basidio + a few Asco),
 # endophyte, filamentous Pezizomycotina, yeasts, and model-organism genera
 # already used by the 13-sample / 165-sample validations.
 BASE_GENERA="Acaulospora,Acremonium,Agaricus,Albahypha,Alternaria,Amanita,Ambispora,Archaeospora,Aspergillus,Austroboletus,Beauveria,Blaszkowskia,Boletus,Butyriboletus,Candida,Cantharellus,Cenococcum,Cetraspora,Chroogomphus,Cladosporium,Claroideoglomus,Clavulina,Colletotrichum,Cortinarius,Dentiscutata,Diversispora,Dominikia,Entrophospora,Eremothecium,Funneliformis,Fusarium,Geastrum,Geopora,Gigaspora,Glomus,Gomphidius,Gyroporus,Hebeloma,Helvella,Hydnellum,Hydnum,Hygrophorus,Inocybe,Laccaria,Lactarius,Lanmaoa,Leccinum,Lentinula,Meliniomyces,Monascus,mycorrhiza,Neurospora,Oidiodendron,Pacispora,Paecilomyces,Paraglomus,Paxillus,Penicillium,Pervetustus,Piriformospora,Pisolithus,Pleurotus,Pseudosperma,Racocetra,Redeckera,Rhizoglomus,Rhizophagus,Rhizopogon,Rhizopus,Rhizoscyphus,Russula,Saccharomyces,Sclerocystis,Scleroderma,Scutellospora,Septoglomus,Serendipita,Sieverdingia,Simiglomus,Sparassis,Sphaerosporella,Suillellus,Suillus,Talaromyces,Thelephora,Trichoderma,Tricholoma,Trichophaea,Tuber,Tulasnella,Tylopilus,Ustilago,Xerocomus,Yarrowia"
@@ -152,7 +152,7 @@ submit() {
   fi
 }
 
-# Phase A — bootstrap: runs prepare-million-real (downloads + indexes
+# Phase A - bootstrap: runs prepare-million-real (downloads + indexes
 # QUERY_COUNT queries, writes prepared/query_manifest.tsv + routing index
 # + read-validation manifest), then BOOTSTRAP_ONLY=1 exits before the
 # benchmark launches.
@@ -162,16 +162,16 @@ submit() {
 # launched 16 parallel workers each holding up to ~1.5 GB of full-base
 # graph state, plus glibc per-arena fragmentation across ~9k full-base
 # shards. 256G fits well inside `multicore` (1.5 TB/node, MaxMemPerNode
-# UNLIMITED) — no himem node needed. Tiered worker pools, streaming FASTA
+# UNLIMITED) - no himem node needed. Tiered worker pools, streaming FASTA
 # reads, and centroid roll-up in fungi_tol_bridge.hpp cut peak RSS further.
 #
 # MALLOC_ARENA_MAX / MALLOC_TRIM_THRESHOLD_: tame glibc malloc per-thread
-# arenas (default = 8 × CPU_COUNT, so 16 cores × 8 = 128 arenas, each
+# arenas (default = 8 x CPU_COUNT, so 16 cores x 8 = 128 arenas, each
 # retaining freed pages). Capping at 2 arenas and a tight trim threshold
-# returns memory to the kernel more aggressively — cheap substitute for
+# returns memory to the kernel more aggressively - cheap substitute for
 # jemalloc on a node that doesn't have it installed.
 #
-# Cores=32 not 16: multicore enforces 8192 MB/CPU, so 256G needs ≥32
+# Cores=32 not 16: multicore enforces 8192 MB/CPU, so 256G needs at least 32
 # cores. The C++ index builder still uses --tol-index-threads=16 (see
 # submit.full_fungal_assembly.sh); the extra 16 cores are pure memory
 # headroom, not extra parallelism.
@@ -184,7 +184,7 @@ BS=$(submit \
   submit.full_fungal_assembly.sh)
 echo "bootstrap_jobid=${BS}"
 
-# Phase B — N-way array, throttled to ARRAY_CONCURRENCY parallel tasks.
+# Phase B - N-way array, throttled to ARRAY_CONCURRENCY parallel tasks.
 # SKIP_PREPARE=1 reuses prepared/ from bootstrap; FORCE_RERUN_SHARDS=1
 # starts each shard from scratch (matters when bug fixes change call
 # semantics). The default catch-up profile keeps the always-on assembly
@@ -202,7 +202,7 @@ AR=$(submit \
   submit.full_fungal_assembly.sh)
 echo "array_jobid=${AR}"
 
-# Phase C — combine all shards into combined/ + master reports.
+# Phase C - combine all shards into combined/ + master reports.
 COMBINE_OVERRIDES="FULL_ASSEMBLY_SHARDS=1,RESUME_SHARDS=1,SKIP_PREPARE=1,MYCOSV_ONLY=${ARRAY_MYCOSV_ONLY},MAX_ASSEMBLY_QUERY_CONTIGS_KEEP=${ARRAY_MAX_QUERY_CONTIGS}"
 CB=$(submit \
   --dependency=afterany:${AR} \

@@ -1,6 +1,4 @@
 #!/usr/bin/env python3
-# Designed for Linux
-
 from __future__ import annotations
 
 import argparse
@@ -165,7 +163,7 @@ ENA_FILEREPORT_FIELDS = [
 # Minimum read count for an ENA run to be considered for SV calling. Below this
 # the run is almost certainly a sentinel/test upload (e.g. SRR33624766 reported
 # 1 read) and would fail every comparator with "no alignments". Picked at 1 000
-# so a single MiSeq lane (~10⁶ reads) trivially passes while obvious junk like
+# so a single MiSeq lane (~10^6 reads) trivially passes while obvious junk like
 # "1 read" / "1000 reads" deposits don't get selected and waste a download.
 _ENA_MIN_READS = 1000
 
@@ -236,8 +234,8 @@ READ_VALIDATION_FIELDS = [
     "status",
 ]
 
-# ── Long-read platform detection ───────────────────────────────────────────
-# PacBio HiFi (CCS): Revio, Sequel IIe/II CCS — ≥99 % accuracy, 10–25 kb.
+# Long-read platform detection.
+# PacBio HiFi (CCS): Revio, Sequel IIe/II CCS, >=99% accuracy, 10-25 kb.
 #   minimap2 preset:  map-hifi
 #   SV callers:       sniffles2, cuteSV (HiFi-tuned cluster params), SVIM
 # PacBio CLR (Sequel I, RS II): lower per-read accuracy.
@@ -249,7 +247,7 @@ READ_VALIDATION_FIELDS = [
 #                     Leptosphaeria, Zymoseptoria) once SNP calls are available.
 #
 # Short reads (Illumina NovaSeq / HiSeq):
-#   bwa-mem2 (or minimap2 -ax sr) → samtools sort+index → Delly / Manta.
+#   bwa-mem2 (or minimap2 -ax sr), then samtools sort/index and Delly / Manta.
 #   bwa-mem2 is the gold standard for Delly/Manta BAM inputs; minimap2 sr is
 #   used here for a single-tool dependency.
 
@@ -545,7 +543,7 @@ def _detect_cgroup_memory_max_bytes() -> int | None:
     """Return this process's cgroup v2 memory.max in bytes, or None if unset.
 
     A SIGKILL with no stderr from the binary on a 754 GiB host is almost
-    always a cgroup OOM kill — the user-slice on shared HPC login nodes is
+    always a cgroup OOM kill - the user-slice on shared HPC login nodes is
     typically capped at 12 GiB. Surfacing this up front turns a confusing
     silent kill into an actionable error.
     """
@@ -699,7 +697,7 @@ def _stream_subprocess_to_files(
             tail_err = _tail(stderr_path)
             tail_out = _tail(stdout_path)
             sys.stderr.write(
-                f"[mycosv] streamed subprocess timed out after {timeout}s — "
+                f"[mycosv] streamed subprocess timed out after {timeout}s - "
                 f"killed via SIGKILL. Stderr tail at {stderr_path}:\n"
             )
             for line in tail_err.splitlines()[-40:]:
@@ -950,7 +948,7 @@ def _http_open_with_retry(req: urllib.request.Request):
             _wait_for_ncbi_cooldown()
             _NCBI_HOST_SEM.acquire()
         # pending_sleep is the backoff we should sleep AFTER releasing the
-        # semaphore — keeping the sleep outside the host-limited region means
+        # semaphore - keeping the sleep outside the host-limited region means
         # the semaphore caps in-flight requests, not idle-waiting workers.
         pending_sleep: float = 0.0
         try:
@@ -961,7 +959,7 @@ def _http_open_with_retry(req: urllib.request.Request):
                     raise
                 retry_after = exc.headers.get("Retry-After") if exc.headers else None
                 wait = _http_retry_sleep(attempt, retry_after)
-                # 503/429 means NCBI is throttling our IP — pause every other
+                # 503/429 means NCBI is throttling our IP - pause every other
                 # worker for the longer of the per-request backoff and a 3 s
                 # floor so the server-side window can clear.
                 if throttled_host is not None and exc.code in {429, 503}:
@@ -1054,7 +1052,7 @@ def http_download(url: str, dest: Path) -> Path:
                         f"Truncated download for {url}: got {got} bytes, expected {expected}"
                     )
         # os.replace is atomic and overwrites if a concurrent writer already
-        # finished and published the same dest — both writers end up with a
+        # finished and published the same dest - both writers end up with a
         # valid file at dest, and neither raises.
         os.replace(tmp, dest)
     except Exception:
@@ -1146,13 +1144,9 @@ def subset_fastq_records(src: Path, dest: Path, max_records: int) -> tuple[Path,
                 except StopIteration:
                     break
                 except (EOFError, OSError, gzip.BadGzipFile) as exc:
-                    # ENA bulk downloads are intentionally capped at
-                    # READ_VALIDATION_MAX_BASES and frequently end mid-record
-                    # without the gzip EOF marker. Keep the complete records
-                    # decoded so far rather than discarding the whole subset;
-                    # otherwise reference-free validation and the pangenome-only
-                    # call layer lose usable complete records from partial
-                    # capped downloads.
+                    # Capped ENA downloads often end mid-record. Keep complete
+                    # records already decoded; discarding the whole subset
+                    # loses validation reads for no benefit.
                     sys.stderr.write(
                         f"[reads-mode] {src.name}: input truncated after "
                         f"{count} complete record(s) ({type(exc).__name__}); "
@@ -1378,7 +1372,7 @@ def truncate_assembly_query_inputs(
     contigs: empirically a query with <=~150 contigs finishes in minutes while
     fragmented drafts (2.7k-180k contigs) stall for hours producing only a
     trickle of calls. Rather than skip those queries (which drops them from
-    the panel — see filter_assembly_query_inputs) or let them hang, we
+    the panel - see filter_assembly_query_inputs) or let them hang, we
     materialise a subset FASTA holding only the N longest contigs and point
     MycoSV + read-validation at it. Large/whole-chromosome contigs are cheap,
     so keeping the longest ones preserves essentially all reliably-callable SV
@@ -1801,9 +1795,9 @@ SPECIES_ALIASES: dict[str, list[str]] = {
     "candida lusitaniae": ["clavispora lusitaniae"],
     "candida guilliermondii": ["meyerozyma guilliermondii"],
     "candida tropicalis": ["[candida] tropicalis"],
-    # Cryptococcus species complex split — keep both names recognised.
+    # Cryptococcus species complex split - keep both names recognised.
     "cryptococcus neoformans": ["cryptococcus neoformans var. grubii", "cryptococcus deneoformans"],
-    # Leptosphaeria maculans — split into species complex (LepmaJN3, LepmaPHW1
+    # Leptosphaeria maculans - split into species complex (LepmaJN3, LepmaPHW1
     # etc.). NCBI assemblies still use `Leptosphaeria maculans` in
     # organism_name but several MAGs / re-annotations use `Plenodomus lingam`.
     # Adding both keeps the panel selection robust against the 2017 reclass.
@@ -1812,7 +1806,7 @@ SPECIES_ALIASES: dict[str, list[str]] = {
         "leptosphaeria maculans 'lepidii'",
         "plenodomus lingam",
     ],
-    # Ustilago maydis — modern teleomorph name is Mycosarcoma maydis (2018
+    # Ustilago maydis - modern teleomorph name is Mycosarcoma maydis (2018
     # ICTF revision). NCBI assemblies still mostly carry `Ustilago maydis`
     # but newer Mexican/U.S. plant-pathology submissions use Mycosarcoma.
     "ustilago maydis": [
@@ -2027,7 +2021,7 @@ def ncbi_genbank_target(row: dict[str, str]) -> tuple[str, str]:
 # discover it once from the directory listing of pub/fungi/ and cache it.
 #
 # Per-species index: species_EnsemblFungi.txt (TSV, ~300 KB) lists every
-# species directory along with its NCBI assembly_accession and taxonomy_id —
+# species directory along with its NCBI assembly_accession and taxonomy_id -
 # small enough to fetch once and re-use across panels. We deliberately do not
 # pull species_metadata_EnsemblFungi.json (376 MB) since it is overkill for
 # accession-keyed lookup.
@@ -2173,7 +2167,7 @@ def _ensembl_fungi_gff_url(
     # that fails with "URL can't contain control characters" *before* the HTTP
     # call is even attempted. Sanitise both URL path components defensively.
     def _safe(part: str) -> str:
-        # Collapse any run of whitespace to a single underscore — matches the
+        # Collapse any run of whitespace to a single underscore - matches the
         # actual filenames Ensembl serves and dodges the urllib pre-flight check.
         return re.sub(r"\s+", "_", part)
 
@@ -2181,7 +2175,7 @@ def _ensembl_fungi_gff_url(
     assembly = _safe(assembly)
     # The whole-genome GFF filename is "<Species_Cap>.<assembly>.<release>.gff3.gz".
     # Capitalize only the first character (Ensembl convention: do NOT title-case
-    # each word — strain suffixes like "_cen_pk113_7d_gca_000269885" must stay
+    # each word - strain suffixes like "_cen_pk113_7d_gca_000269885" must stay
     # lowercase).
     species_cap = species_dir[:1].upper() + species_dir[1:]
     filename = f"{species_cap}.{assembly}.{release}.gff3.gz"
@@ -2233,10 +2227,10 @@ def download_ncbi_gene_annotation_source(
     """Download the best public gene-annotation source for one NCBI assembly.
 
     Preference order:
-      1. NCBI GFF3 (genomic.gff.gz)               — when NCBI auto-annotated it
-      2. Ensembl Fungi GFF3 (species_metadata)    — for GenBank-only assemblies
+      1. NCBI GFF3 (genomic.gff.gz)               - when NCBI auto-annotated it
+      2. Ensembl Fungi GFF3 (species_metadata)    - for GenBank-only assemblies
                                                     Ensembl re-annotates
-      3. NCBI GenBank flatfile (genomic.gbff.gz)  — gene/CDS records embedded
+      3. NCBI GenBank flatfile (genomic.gbff.gz)  - gene/CDS records embedded
                                                     in the deposited record
 
     A missing/empty annotation source is not a fatal download error: many
@@ -2294,7 +2288,7 @@ def download_ncbi_gene_annotation_source(
 # One-shot caches for downstream multi-omics signal
 #
 # Both gene-expression (Expression Atlas differential) and ecological-trait
-# (FungalTraits) data are species-keyed and slow to refetch — the EBI Atlas
+# (FungalTraits) data are species-keyed and slow to refetch - the EBI Atlas
 # JSON endpoint is paginated and FungalTraits is hosted as a single CSV. We
 # cache them under data_cache/ and reuse across panels; the prepare-step
 # stitches per-panel `expression.tsv` from the cache so the existing
@@ -2343,7 +2337,7 @@ def fetch_expression_atlas_for_species(
 
     Server-side filtering on /gxa/json/experiments is unreliable (the `species=`
     parameter is currently ignored, so a query for Fusarium oxysporum returns
-    the full Atlas catalog including Glycine max, Arabidopsis, Anopheles, …).
+    the full Atlas catalog including Glycine max, Arabidopsis, Anopheles, ...).
     We therefore fetch the full catalog ONCE, persist it as `_all.json`, and
     per-species derive `<slug>.json` by client-side filtering on the canonical
     species name. Cache is reused indefinitely; rerun by deleting the cache
@@ -2509,7 +2503,7 @@ def assemble_expression_tsv(
     query_asms that map to that species. Returns the number of rows written.
 
     The analyzer keys on query_asm, so emitting one block per query_asm
-    avoids forcing the caller to learn the species → assembly mapping.
+    avoids forcing the caller to learn the species -> assembly mapping.
     """
     rows: list[dict[str, Any]] = []
     for species, listing_path in species_to_listing.items():
@@ -2541,7 +2535,7 @@ def assemble_expression_tsv(
             # Atlas analytics carry one (log2foldchange, p-value) pair per
             # contrast; the column header encodes the contrast name as
             # "<Contrast>.log2foldchange" / "<Contrast>.p-value". We pivot
-            # the first contrast only — additional contrasts are ignored
+            # the first contrast only - additional contrasts are ignored
             # to keep expression.tsv flat, matching the analyzer schema.
             contrast: str | None = None
             l2_idx: int | None = None
@@ -2602,7 +2596,7 @@ _FUNGALTRAITS_URL = (
 # An earlier version of this fetcher pulled funguild_db.json from the
 # UMNFuN/FUNGuild GitHub repo, but that repo was removed in 2025 and every
 # known mirror now 404s. So we read FunGuild's contribution out of the
-# already-cached FungalTraits CSV — no extra HTTP fetch needed. Keeping the
+# already-cached FungalTraits CSV - no extra HTTP fetch needed. Keeping the
 # constant as None makes the fetch a graceful no-op.
 _FUNGUILD_URL = None  # disabled: upstream removed; data is sourced from
                       # FungalTraits CSV's guild_fg trait_name rows instead.
@@ -2696,7 +2690,7 @@ def write_ecological_summary_tsv(
             by_species.setdefault(species, {}).update({k: v for k, v in record.items() if v})
     # FunGuild data is folded into FungalTraits as the guild_fg trait_name
     # (1,116 species at time of writing). The pivot logic above stores it as
-    # record["guild_fg"]. Expose it as the `guild` column — FunGuild's
+    # record["guild_fg"]. Expose it as the `guild` column - FunGuild's
     # primary semantic field.
 
     rows: list[dict[str, Any]] = []
@@ -2722,7 +2716,7 @@ def write_ecological_summary_tsv(
             or record.get("trophic_mode")
             or "."
         )
-        # FunGuild guild — embedded in FungalTraits' long-form export as
+        # FunGuild guild - embedded in FungalTraits' long-form export as
         # trait_name=guild_fg. The pivot stored it as record["guild_fg"].
         guild = (
             record.get("guild_fg")
@@ -2748,7 +2742,7 @@ def write_ecological_summary_tsv(
     #     longer carries that trait_name).
     #   * Dropped `substrate_or_host` (the `substrate` trait_name has empty
     #     values in the current FungalTraits export).
-    #   * Added `guild` from guild_fg — FunGuild's contribution to the merged
+    #   * Added `guild` from guild_fg - FunGuild's contribution to the merged
     #     trait table. Downstream consumers (analyze_new_biology_candidates.py,
     #     sv_visualization_report.py) read trait fields with .get() so the
     #     schema shift is backward-compatible.
@@ -2797,7 +2791,7 @@ def parse_custom_url_manifest(path: Path) -> list[dict[str, str]]:
 def write_tsv(path: Path, rows: list[dict[str, Any]], fieldnames: list[str]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     # lineterminator="\n": csv.DictWriter defaults to "\r\n" on every platform.
-    # CRLF in TSVs silently breaks downstream consumers that don't strip \r —
+    # CRLF in TSVs silently breaks downstream consumers that don't strip \r -
     # documented bug-5 in fungi_tol_bridge.hpp (clade_manifest.tsv) and just
     # observed in ecological_traits.tsv (last column always looked like ".\r"
     # instead of ".", so substrate_or_host appeared 100% populated when it was
@@ -2927,7 +2921,7 @@ def promote_hierarchical_checkpoint(out_prefix: Path) -> dict[str, str] | None:
 
 _GFF_GENE_TYPES: frozenset[str] = frozenset({
     # NCBI / Ensembl Fungi gene-level feature types we want to surface to the
-    # SV biology analyzer. ncRNA / tRNA / rRNA are deliberately excluded — the
+    # SV biology analyzer. ncRNA / tRNA / rRNA are deliberately excluded - the
     # candidate scoring already discriminates protein-coding loci.
     "gene", "protein_coding_gene", "pseudogene",
 })
@@ -3283,7 +3277,7 @@ def ena_filereport_species_url(species: str, max_rows: int = 200) -> str:
     species lookups go through that endpoint.
 
     The scientific_name filter works against any rank ENA stores, so a genus
-    name like 'Rhizophagus' also resolves — important for AMF where
+    name like 'Rhizophagus' also resolves - important for AMF where
     species-level assignments are patchy.
     """
     query = urllib.parse.urlencode({
@@ -3355,7 +3349,7 @@ def _is_pacbio_hifi(row: dict[str, str]) -> bool:
 
     Detection order:
     1. library_strategy contains a known HiFi keyword ("CCS", "HiFi", "Hi-Fi").
-    2. instrument_model matches Revio or Sequel IIe — both are HiFi-only.
+    2. instrument_model matches Revio or Sequel IIe - both are HiFi-only.
     3. Sequel II with WGS strategy defaults to HiFi; Sequel II CLR runs
        typically carry "CLR" in library_strategy.
     """
@@ -3368,7 +3362,7 @@ def _is_pacbio_hifi(row: dict[str, str]) -> bool:
     model = (row.get("instrument_model") or "").lower()
     if any(kw in model for kw in _HIFI_MODEL_KW):
         return True
-    # Sequel II without an explicit CLR flag → assume modern HiFi workflow.
+    # Sequel II without an explicit CLR flag: assume modern HiFi workflow.
     if ("sequel ii" in model or "sequel 2" in model) and "clr" not in strategy:
         return True
     return False
@@ -3377,15 +3371,15 @@ def _is_pacbio_hifi(row: dict[str, str]) -> bool:
 def _long_read_platform_score(row: dict[str, str]) -> int:
     """Rank ENA long-read runs for selection priority (higher = preferred).
 
-    3 — PacBio HiFi (Revio / Sequel IIe / Sequel II CCS)
+    3 - PacBio HiFi (Revio / Sequel IIe / Sequel II CCS)
           Highest per-read accuracy; minimap2 map-hifi + sniffles2 / cuteSV.
-    2 — ONT PromethION or GridION
+    2 - ONT PromethION or GridION
           High-depth, likely R10.4.1 simplex in recent submissions (~Q20).
-    1 — ONT MinION / Mk1C
+    1 - ONT MinION / Mk1C
           Valid long-read data; recent kits may carry R10.4.1 chemistry.
-    0 — PacBio CLR (RS II, Sequel I)
+    0 - PacBio CLR (RS II, Sequel I)
           Lower base accuracy; minimap2 map-pb still produces usable BAMs.
-   -1 — Any other platform that passed the long-reads filter.
+   -1 - Any other platform that passed the long-reads filter.
     """
     if _is_pacbio_hifi(row):
         return 3
@@ -3418,7 +3412,7 @@ def filter_ena_rows_for_mode(rows: list[dict[str, str]], query_mode: str) -> lis
     matched = [row for row in rows if (row.get("instrument_platform") or "").upper() in preferred]
     # Hard filter: an Illumina run must not be returned for long-reads mode
     # and vice versa, otherwise downstream SV callers see mislabeled input.
-    # Drop runs with read_count below the noise floor — saw `SRR33624766: 1
+    # Drop runs with read_count below the noise floor - saw `SRR33624766: 1
     # reads` in production, which is a sentinel ENA upload and aligns to nothing.
     # When read_count is absent (older submissions), keep the row so we don't
     # over-filter species with unreliable metadata.
@@ -3536,7 +3530,7 @@ def merge_sequence_sources(sources: list[str], dest_prefix: Path) -> Path:
                 # retry against a different ENA accession.
                 sys.stderr.write(f"[reads-mode] dropping corrupt cached payload: {exc}\n")
                 # _validate_fastq_payload already unlinked the file before
-                # raising — fall through to the re-download path.
+                # raising - fall through to the re-download path.
         if out_path.exists() and out_path.stat().st_size > 0:
             return out_path
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -3577,7 +3571,7 @@ def merge_sequence_sources(sources: list[str], dest_prefix: Path) -> Path:
                         in_fh.seek(0)
                         shutil.copyfileobj(in_fh, out_fh)
             except (EOFError, OSError, gzip.BadGzipFile):
-                # The cached part is a corrupt/truncated gzip — drop it so the
+                # The cached part is a corrupt/truncated gzip - drop it so the
                 # next pool URL (or a future re-run) re-downloads instead of
                 # repeatedly failing on the same broken bytes.
                 if local_part != out_path and local_part.parent == dest_prefix.parent and local_part.exists():
@@ -3605,7 +3599,7 @@ def _validate_fastq_payload(path: Path) -> None:
         return
     if not head:
         return
-    if head[:2] == b"\x1f\x8b":  # gzipped FASTQ — content checked at consumption.
+    if head[:2] == b"\x1f\x8b":  # gzipped FASTQ - content checked at consumption.
         return
     if head[:1] != b"@":
         path.unlink(missing_ok=True)
@@ -4151,7 +4145,7 @@ def prepare_from_ncbi(args: argparse.Namespace) -> int:
     # resolve public ENA read runs for each panel species and download up to
     # --read-accessions-per-species runs per (species, mode). This is the
     # mechanism that makes benchmark_short-reads/ and benchmark_long-reads/
-    # non-empty for NCBI panels — without it the panels only produce
+    # non-empty for NCBI panels - without it the panels only produce
     # assembly-mode queries, which is why those folders were empty.
     # ------------------------------------------------------------------
     requested_read_modes: list[str] = []
@@ -4171,7 +4165,7 @@ def prepare_from_ncbi(args: argparse.Namespace) -> int:
                 continue
             default_benchmark = species_benchmark_defaults.get(species, {})
             if not default_benchmark.get("benchmark_ref_fasta"):
-                # No reference was downloaded for this species — reads-mode
+                # No reference was downloaded for this species - reads-mode
                 # benchmarks require one, so skip.
                 sys.stderr.write(
                     f"[reads-mode] skip {species!r}: no reference assembly available "
@@ -4322,7 +4316,7 @@ def prepare_from_ncbi(args: argparse.Namespace) -> int:
     # in calls.hits.tsv carry query_asm=<query asm name> and contig=<ref
     # contig>, so we duplicate every gene row under every query_asm that
     # uses that ref (per benchmark_map_rows). This makes (query_asm, ref_contig)
-    # lookups hit without forcing the analyzer to learn ref↔query joins.
+    # lookups hit without forcing the analyzer to learn ref<->query joins.
     gene_annotations_count = 0
     if gff_pairs:
         gene_annotations_path = out_dir / "gene_annotations.tsv"
@@ -4533,7 +4527,7 @@ def _genome_alignment_match_bp(
     A cross-species reference leaves almost all of the query unaligned (the
     F. falciforme vs F. oxysporum pair aligns ~4% of the genome), so the
     candidate with the largest aligned span is the closest available relative.
-    Returns 0 when minimap2 is unavailable or the alignment fails — callers
+    Returns 0 when minimap2 is unavailable or the alignment fails - callers
     treat 0 as "no proximity signal" and fall back to pool order.
     """
     mm2 = tool_path("minimap2")
@@ -4576,7 +4570,7 @@ def select_closest_benchmark_ref(
 ) -> tuple[str, str] | None:
     """Pick the (asm_name, fasta_path) whose genome aligns best to query_fa.
 
-    `candidates` should already be filtered to the most plausible pool —
+    `candidates` should already be filtered to the most plausible pool -
     conspecific genomes first, else genus-mates. At most `max_align` are
     aligned so the cost stays bounded even when a genus pool is large. If
     minimap2 is unavailable or nothing aligns, the first pool entry is
@@ -4908,8 +4902,8 @@ def sequence_bp_and_records(path: Path | None) -> tuple[int, int]:
         # READ_VALIDATION_MAX_BASES often end mid-record without the gzip
         # end-of-stream marker, which makes gzip.GzipFile raise EOFError on
         # the final read. The downstream callers (sniffles/cuteSV/SVIM/
-        # MycoSV) tolerate the truncation themselves — they just stop at
-        # the last complete record — so we should too. Without this guard
+        # MycoSV) tolerate the truncation themselves - they just stop at
+        # the last complete record - so we should too. Without this guard
         # the whole shard fails in write_sv_volume_audit even though all
         # callers succeeded.
         try:
@@ -4996,7 +4990,7 @@ def write_sv_volume_audit(
             for (coord, label), calls in truth_sets.get(query_asm, {}).items()
         }
         max_truth = max(truth_counts.values(), default=0)
-        # Raw per-comparator truth sets only — exclude the derived
+        # Raw per-comparator truth sets only - exclude the derived
         # consensus_* / read_level_union sets so the emptiness check below
         # reflects how many actual SV callers produced a usable callset.
         comparator_truth = {
@@ -5118,7 +5112,7 @@ def load_mycosv_paired_calls(
     NormalizedCall produced from the same VCF row that yielded `ref_calls[i]`.
     Lets the benchmark loop, after matching reference-coord truth vs
     reference-coord mycosv predictions, attribute the comparator-support label
-    back to the QUERY-coord call_key that `support_by_key` is indexed by — the
+    back to the QUERY-coord call_key that `support_by_key` is indexed by - the
     bridge across coordinate spaces so biology_findings.tsv can mark
     `mycosv_unique` accurately.
     """
@@ -5337,7 +5331,7 @@ def _infer_svtype_from_alleles(ref_allele: str, alt_allele: str) -> tuple[str | 
     # BND notation: ALT contains breakend brackets.
     if "[" in alt_allele or "]" in alt_allele:
         return "TRA", 0
-    # Symbolic ALT (e.g. <INS>, <DEL>) — already handled by caller; bail.
+    # Symbolic ALT (e.g. <INS>, <DEL>) - already handled by caller; bail.
     if alt_allele.startswith("<"):
         return None, 0
     diff = len(alt_allele) - len(ref_allele)
@@ -5345,7 +5339,7 @@ def _infer_svtype_from_alleles(ref_allele: str, alt_allele: str) -> tuple[str | 
         return "INS", diff
     if diff < 0:
         return "DEL", -diff
-    return None, 0  # SNV or MNV — not an SV.
+    return None, 0  # SNV or MNV - not an SV.
 
 
 def load_reference_vcf_calls(path: Path, label: str, query_asm: str) -> list[NormalizedCall]:
@@ -5436,8 +5430,8 @@ def load_minigraph_bubble_calls(bubble_bed: Path, sample_bed: Path, query_asm: s
     """Load minigraph bubble calls as a normalized comparator callset.
 
     minigraph emits one bubble per local divergence, including microsatellite
-    expansions and 30 bp indels — typical yeast assemblies produce ~1 000 bubbles
-    per sample, of which 60–80 % are sub-50 bp events that mycosv's chain caller
+    expansions and 30 bp indels - typical yeast assemblies produce ~1 000 bubbles
+    per sample, of which 60-80 % are sub-50 bp events that mycosv's chain caller
     intentionally collapses. Comparing 1 000 minigraph bubbles against
     ~20 mycosv chain-level events caps recall at ~2 % independent of correctness.
 
@@ -5573,7 +5567,7 @@ def _span_contain_applies(truth: NormalizedCall, pred: NormalizedCall) -> bool:
     span-containment lets one chain-level pred match a single fine-grained
     truth event nested inside it. The truth-loop in match_calls() still
     consumes the pred greedily, so a single coarse pred is credited for at
-    most one TP — it cannot inflate TP by claiming many fine-grained truths
+    most one TP - it cannot inflate TP by claiming many fine-grained truths
     at once.
     """
     group = canonical_group(truth.svtype)
@@ -5655,7 +5649,7 @@ def build_consensus_truth(
 ) -> list[NormalizedCall]:
     """Return SV calls supported by at least min_support of the input callsets.
 
-    Two calls "support" each other iff calls_compatible() — same coord space,
+    Two calls "support" each other iff calls_compatible() - same coord space,
     same canonical SV type, position within DEFAULT_TOL_BP, length within
     DEFAULT_TOL_LEN_FRAC. The returned set has one representative per cluster
     (the earliest-encountered call), so |consensus| <= |smallest input|.
@@ -5814,7 +5808,7 @@ def score_callsets_by_svtype(
     """Return {svtype -> metrics} stratified per canonical SV type, plus an
     "ALL" key with aggregate metrics. Filters both truth and predictions to
     each type before scoring so precision is computed against same-type
-    predictions only — a comparator that emits zero INS calls but many DEL
+    predictions only - a comparator that emits zero INS calls but many DEL
     calls scores 0/0 on INS rather than diluting the DEL row.
     """
     out: dict[str, dict[str, Any]] = {"ALL": score_callsets(truth_calls, pred_calls)}
@@ -5825,21 +5819,21 @@ def score_callsets_by_svtype(
     return out
 
 
-# ── Fungal-specific leave-one-out comparator-variance benchmark ──────────
+# Fungal-specific leave-one-out comparator-variance benchmark.
 #
 # Single-number F1 against comparator consensus hides how much of the metric is
 # driven by *which* comparators happened to be in the pool. LOO replays the
 # score K times, each time excluding one comparator; the F1 dispersion is
 # the "comparator-induced" component. Folds are also stratified by fungal-
-# specific axes — length bin (sub-TE / TE element / TE cluster / arm) and
-# element class (TE_LTR / TE_TIR / STARSHIP / HGT / RIP / ...) — so the
+# specific axes - length bin (sub-TE / TE element / TE cluster / arm) and
+# element class (TE_LTR / TE_TIR / STARSHIP / HGT / RIP / ...) - so the
 # reader can tell whether the variance is in boring small INDELs or in the
 # biologically interesting HGT / STARSHIP / >50 kb arm rearrangements.
 #
 # Length-bin boundaries reflect fungal SV biology:
 #   <500 bp        : sub-TE fragments / small accessory
-#   500 bp–5 kb    : full TE element (LTR retrotransposon, helitron, TIR)
-#   5–50 kb        : TE cluster, Starship cargo, accessory chromosome chunk
+#   500 bp-5 kb    : full TE element (LTR retrotransposon, helitron, TIR)
+#   5-50 kb        : TE cluster, Starship cargo, accessory chromosome chunk
 #   >50 kb         : whole-arm rearrangement / accessory chromosome
 _FUNGAL_LEN_BINS: tuple[tuple[int, int, str], ...] = (
     (50,        500,         "lt_500bp_subTE"),
@@ -5920,14 +5914,14 @@ def score_loo_consensus(
     """Leave-one-out comparator-variance benchmark.
 
     For K comparator callsets:
-      • Baseline: K-comparator consensus_(min_support) of K.
-      • For each comparator i, exclude i and compute consensus on the
-        remaining K-1 → leave-one-out fold; score pred against it.
+      - Baseline: K-comparator consensus_(min_support) of K.
+      - For each comparator i, exclude i and compute consensus on the
+        remaining K-1 -> leave-one-out fold; score pred against it.
     Returns per-fold metrics + F1 mean/stdev/range + the most influential
     comparator (the one whose exclusion shifts F1 most). All folds are
     additionally broken down by fungal length bin / element class / phylum.
 
-    Skipped when K < min_support + 1 — without a margin, LOO folds would
+    Skipped when K < min_support + 1 - without a margin, LOO folds would
     drop below the support threshold and emit empty truth.
     """
     K = len(comparator_callsets)
@@ -5984,9 +5978,9 @@ def score_loo_consensus(
                 best_abs = abs(delta)
                 most_influential = {"label": lbl, "delta_f1": delta}
 
-    # Verdict requires ≥2 valid fold F1 values, otherwise the "robust" label
+    # Verdict requires at least 2 valid fold F1 values, otherwise the "robust" label
     # is unearned (every fold's consensus could have been empty). >5pp swing
-    # over ≥2 folds → comparator-driven; reader should not quote a single F1
+    # over at least 2 folds is comparator-driven; readers should not quote a single F1
     # number without the swing alongside it.
     if len(f1_vals) < 2:
         verdict = "insufficient_folds"
@@ -6130,7 +6124,7 @@ def _sanitize_for_json(obj: Any) -> Any:
     the LOO doc dumps to *strict* JSON (parseable by jq, JS JSON.parse, and
     schema validators). json.dump's default `allow_nan=True` writes literal
     `NaN` tokens which Python parses back but every other JSON parser
-    rejects — so we walk the doc explicitly instead of relying on the
+    rejects - so we walk the doc explicitly instead of relying on the
     `default=` callback (which is never invoked for floats since floats
     are technically serializable)."""
     if isinstance(obj, float):
@@ -6152,12 +6146,12 @@ def diagnose_match_failures(
     row describing the closest truth candidate (same contig + same svtype
     group) and the specific reason matching failed:
 
-      contig_mismatch   — no truth call shares the predicted contig
-      type_mismatch     — same contig but no truth call shares the SV type
-      pos_out_of_tol    — same contig+type but breakpoint > DEFAULT_TOL_BP
-      svlen_out_of_tol  — close enough on pos but svlen ratio > tol_frac
-      mate_mismatch     — TRA mate contig/pos disagrees
-      no_truth_for_type — empty truth subset for the SV type
+      contig_mismatch   - no truth call shares the predicted contig
+      type_mismatch     - same contig but no truth call shares the SV type
+      pos_out_of_tol    - same contig+type but breakpoint > DEFAULT_TOL_BP
+      svlen_out_of_tol  - close enough on pos but svlen ratio > tol_frac
+      mate_mismatch     - TRA mate contig/pos disagrees
+      no_truth_for_type - empty truth subset for the SV type
 
     These rows feed a match_failures.tsv that lets the operator see at a
     glance why precision/recall is zero without re-running the benchmark.
@@ -6199,7 +6193,7 @@ def diagnose_match_failures(
             ):
                 reason = "mate_mismatch"
             else:
-                # Should be a TP if we got here — usually means pred was bumped
+                # Should be a TP if we got here - usually means pred was bumped
                 # by another pred grabbing the same truth in the greedy match.
                 reason = "claimed_by_other_pred"
             closest_pos_delta = str(pos_delta)
@@ -6316,7 +6310,7 @@ def project_ref_calls_to_query(
 
     Comparators (anchorwave, svim_asm, minigraph) emit truth in the benchmark
     reference's coordinate space. MycoSV pangenome calls live in query
-    coordinates by design — the ref-coord projection in calls.vcf is a
+    coordinates by design - the ref-coord projection in calls.vcf is a
     secondary annotation. Scoring mycosv in ref space alone biases against
     pangenome calls whose anchor chain projects to a slightly different ref
     contig than the comparator's alignment chose (the dominant
@@ -6375,7 +6369,7 @@ def _emit_per_svtype_rows(
     Lifts the row-shape from a single score_callsets() call into an
     agreement-table-ready list, with each row carrying the `svtype` column
     that the visualization layer uses to score "MycoSV vs comparator per SV
-    type" — the headline view requested for the real-data benchmark.
+    type" - the headline view requested for the real-data benchmark.
     """
     metrics_by_type = score_callsets_by_svtype(truth_calls, pred_calls)
     rows: list[dict[str, Any]] = []
@@ -6548,10 +6542,10 @@ def _samtools_count_breakpoint_support(
 ) -> int:
     """Return the number of reads with split/clipped alignments spanning the
     candidate breakpoint window. Uses `samtools view` and counts reads whose
-    CIGAR carries a soft/hard clip ≥ min_clip on either side, or that have an
-    SA tag (supplementary alignment), within ±flank_bp of the breakpoint.
+    CIGAR carries a soft/hard clip >= min_clip on either side, or that have an
+    SA tag (supplementary alignment), within +/-flank_bp of the breakpoint.
 
-    A breakpoint with ≥ K supporting reads (K=3 default elsewhere) is treated
+    A breakpoint with >= K supporting reads (K=3 default elsewhere) is treated
     as raw-data confirmed; below K it is dropped from truth.
     """
     if not tool_path("samtools"):
@@ -6597,7 +6591,7 @@ def _build_validation_bam(
     """Build a sorted+indexed BAM of the query's raw reads vs benchmark ref.
 
     For assembly-mode queries this uses the assembly contigs themselves as
-    "reads" (asm20 alignment — the benchmark ref is a diverged sibling
+    "reads" (asm20 alignment - the benchmark ref is a diverged sibling
     clade), which still surfaces split-alignment evidence at every
     assembly-supported breakpoint. For reads-mode queries the appropriate
     long/short minimap2 preset is selected.
@@ -6632,7 +6626,7 @@ def _build_validation_bam(
         # genome. asm5 (<=5% divergence) fragments the contig-vs-ref alignment
         # for cross-species fungal pairs into short MAPQ-0 blocks, so the
         # split/clip breakpoint signal never lands where the call expects it
-        # — every assembly-supported SV then fails read-validation and is
+        # - every assembly-supported SV then fails read-validation and is
         # dropped from read_validated_truth.tsv. asm20 keeps the alignment
         # coherent across the genus-level divergence these pairs actually
         # have; matches the svim_asm / syri / clade-lift presets.
@@ -6675,7 +6669,7 @@ def validate_calls_with_reads(
     """Re-anchor algorithm-derived candidate calls in the raw query data.
 
     force_external=True disables the "trust MycoSV's intrinsic support"
-    shortcut: EVERY candidate — comparator or MycoSV — must clear the
+    shortcut: EVERY candidate - comparator or MycoSV - must clear the
     external split/clipped-read threshold. This is required when the input
     is a tool-agnostic union (read_level_union): letting MycoSV calls
     self-validate via their own anchor/cluster counts would make precision
@@ -6757,7 +6751,7 @@ def validate_calls_with_reads(
                     validated if intrinsic is not None else None),
                 status="validation_unavailable",
             ))
-        # Without an alignment there is no external evidence — under
+        # Without an alignment there is no external evidence - under
         # force_external nothing can be confirmed, so the validated set is empty
         # rather than falling back to (tool-biased) intrinsic counts.
         if force_external:
@@ -6805,7 +6799,7 @@ def validate_calls_with_reads(
 
     # Build the set of contigs actually present in the validation BAM header
     # once, up front. samtools view on an absent contig returns 0 reads
-    # silently — without this guard we mis-attribute "no reads at breakpoint"
+    # silently - without this guard we mis-attribute "no reads at breakpoint"
     # to the call, when in reality the contig is on a sibling clade we never
     # aligned to. Used below to skip the breakpoint scan for those calls.
     bam_contigs: frozenset[str] = frozenset()
@@ -6834,13 +6828,13 @@ def validate_calls_with_reads(
         # `intrinsic >= min_support` as `validated=True` without consulting
         # the BAM. With the current C++ binary emitting intrinsic counts on
         # essentially every call, the shortcut fired ~100% of the time and
-        # MycoSV's "read-validation rate" became a tautology (≈ fraction of
-        # calls passing the C++ clustering threshold, which is ≈ 100% by
+        # MycoSV's "read-validation rate" became a tautology (~ fraction of
+        # calls passing the C++ clustering threshold, which is ~ 100% by
         # construction). Comparators don't get the shortcut, so the panel
         # comparison was structurally biased in MycoSV's favor.
         #
         # New behavior (Option A from the manuscript-fix audit):
-        #   * If the BAM has the call's contig → run the external split-read
+        #   * If the BAM has the call's contig, run the external split-read
         #     check exactly like comparators. The intrinsic count is recorded
         #     for diagnostics but does NOT override a failed external check.
         #     A call that fails the BAM check is marked
@@ -6851,7 +6845,7 @@ def validate_calls_with_reads(
         #     This preserves the original intent of not losing ~50% of
         #     MycoSV calls to BAM contig misses.
         #   * Query-coord assembly-mode calls keep the
-        #     "query_space_not_reference_validated" status — they're truly
+        #     "query_space_not_reference_validated" status - they're truly
         #     off-reference and can't be BAM-checked.
         if (not force_external
                 and call.source == "mycosv"
@@ -6881,7 +6875,7 @@ def validate_calls_with_reads(
                 continue
 
             if not bam_has_contig:
-                # Sibling-clade contig the BAM was never indexed against —
+                # Sibling-clade contig the BAM was never indexed against -
                 # external check would always read 0. Fall back to the
                 # intrinsic shortcut, but use a distinct status label so the
                 # aggregator can audit how many calls relied on it.
@@ -6918,7 +6912,7 @@ def validate_calls_with_reads(
         # `ref#1#CM146571.1`). The read-validation BAM is indexed by the
         # bare reference contig (`CM146571.1`), so the absence check would
         # fire for every PGGB call and mark them all
-        # `contig_absent_from_validation_bam` → read_validated=unknown.
+        # `contig_absent_from_validation_bam` maps to read_validated=unknown.
         # Strip the PanSN prefix and retry the lookup before declaring
         # the contig absent.
         if bam_contigs and contig not in bam_contigs and "#" in contig:
@@ -6960,7 +6954,7 @@ def validate_calls_with_reads(
             )
             validation_support = max(validation_support, mate_support)
         # force_external: external split-read count is the ONLY evidence that
-        # counts — intrinsic (tool-derived) support is ignored for truth
+        # counts - intrinsic (tool-derived) support is ignored for truth
         # membership so the union truth stays tool-agnostic.
         effective_support = (
             validation_support if force_external
@@ -6991,7 +6985,7 @@ def validate_calls_with_reads(
 # ASSEMBLY's local sequence at the breakpoint, aligns raw reads (long-reads
 # preferred, short-reads supported) to that mini-fasta with minimap2, and
 # counts split/clip-supporting reads at the breakpoint position inside each
-# window. Works for every SV type MycoSV emits — DEL/INS/DUP/INV use one
+# window. Works for every SV type MycoSV emits - DEL/INS/DUP/INV use one
 # window per call, TRA uses two (one per breakend, validated iff either
 # side has >= min_support).
 # ============================================================================
@@ -7028,7 +7022,7 @@ def _extract_query_window(
     seq = "".join(seq_lines).strip()
     if not seq:
         return None
-    # Breakpoint offset within the window, 1-based — used as the "pos" we
+    # Breakpoint offset within the window, 1-based - used as the "pos" we
     # ask _samtools_count_breakpoint_support to scan around.
     bp_offset = max(1, pos - win_start + 1)
     return seq, win_start, bp_offset
@@ -7079,7 +7073,7 @@ def _build_junction_window_fasta(
     written = 0
     with out_fasta.open("w") as out:
         for idx, call in enumerate(calls):
-            # Always use the query-coord contig — this validator is reference-
+            # Always use the query-coord contig - this validator is reference-
             # free, so reference-coord MycoSV calls are routed through their
             # paired query_contig field instead.
             contig = call.query_contig
@@ -7387,9 +7381,9 @@ def _ensure_clade_to_bench_paf(
     if paf_path.exists() and paf_path.stat().st_size > 0:
         return paf_path
     tmp_path = paf_path.with_suffix(".paf.part")
-    # asm20 (≥80 % identity, divergence ≤20 %) captures cross-species fungal
-    # synteny — Saccharomyces sensu stricto, Candida sister lineages, Puccinia
-    # rusts — that asm5 (intra-species) misses. Without it the lift drops most
+    # asm20 (>=80% identity, divergence <=20%) captures cross-species fungal
+    # synteny - Saccharomyces sensu stricto, Candida sister lineages, Puccinia
+    # rusts - that asm5 (intra-species) misses. Without it the lift drops most
     # sibling-clade calls because mycosv routes broadly across the family tree.
     try:
         with tmp_path.open("wb") as out:
@@ -7407,7 +7401,7 @@ def _ensure_clade_to_bench_paf(
 
 
 def _load_lift_table(paf_path: Path) -> dict[str, list[tuple[int, int, str, int, int, int]]]:
-    """Parse a PAF into {query_contig: [(qs, qe, tname, ts, te, strand), …]}
+    """Parse a PAF into {query_contig: [(qs, qe, tname, ts, te, strand), ...]}
     sorted by qs. Strand is +1 / -1.
     """
     table: dict[str, list[tuple[int, int, str, int, int, int]]] = defaultdict(list)
@@ -7440,7 +7434,7 @@ def _lift_pos(
     intervals = lift_table.get(qname)
     if not intervals:
         return None
-    # Walk linearly — n_intervals per contig is small in practice (asm5 emits
+    # Walk linearly - n_intervals per contig is small in practice (asm5 emits
     # one block per contiguous syntenic block). Binary search is only a win
     # for >>100 blocks, which would itself signal an unstable alignment.
     for qs, qe, tname, ts, te, strand in intervals:
@@ -7458,10 +7452,10 @@ def _ensure_query_to_bench_paf(
     cache_dir: Path,
     threads: int,
 ) -> Path | None:
-    """Build (or reuse) a query→benchmark_ref PAF for direct mycosv projection.
+    """Build (or reuse) a query->benchmark_ref PAF for direct mycosv projection.
 
-    Unlike _ensure_clade_to_bench_paf (which goes pangenome-clade→bench), this
-    aligns the QUERY assembly directly to the benchmark reference — the same
+    Unlike _ensure_clade_to_bench_paf (which goes pangenome-clade->bench), this
+    aligns the QUERY assembly directly to the benchmark reference - the same
     alignment svim_asm and anchorwave use internally. We then project mycosv's
     query-coord calls through this PAF, putting mycosv into the SAME coordinate
     space as every single-reference comparator. Result: no coord-space leak,
@@ -7507,7 +7501,7 @@ def project_mycosv_to_benchmark_ref(
     This is the canonical fix for the coordinate-space leak that gave 95%
     `contig_mismatch` in match_failures.tsv: every mycosv call lives on a
     query contig (e.g. PQFF01000002.1), every comparator lives on a benchmark-
-    ref contig (e.g. QKWP01000306.1). Without a query→ref projection, the two
+    ref contig (e.g. QKWP01000306.1). Without a query->ref projection, the two
     sides never intersect.
 
     Returns one NormalizedCall per input that successfully lifts; calls whose
@@ -7604,7 +7598,7 @@ def _lift_calls_to_benchmark_ref(
             continue
         clade = call.ref_asm or "."
         if clade in {".", "", "OFF_REFERENCE"}:
-            # No clade info — keep the call on its native ref_contig so it
+            # No clade info - keep the call on its native ref_contig so it
             # still scores for `reference_any_clade` rows; the bench_contigs
             # filter at the caller will drop it from the strict reference row.
             out.append(call)
@@ -7630,7 +7624,7 @@ def _lift_calls_to_benchmark_ref(
         lifted_start = _lift_pos(table, call.ref_contig, call.pos)
         if lifted_start is None:
             # PAF exists but does not cover this breakpoint. Keep the call
-            # on its original clade contig — see comment above.
+            # on its original clade contig - see comment above.
             out.append(call)
             continue
         lifted_end = _lift_pos(table, call.ref_contig, call.end) or lifted_start
@@ -7768,7 +7762,7 @@ def compile_binary_if_needed(binary_path: Path, force: bool = False) -> None:
     lock_path = binary_path.with_suffix(binary_path.suffix + ".lock")
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     # flock(2) on the bmh01-rds NFS share returns ENOLCK ("No locks available")
-    # under SLURM array contention — the prior panel lost ~half its shards to
+    # under SLURM array contention - the prior panel lost ~half its shards to
     # exactly this when the binary looked stale (a .hpp newer than the binary)
     # and dozens of tasks raced to lock+rebuild. The submit wrapper prebuilds a
     # current binary with a NODE-LOCAL lock before the array launches, so a
@@ -7834,7 +7828,7 @@ def estimate_prepared_genome_size_hint(
 
     The hint feeds the C++ binary's reads-mode auto-tuner (coverage estimate,
     minimum cluster support). Returning the *first* ref's size was wrong for
-    mixed-phyla panels — a 12 Mbp yeast hint applied to a 30 Mbp Aspergillus
+    mixed-phyla panels - a 12 Mbp yeast hint applied to a 30 Mbp Aspergillus
     query (or, worse, a 700 Mbp Gigaspora) makes coverage estimates orders
     of magnitude off. For filtered benchmark runs, use the selected query rows
     rather than the whole mixed manifest; otherwise a Fusarium-only long-read
@@ -7948,16 +7942,9 @@ def run_mycosv(
     # with multi-species refs benefit greatly from routing; without it the binary would
     # try to load all refs into a flat graph and produce 0 calls across phyla).
     hierarchy_manifest = prepared_dir / "hierarchy_manifest.tsv"
-    # MYCOSV_FORCE_FLAT_QUERY routes queries straight to the flat ref-list
-    # aligner against the benchmark ref subset, skipping hierarchical routing.
-    # GUARD: read modes only (long-/short-reads). Assembly mode is deliberately
-    # excluded so this can never alter the assembly benchmark -- assembly has few
-    # contigs, where hierarchical routing is cheap and improves cross-phylum
-    # recall. Read modes emit thousands of pseudo-contigs after the minimizer-
-    # clustering fix, which the per-contig hierarchical router cannot process in
-    # feasible time (a 47-contig sample already exhausted the 6h tool timeout),
-    # so they align flat against the conspecific+neighbor benchmark ref subset
-    # and still get the single-reference-vs-pangenome-only comparison.
+    # MYCOSV_FORCE_FLAT_QUERY: route read-mode queries to the flat ref-list
+    # aligner against the benchmark ref subset. Assembly mode stays hierarchical
+    # (few contigs, routing is cheap and improves cross-phylum recall).
     force_flat_query = (
         mode in {"long-reads", "short-reads"}
         and ref_list_override is not None
@@ -8066,7 +8053,7 @@ def run_mycosv(
     )
     # The streaming path already wrote to disk; the in-memory `result.stdout`
     # / `result.stderr` carry only the tail. The non-streaming path (older
-    # callers) returns full bytes — write them too so existing log layout
+    # callers) returns full bytes - write them too so existing log layout
     # is preserved either way.
     if result.stdout and not calls_stdout_log.exists():
         calls_stdout_log.write_text(result.stdout, encoding="utf-8")
@@ -8235,7 +8222,7 @@ def run_syri_for_query(query_row: dict[str, str], out_dir: Path, threads: int) -
     except subprocess.CalledProcessError as exc:
         # SyRI rejects highly divergent pairs (e.g. cross-genus assemblies)
         # with a non-zero exit. Treat as "no comparator output" rather than
-        # propagating the failure up to abort the whole panel — but capture
+        # propagating the failure up to abort the whole panel - but capture
         # the actual stderr so the operator can distinguish "no syntenic
         # region" (the expected divergence case) from a missing chromosome,
         # SAM parse error, or pysam crash that needs different remediation.
@@ -8328,13 +8315,13 @@ def run_pggb_for_query(query_row: dict[str, str], out_dir: Path, threads: int, i
     if pair_fa is None:
         return None
 
-    # pggb wraps wfmash → seqwish → smoothxg → vg deconstruct, and the
+    # pggb wraps wfmash, seqwish, smoothxg, and vg deconstruct; the
     # combined pipeline returns rc=2 when wfmash produces zero homologous
     # mappings.  Two predictable failure modes we can short-circuit:
-    #   (a) pair.fa contains <2 records — `build_pair_fasta` writes ref then
+    #   (a) pair.fa contains <2 records - `build_pair_fasta` writes ref then
     #       query, but if either FASTA was empty after gz decompression we
     #       end up with a single sequence and pggb's `-n 2` fails immediately.
-    #   (b) the longest sequence is shorter than the segment length — wfmash
+    #   (b) the longest sequence is shorter than the segment length - wfmash
     #       can't pick a single segment and emits "no segment found".
     n_records, _, longest = _fasta_stats(pair_fa)
     if n_records < 2:
@@ -8417,7 +8404,7 @@ def run_pggb_for_query(query_row: dict[str, str], out_dir: Path, threads: int, i
 #
 # All of these consume a sorted-indexed BAM of query reads aligned to the
 # reference and produce a reference-coordinate VCF that
-# load_reference_vcf_calls() already knows how to parse — so the truth_set
+# load_reference_vcf_calls() already knows how to parse - so the truth_set
 # plumbing in benchmark_real_data() picks them up the same way pggb does.
 # ============================================================================
 
@@ -8429,19 +8416,19 @@ def _minimap2_align_reads(
     *,
     preset: str,
 ) -> tuple[Path, Path] | None:
-    """Align reads to the benchmark reference with minimap2 → sorted+indexed BAM.
+    """Align reads to the benchmark reference with minimap2 -> sorted+indexed BAM.
 
     Preset routing (set by _long_read_preset / callers):
       map-hifi  PacBio HiFi CCS (Revio, Sequel IIe, Sequel II CCS)
       map-pb    PacBio CLR (RS II, Sequel I)
-      map-ont   ONT — R10.4.1 simplex and R9.4.1 both use this preset
+      map-ont   ONT - R10.4.1 simplex and R9.4.1 both use this preset
       sr        Illumina short reads (bwa-mem2 is an alternative for
                 Delly / Manta pipelines that mandate BWA-formatted RG headers)
 
     The resulting BAM can feed:
-      • sniffles2 / SVIM / cuteSV  for long-read SV calling
-      • Delly / Manta              for short-read SV calling
-      • WhatsHap phase + haplotag  for haplotype-phased variant calling in
+      - sniffles2 / SVIM / cuteSV  for long-read SV calling
+      - Delly / Manta              for short-read SV calling
+      - WhatsHap phase + haplotag  for haplotype-phased variant calling in
         dikaryotic or diploid fungi (Puccinia, Leptosphaeria, Zymoseptoria)
 
     Returns (bam_path, ref_path) or None if prerequisites are not met.
@@ -8506,11 +8493,11 @@ def _long_read_preset(query_row: dict[str, str]) -> str:
     """Return the minimap2 long-read alignment preset for this query.
 
     map-hifi  PacBio HiFi CCS (Revio, Sequel IIe, Sequel II CCS).
-              Tuned for ≥99 % accuracy reads; incompatible with CLR data.
+              Tuned for >=99 % accuracy reads; incompatible with CLR data.
     map-pb    PacBio CLR (RS II, Sequel I, Sequel II in CLR mode).
-    map-ont   Oxford Nanopore — covers R9.4.1 and R10.4.1 simplex.
+    map-ont   Oxford Nanopore - covers R9.4.1 and R10.4.1 simplex.
               R10.4.1 on PromethION/GridION yields ~Q20 average; the same
-              minimap2 preset applies, though Sniffles2 ≥v2.2 accepts
+              minimap2 preset applies, though Sniffles2 >=v2.2 accepts
               --long-read-model ont_r10_q20 for a marginal recall boost.
     """
     platform = (query_row.get("instrument_platform") or "").strip().upper()
@@ -8546,7 +8533,7 @@ def run_svim_for_query(query_row: dict[str, str], out_dir: Path, threads: int) -
     # SVIM 2.0 + matplotlib 3.9 crashes in its final plotting step with
     # `AttributeError: 'Legend' object has no attribute 'legendHandles'`
     # (renamed to `legend_handles`). The VCF is written *before* the plot
-    # step so a non-zero exit is harmless — we keep the VCF and continue.
+    # step so a non-zero exit is harmless - we keep the VCF and continue.
     try:
         run(
             ["svim", "alignment", str(svim_out), str(bam_sorted), str(ref_fa)],
@@ -8562,7 +8549,7 @@ def run_svim_for_query(query_row: dict[str, str], out_dir: Path, threads: int) -
         legend_bug = "legendHandles" in (tail or "")
         sys.stderr.write(
             f"[warn] svim exited non-zero for {query_asm} "
-            f"({'matplotlib legend bug — VCF unaffected' if legend_bug else 'see stderr'}), "
+            f"({'matplotlib legend bug - VCF unaffected' if legend_bug else 'see stderr'}), "
             f"keeping VCF output{tail}\n"
         )
         return {"label": "svim", "vcf": str(vcf_path)}
@@ -8576,7 +8563,7 @@ def run_svim_for_query(query_row: dict[str, str], out_dir: Path, threads: int) -
 def run_sniffles_for_query(query_row: dict[str, str], out_dir: Path, threads: int) -> dict[str, str] | None:
     """Sniffles2: long-read SV caller. Emits a reference-coordinate VCF.
 
-    For ONT R10.4.1 simplex reads, Sniffles2 ≥v2.2 accepts
+    For ONT R10.4.1 simplex reads, Sniffles2 >=v2.2 accepts
     --long-read-model ont_r10_q20, which improves recall on ~Q20 data.
     We try the model flag first and fall back silently if unsupported.
     PacBio HiFi reads work with Sniffles2 defaults (the map-hifi BAM RG
@@ -8715,7 +8702,7 @@ def run_manta_for_query(query_row: dict[str, str], out_dir: Path, threads: int) 
         return None
     bam_sorted, ref_fa = aligned
     run_dir = work_dir / "manta_run"
-    # Manta refuses to overwrite an existing run dir — clean it out first.
+    # Manta refuses to overwrite an existing run dir - clean it out first.
     if run_dir.exists():
         shutil.rmtree(run_dir, ignore_errors=True)
     try:
@@ -8835,7 +8822,7 @@ def run_cactus_for_query(
 def _fasta_stats(fa: Path) -> tuple[int, int, int]:
     """Return (n_records, total_bp, longest_bp) for a (possibly gzipped) FASTA.
     Used by comparator pre-checks to skip pairs that would deterministically
-    blow up the downstream tool — e.g. fragmented MAG queries that defeat
+    blow up the downstream tool - e.g. fragmented MAG queries that defeat
     SyRI's chrmatch heuristic, or pairs with too-short contigs that fall
     below pggb's segment length."""
     n_records = 0
@@ -8914,7 +8901,7 @@ def run_svim_asm_for_query(query_row: dict[str, str], out_dir: Path, threads: in
     # asm20 (divergence <=20%), NOT asm5 (<=5%). The benchmark reference is a
     # held-out *sibling-clade* genome, so query vs ref is a cross-species
     # fungal pair. asm5 on such a pair yields only short, ambiguous
-    # alignments — every record comes back MAPQ 0 — and svim-asm's
+    # alignments - every record comes back MAPQ 0 - and svim-asm's
     # min_mapq=20 filter then discards them all ("Found 0 candidates"),
     # giving truth_calls=0 and F1=nan for the diverged samples. asm20 keeps
     # the cross-species synteny minimap2 can actually anchor; it matches the
@@ -9012,7 +8999,7 @@ def run_anchorwave_for_query(query_row: dict[str, str], out_dir: Path, threads: 
     # Step 1: minimap2 asm20 alignment as AnchorWave input seeds.
     # asm20, not asm5: the benchmark reference is a held-out sibling-clade
     # genome. asm5 (<=5% divergence) leaves a cross-species fungal pair almost
-    # entirely unaligned — only ~0.2 Mb of a 53 Mb genome — so `paftools call`
+    # entirely unaligned - only ~0.2 Mb of a 53 Mb genome - so `paftools call`
     # downstream emits an empty VCF and anchorwave's truth_calls pin at 0 with
     # F1=nan. This mirrors the asm20 fix already applied to the svim_asm and
     # read-validation paths for the same reason.
@@ -9112,7 +9099,7 @@ def run_per_query_in_parallel(
 
     `runner` must take (query_row, out_dir, per_query_threads) and return the
     per-query result dict (or None). Failures on a single query are caught,
-    logged, and recorded via _log_comparator_failure — they do not abort the
+    logged, and recorded via _log_comparator_failure - they do not abort the
     other queries in the pool. Returns {query_asm: result_or_None}.
     """
     from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -9139,7 +9126,7 @@ def run_per_query_in_parallel(
             except subprocess.TimeoutExpired as exc:
                 sys.stderr.write(
                     f"[warn] {label} timed out for {qa} after "
-                    f"{_COMPARATOR_TIMEOUT}s — continuing other queries\n"
+                    f"{_COMPARATOR_TIMEOUT}s - continuing other queries\n"
                 )
                 _log_comparator_failure(out_dir, label, qa, f"timeout:{exc}")
                 results[qa] = None
@@ -9519,7 +9506,7 @@ def write_mycosv_novel_biology_enrichment(
         # group_b is the MycoSV recurrent background: calls that are NOT
         # MycoSV-unique because they are single-reference-equivalent,
         # pangenome-locus-deduplicated, or carry a comparator supporter. It is
-        # NOT a comparator-validated set — when the benchmark reference is
+        # NOT a comparator-validated set - when the benchmark reference is
         # cross-species the comparators confirm almost nothing, so this group
         # is dominated by single-reference-equivalent MycoSV calls. The
         # contrast is therefore within-MycoSV (unique vs recurrent); the count
@@ -9580,7 +9567,7 @@ def write_mycosv_novel_biology_enrichment(
 # call is independently supported by a comparator AND by external read evidence;
 # "moderate" by one of the two; "intrinsic_only" means the call cleared the C++
 # clustering floor (SUPPORT>=2) but no external signal could be re-anchored
-# (sibling-clade contig absent from the validation BAM, low query coverage, …);
+# (sibling-clade contig absent from the validation BAM, low query coverage, ...);
 # "weak" is the rare residual where even MycoSV's intrinsic count is <=1. The
 # panorama panel in the report shows these so an unvalidatable-but-real MycoSV
 # call surfaces as "intrinsic_only" rather than disappearing from the F1 plots.
@@ -9779,7 +9766,7 @@ def write_mycosv_validation_followup(
 def _annotate_comparator_truth_quality(rows: list[dict[str, Any]]) -> None:
     """Stamp each row with a comparator_truth_quality flag.
 
-    Comparators disagree wildly on some queries — e.g. minigraph emits 7295
+    Comparators disagree wildly on some queries - e.g. minigraph emits 7295
     "truth" SVs on a Trichoderma genome where svim_asm sees 784 and
     anchorwave 97 (bubble over-segmentation). Computing F1 against any
     single comparator in that situation is misleading: the F1 is dominated
@@ -10181,7 +10168,7 @@ def _auto_enable_comparators(args: argparse.Namespace) -> None:
     if skipped:
         for tool_name, absent in skipped:
             sys.stderr.write(
-                f"[comparators] {tool_name}: missing {', '.join(absent)} — "
+                f"[comparators] {tool_name}: missing {', '.join(absent)} - "
                 f"run install_tools.sh to install\n"
             )
     if not enabled:
@@ -10202,7 +10189,7 @@ def benchmark_real_data(args: argparse.Namespace) -> int:
     # "mycosv-vs-baseline per SV type" panel is never empty. Minigraph is
     # the assembly-mode baseline; Delly/Manta cover short-reads; Sniffles2
     # and cuteSV cover long-reads. Read-level validation (samtools-driven
-    # split-read counting) runs in every mode independently — see
+    # split-read counting) runs in every mode independently - see
     # validate_calls_with_reads(). --mycosv-only disables this forcing for
     # the million-real flow where comparators are out of scope.
     _MANDATORY_BASELINES_BY_MODE: dict[str, list[tuple[str, list[str]]]] = {
@@ -10232,7 +10219,7 @@ def benchmark_real_data(args: argparse.Namespace) -> int:
             for tool_name, absent in missing_baselines:
                 sys.stderr.write(
                     f"[comparators] WARNING: {tool_name} (mandatory {args.mode} "
-                    f"baseline) is missing binaries {', '.join(absent)} — install "
+                    f"baseline) is missing binaries {', '.join(absent)} - install "
                     f"via install_tools.sh; the per-SV-type wins panel will be "
                     f"thin without it.\n"
                 )
@@ -10268,7 +10255,7 @@ def benchmark_real_data(args: argparse.Namespace) -> int:
     # Filter to rows whose query_mode matches the requested benchmark mode.
     # Without this, running `--mode long-reads` on a prepared dir that only
     # contains assembly queries would feed FASTA paths to MycoSV as if they
-    # were reads and silently produce empty VCFs — which is exactly what made
+    # were reads and silently produce empty VCFs - which is exactly what made
     # benchmark_long-reads/ appear empty for NCBI panels.
     if args.mode in {"assembly", "short-reads", "long-reads"}:
         query_manifest = [row for row in full_manifest if (row.get("query_mode") or "assembly") == args.mode]
@@ -10386,7 +10373,7 @@ def benchmark_real_data(args: argparse.Namespace) -> int:
     # neighborhood of phylogenetically related refs from prepared_dir.
     #
     # Strategy: start with the per-query benchmark refs, then give each query
-    # a fair share of NEIGHBOR_REF_CAP — adding genus → family → order → class
+    # a fair share of NEIGHBOR_REF_CAP; adding genus, family, order, and class
     # neighbors until the cap is filled. The C++ binary enforces
     # --max-ref-memory-mb, so an over-broad list is safe; missing related refs
     # is much more damaging than carrying a bounded neighborhood.
@@ -10404,7 +10391,7 @@ def benchmark_real_data(args: argparse.Namespace) -> int:
     # itself as a "neighbor." The query is registered in hierarchy_manifest.tsv
     # under its own genus, so without this exclusion the chain-search anchors
     # snap to the query's own contigs (perfect self-identity), suppressing
-    # every DUP/TRA call and forcing Path C into the OFF_REF tile sweep —
+    # every DUP/TRA call and forcing Path C into the OFF_REF tile sweep -
     # observed on the F. falciforme vs F. oxysporum Fo47 run as 0 DUP, 0 TRA,
     # and 3,584 phantom NOVEL_WEAK windows.
     for row in query_manifest:
@@ -10430,7 +10417,7 @@ def benchmark_real_data(args: argparse.Namespace) -> int:
     # scattering the callset across sibling species (observed: only 24/121
     # F. falciforme long-read calls routed to the conspecific, the rest to
     # F. acuminatum / tricinctum / oxysporum). Keep the panel to the per-query
-    # benchmark refs. Assembly mode still gets neighbors — its MEM-chain
+    # benchmark refs. Assembly mode still gets neighbors - its MEM-chain
     # search genuinely needs related refs for cross-genome SV discovery.
     reads_mode = (getattr(args, "mode", "") or "").lower() in {"long-reads", "short-reads"}
     hierarchy_path = prepared_dir / "hierarchy_manifest.tsv"
@@ -10586,9 +10573,9 @@ def benchmark_real_data(args: argparse.Namespace) -> int:
             Path(mycosv_paths["vcf"]), query_asm,
         )
         # `ref_to_query_keys` is a parallel list (same length, same order as
-        # r_calls). The phase-1 lift fallback preserves order and length —
+        # r_calls). The phase-1 lift fallback preserves order and length -
         # every input ref-call yields exactly one output, with at most pos/end
-        # rewritten — so this index mapping survives the lift step at 6755
+        # rewritten - so this index mapping survives the lift step at 6755
         # below. After bench_contigs filtering we propagate the original index
         # alongside each kept ref-call so the support-tracking step at 6905
         # can still reach back to the QUERY-coord call_key for the same VCF
@@ -10618,7 +10605,7 @@ def benchmark_real_data(args: argparse.Namespace) -> int:
     # SyRI / minigraph / pggb produce comparator callsets when they succeed; any tool
     # failure on a single query (SyRI's CalledProcessError on weak alignments,
     # minigraph crashes on huge gaps, pggb timeouts) is captured here so it
-    # does not abort the entire benchmark — surviving comparators still
+    # does not abort the entire benchmark - surviving comparators still
     # contribute to exact_benchmark_summary.tsv.
     # Comparators are scheduled across queries via run_per_query_in_parallel so
     # the 5-query x N-tool fan-out stays inside the per-mode wall budget.
@@ -10698,8 +10685,8 @@ def benchmark_real_data(args: argparse.Namespace) -> int:
             )
 
     # ------------------------------------------------------------------
-    # Read-based SV callers: long-reads → SVIM / Sniffles / cuteSV,
-    #                        short-reads → Delly / Manta.
+    # Read-based SV callers: long-reads use SVIM / Sniffles / cuteSV;
+    # short-reads use Delly / Manta.
     # Each produces a reference-coordinate VCF; load_reference_vcf_calls
     # handles normalization. Failures on a single query don't abort the run.
     # ------------------------------------------------------------------
@@ -10815,7 +10802,7 @@ def benchmark_real_data(args: argparse.Namespace) -> int:
         query_asm = query_row["query_asm"]
         mycosv_query_calls = mycosv_calls_by_query.get(query_asm, {}).get("query", [])
         mycosv_ref_calls_all = mycosv_calls_by_query.get(query_asm, {}).get("reference", [])
-        # Parallel to mycosv_ref_calls_all (same length, same order) — gives us
+        # Parallel to mycosv_ref_calls_all (same length, same order) - gives us
         # the QUERY-coord call_key for each ref-coord call, even after the lift
         # rewrites pos/end. Used below to propagate per-comparator support back
         # to the right entry in support_by_key.
@@ -10841,7 +10828,7 @@ def benchmark_real_data(args: argparse.Namespace) -> int:
                 threads=args.threads,
             )
             # Coordinate-space-leak fix: directly project mycosv QUERY-coord
-            # calls into benchmark-ref space using a query→benchmark_ref PAF.
+            # calls into benchmark-ref space using a query-to-benchmark_ref PAF.
             # This catches the (large) population of mycosv calls that have no
             # REFCONTIG (so the cross-clade lift above could not touch them)
             # but DO have a syntenic mapping to the benchmark reference. Without
@@ -10858,12 +10845,12 @@ def benchmark_real_data(args: argparse.Namespace) -> int:
                 )
             except Exception as exc:
                 sys.stderr.write(
-                    f"[projection] {query_asm}: query→bench projection failed "
+                    f"[projection] {query_asm}: query->bench projection failed "
                     f"({type(exc).__name__}: {exc}); using PAF-lift output alone\n"
                 )
                 projected_pairs = []
             if projected_pairs:
-                # Union by call_key — never duplicates an existing ref-space call.
+                # Union by call_key - never duplicates an existing ref-space call.
                 existing_keys = {call_key(c) for c in mycosv_ref_calls_all}
                 added_keys: list[tuple[str, str, int, int, str]] = []
                 for proj_call, src_query in projected_pairs:
@@ -10905,12 +10892,12 @@ def benchmark_real_data(args: argparse.Namespace) -> int:
         }
         # Count single-reference-equivalent at the query-LOCUS level (not the
         # post-projection ref-locus level) so the value stays bounded by
-        # `total_loci` and satisfies single_ref + pangenome_only ≤ total_loci.
+        # `total_loci` and satisfies single_ref + pangenome_only <= total_loci.
         # The earlier `len(mycosv_ref_calls)` was the post-projection ref-locus
         # count: when a query locus projected to multiple ref loci via the
-        # query→benchmark_ref PAF (added by the coordinate-space-leak fix above),
+        # query-to-benchmark_ref PAF (added by the coordinate-space-leak fix above),
         # it got multi-counted, inflating single_ref past total_loci and
-        # collapsing pangenome_lift_pct ~30× across the panel.
+        # collapsing pangenome_lift_pct ~30x across the panel.
         single_ref_equivalent_counts[query_asm] = len(
             single_ref_equivalent_loci_by_query[query_asm]
         )
@@ -11086,7 +11073,7 @@ def benchmark_real_data(args: argparse.Namespace) -> int:
                     "min_split_reads": args.read_validation_min_support,
                 }
 
-        # Fix B: "any-clade" rows — score every reference-space comparator
+        # Fix B: "any-clade" rows - score every reference-space comparator
         # against the *unfiltered* mycosv ref-coord set so the operator can
         # tell apart "mycosv called the wrong thing" from "mycosv called the
         # right thing on the wrong reference clade". Same truth, different
@@ -11110,8 +11097,8 @@ def benchmark_real_data(args: argparse.Namespace) -> int:
         # contig_mismatch dominance in match_failures.tsv that arises when
         # mycosv's pangenome-anchor projection lands on a different ref
         # contig than the comparator's minimap2 chose. Comparators that have
-        # no PAF/BAM trace (minigraph bubbles, pggb graph) are skipped here —
-        # the projection requires query↔ref alignment evidence.
+        # no PAF/BAM trace (minigraph bubbles, pggb graph) are skipped here -
+        # the projection requires query<->ref alignment evidence.
         q2r_paf = out_dir / "comparators" / "anchorwave" / query_asm / "q2r.srt.paf"
         if q2r_paf.exists() and mycosv_query_calls:
             for (coord_space, label), truth_calls in list(truth_for_query.items()):
@@ -11139,11 +11126,11 @@ def benchmark_real_data(args: argparse.Namespace) -> int:
                     "projection_source": "anchorwave_q2r_paf",
                 }
 
-        # Comparator consensus per coord_space — a candidate call is in the
+        # Comparator consensus per coord_space: a candidate call is in the
         # consensus iff it is supported by >=2 comparators (calls_compatible
         # across position+length+type tolerance). This dilutes single-tool
         # bias (e.g. minigraph's bubble-extraction conservatism, svim_asm's
-        # alt-allele preference) by keeping only events that ≥2 independent
+        # alt-allele preference) by keeping only events that at least 2 independent
         # callers agree on, then scores mycosv against that consensus.
         for coord_space in ("query", "reference"):
             ref_labels = [
@@ -11170,14 +11157,14 @@ def benchmark_real_data(args: argparse.Namespace) -> int:
                 consensus_label
             ] = score_callsets(consensus_calls, pred_calls)
 
-            # ── Leave-one-out comparator-variance benchmark ──────────────
+            # Leave-one-out comparator-variance benchmark.
             # Replays the consensus K times, each time excluding one
             # comparator, and reports the F1 dispersion + the most
             # influential comparator. Fungal-specific strata (length bin /
             # element class / phylum) let the reader see whether the
             # variance lives in boring small INDELs or in the biologically
-            # interesting HGT / STARSHIP / arm-level events. Needs ≥3
-            # comparators so each LOO fold still has ≥2 left to vote.
+            # interesting HGT / STARSHIP / arm-level events. Needs at least 3
+            # comparators so each LOO fold still has at least 2 left to vote.
             phylum_label = str(query_row.get("phylum", ".") or ".")
             if len(ref_labels) >= 3:
                 loo_inputs = {
@@ -11202,7 +11189,7 @@ def benchmark_real_data(args: argparse.Namespace) -> int:
                     loo=loo,
                 ))
             else:
-                # LOO needs ≥3 comparators (each fold has K-1 ≥ 2 left so
+                # LOO needs at least 3 comparators; each fold has K-1 >= 2 left so
                 # consensus_2of_(K-1) is well-defined). Without it we'd
                 # silently emit an empty loo_consensus_summary.tsv and the
                 # operator would have no idea why. Emit an explicit skipped
@@ -11292,7 +11279,7 @@ def benchmark_real_data(args: argparse.Namespace) -> int:
                 # Apples-to-apples comparator scoring: each algorithmic
                 # comparator is now ALSO scored as a predictor against the
                 # same read-validated truth, per SV type. This populates the
-                # "MycoSV vs comparator per SV type — wins matrix" panel in
+                # "MycoSV vs comparator per SV type - wins matrix" panel in
                 # the visualization (method=<comparator_label> rows alongside
                 # the existing method=mycosv row, all under the shared
                 # truth_label=consensus_..._read_supported).
@@ -11385,8 +11372,8 @@ def benchmark_real_data(args: argparse.Namespace) -> int:
             if read_validation_summary.keys() - {"min_split_reads", "mode"}:
                 summary_json["queries"][query_asm]["read_validation"] = read_validation_summary
 
-            # ── Tool-agnostic raw-read validation (read_level_union) ───────
-            #   An SV is independently validated iff the RAW READS support it — regardless of
+            # Tool-agnostic raw-read validation (read_level_union).
+            #   An SV is independently validated iff the raw reads support it, regardless of
             #   which caller (if any) proposed it. We pool every caller's
             #   candidate loci (all comparators + MycoSV) into a per-coord
             #   union, then keep only those clearing the external split/
@@ -11409,7 +11396,7 @@ def benchmark_real_data(args: argparse.Namespace) -> int:
                 }
             for coord_space in (() if not external_read_validation else ("reference", "query")):
                 # NOTE (truth-construction): the union truth set is built from
-                # COMPARATOR calls only — never include MycoSV's own predictions.
+                # COMPARATOR calls only - never include MycoSV's own predictions.
                 # Including them inflated recall to 1.0 by construction (every
                 # read-validated MycoSV pred appeared in both truth and pred),
                 # which made the read_level_union row useless as a benchmark.
@@ -11459,7 +11446,7 @@ def benchmark_real_data(args: argparse.Namespace) -> int:
                     "read_validated": len(read_level_truth),
                     "min_split_reads": args.read_validation_min_support,
                 }
-                # Same tool-agnostic truth, every comparator as predictor —
+                # Same tool-agnostic truth, every comparator as predictor -
                 # populates the per-SV-type wins matrix on equal footing.
                 for (cs, cmp_label), cmp_calls in truth_for_query.items():
                     if cs != coord_space:
@@ -11491,7 +11478,7 @@ def benchmark_real_data(args: argparse.Namespace) -> int:
 
         # Reference-free read-level validation of MycoSV's own calls. Built
         # on raw reads (long-reads preferred, short-reads supported) aligned
-        # to a junction-window mini-fasta cut from the QUERY ASSEMBLY — no
+        # to a junction-window mini-fasta cut from the QUERY ASSEMBLY - no
         # benchmark reference is consulted. This lets pangenome-only / off-
         # reference calls clear the read-validation bar that the BAM-to-
         # benchmark-ref path structurally rejects, which is the prerequisite
@@ -11910,7 +11897,7 @@ def prepare_million_real(args: argparse.Namespace) -> int:
     # Parallel download. The serial loop spent ~3 h on ~3300/10000 rows in
     # production because every NCBI fetch was synchronous; threading is safe
     # since materialize_entry is per-URL and disk-cached. Workers are tunable
-    # via MILLION_REAL_DOWNLOAD_WORKERS. Lowered from 8 → 6 after the
+    # via MILLION_REAL_DOWNLOAD_WORKERS. Lowered from 8 to 6 after the
     # 2026-05-15 prep run (slurm-14936460) still produced hundreds of 503
     # retries with 8 workers; defense-in-depth comes from the
     # _NCBI_HOST_SEM/_NCBI_COOLDOWN pair above, which throttles even when
@@ -12003,7 +11990,7 @@ def prepare_million_real(args: argparse.Namespace) -> int:
     # cache_dir, and N workers racing on first-fetch would all call
     # http_download() against the same .part file. Warming serially upfront
     # populates the on-disk cache, after which every worker hits the fast
-    # path. Errors here are non-fatal — _ensembl_fungi_gff_url tolerates a
+    # path. Errors here are non-fatal - _ensembl_fungi_gff_url tolerates a
     # missing index and falls through to NCBI GBFF.
     if download_gff:
         try:
@@ -12042,20 +12029,20 @@ def prepare_million_real(args: argparse.Namespace) -> int:
                 last_progress_t = now
 
     if not ref_manifest_rows:
-        raise RuntimeError("No assemblies were successfully downloaded — aborting indexing.")
+        raise RuntimeError("No assemblies were successfully downloaded - aborting indexing.")
     print(f"      downloaded/cached {download_count} assemblies (examined {examined})", flush=True)
     annot_summary = annotation_source_summary()
     if annot_summary:
         print(f"      {annot_summary}", flush=True)
 
-    # ── Hold out a small subset as MycoSV-only benchmark queries ─────────────
+    # Hold out a small subset as MycoSV-only benchmark queries.
     # The downstream `benchmark` sub-command is fed by query_manifest.tsv +
     # ref_list.txt; without these, the million-real artifact is just an index
     # with no end-to-end SV-call/biology/visualization payload. Reserve K
     # assemblies as queries (sampled stride-uniformly across phyla so we get
     # taxonomic diversity even when --max-assemblies is small), and exclude
     # them from the index manifest. Per-query benchmark_ref_fasta is the
-    # closest sibling in the same genus → family → phylum, falling back to
+    # closest sibling in the same genus, family, or phylum, falling back to
     # the first ref so read-level validation has SOMETHING to align against.
     n_queries = max(0, int(getattr(args, "million_real_queries", 0) or 0))
     n_queries = min(n_queries, max(0, len(ref_manifest_rows) - 1))
@@ -12191,7 +12178,7 @@ def prepare_million_real(args: argparse.Namespace) -> int:
             # Prefer a non-metagenomic candidate at every taxonomic level
             # before falling back to any candidate. A `uncultured ...`
             # benchmark ref pairs the held-out query against a MAG of unknown
-            # assembly quality, which produces noisy SV truth — keep them as a
+            # assembly quality, which produces noisy SV truth - keep them as a
             # last resort rather than the first match.
             for bucket, key in (
                 (by_genus, qrow.get("genus", ".") or "."),
@@ -12283,13 +12270,11 @@ def prepare_million_real(args: argparse.Namespace) -> int:
             flush=True,
         )
 
-    # ── Optional: pull public ENA reads for each held-out query species so
-    # ────── the million-real bench step can also exercise short-reads /
-    # ────── long-reads modes (matching the per-panel real-data flow).
-    # ────── Without this, only `benchmark_assembly/` is ever populated.
-    # ────── Each (query, mode) pair appends a new row to the query manifest;
-    # ────── benchmark filters by mode at run time so the assembly-mode
-    # ────── invocation continues to see only the assembly rows.
+    # Optional: pull public ENA reads for each held-out query species so the
+    # million-real bench step can exercise short-read and long-read modes.
+    # Without this, only `benchmark_assembly/` is populated. Each (query, mode)
+    # pair appends a row to the query manifest; benchmark filters by mode at
+    # run time, so assembly-mode invocations still see only assembly rows.
     include_reads = bool(getattr(args, "million_real_include_reads", False))
     if include_reads and query_manifest_rows:
         modes_arg = getattr(args, "million_real_read_modes", "both") or "both"
@@ -12617,7 +12602,7 @@ def prepare_million_real(args: argparse.Namespace) -> int:
                 # for samples whose holdout assignment changed are stale.
                 # That's a graceful degradation: missing rows just leave a
                 # call's gene context blank instead of producing wrong output.
-                # Avoids the 5–6 h re-stream cost of 24 k GFF/GBFF sources.
+                # Avoids the 5-6 h re-stream cost of 24 k GFF/GBFF sources.
                 immutable_keys = (
                     "source",
                     "max_assemblies_requested",
@@ -12638,7 +12623,7 @@ def prepare_million_real(args: argparse.Namespace) -> int:
                     print(
                         f"      gene_annotations: soft cache hit on {gene_annotations_path} "
                         f"({gene_annotations_count} rows; immutable fields match). "
-                        f"Holdout drift: +{len(added)} / -{len(dropped)} query asms — "
+                        f"Holdout drift: +{len(added)} / -{len(dropped)} query asms - "
                         f"per-query alias rows may be stale for the changed samples; "
                         f"gene records themselves are unchanged.",
                         flush=True,
@@ -12936,7 +12921,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     # Reads-mode queries for the held-out species: pull public ENA runs so
     # the million-real bench can also exercise short-reads (Illumina) and
-    # long-reads (PacBio HiFi / ONT R10.4 etc.) modes — without these,
+    # long-reads (PacBio HiFi / ONT R10.4 etc.) modes - without these,
     # only benchmark_assembly/ ever gets populated.  The per-mode queries
     # share the held-out assembly's benchmark_ref_fasta (closest sibling),
     # so per-query truth alignment still works.  Off by default to keep
@@ -13058,7 +13043,7 @@ def build_parser() -> argparse.ArgumentParser:
                          "(or in the project conda env). The most robust way to get truth-set rows "
                          "in exact_benchmark_summary.tsv without naming each comparator individually.")
     sb.add_argument("--mycosv-only", action="store_true",
-                    help="Run MycoSV only — no algorithmic comparators (minigraph/syri/cactus/"
+                    help="Run MycoSV only - no algorithmic comparators (minigraph/syri/cactus/"
                          "svim-asm/anchorwave/sniffles/cuteSV/svim/Delly/Manta) are launched, "
                          "and the per-mode mandatory-baseline forcing in benchmark_real_data is "
                          "disabled. Used by the million-real flow where comparators are out of "
@@ -13091,8 +13076,8 @@ def build_parser() -> argparse.ArgumentParser:
                     help="Cap long-read FASTQ records used by external comparators "
                          "and read validation. 0 disables subsetting (default: 200000). "
                          "Bumped from 20000 because at the lower cap svim / sniffles / "
-                         "cuteSV produce zero SV calls on ~60–80 Mbp fungal genomes "
-                         "(0.02–2× coverage) — which is why the headline TSVs were "
+                         "cuteSV produce zero SV calls on ~60-80 Mbp fungal genomes "
+                         "(0.02-2x coverage) - which is why the headline TSVs were "
                          "dominated by status=no_truth.")
     sb.add_argument("--mycosv-use-full-reads", action="store_true",
                     help="In read modes, pass the original full FASTQ to MycoSV "
@@ -13186,8 +13171,8 @@ def build_parser() -> argparse.ArgumentParser:
                          "breakpoint to keep an SV in the read-validated "
                          "validated callset (default: 2). The C++ MycoSV pipeline "
                          "clusters at SUPPORT=2; defaulting validation to 3 "
-                         "auto-failed ~50–90 %% of mycosv short-read calls "
-                         "even though each call already had ≥2 cluster reads.")
+                         "auto-failed ~50-90 %% of mycosv short-read calls "
+                         "even though each call already had >=2 cluster reads.")
     sb.add_argument("--read-validation-flank-bp", type=int, default=250,
                     help="Window around each breakpoint where supporting "
                          "split/clipped reads are counted (default: 250 bp).")

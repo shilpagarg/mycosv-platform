@@ -54,7 +54,7 @@ except Exception:
     _from_memberships = None
 
 
-# Publication-style defaults — applied once at module import so every figure
+# Publication-style defaults - applied once at module import so every figure
 # (including the legacy bar/scatter calls) inherits clean spines, larger
 # fonts, and consistent typography. The Okabe-Ito palette is color-blind safe.
 if plt is not None:
@@ -99,12 +99,12 @@ PALETTE = {
 }
 
 SVTYPE_PALETTE = {
-    "INS": "#E69F00",  # orange — gain
-    "DEL": "#56B4E9",  # blue   — loss
+    "INS": "#E69F00",  # orange - gain
+    "DEL": "#56B4E9",  # blue   - loss
     "INV": "#009E73",  # green
     "DUP": "#CC79A7",  # pink
     "TRA": "#D55E00",  # vermilion
-    "OFF_REF": "#0072B2",  # dark blue — novel
+    "OFF_REF": "#0072B2",  # dark blue - novel
 }
 
 SCOPE_PALETTE = {
@@ -326,7 +326,7 @@ def save_circos_sv_landscape(
     # Pick top N contigs by call count to keep the plot legible.
     contig_sizes: dict[str, int] = {}
     for c, rows in by_contig.items():
-        # Approximate contig length as max(end) — good enough for binning.
+        # Approximate contig length as max(end) - good enough for binning.
         max_end = 0
         for r in rows:
             end = as_int(r.get("end")) or (as_int(r.get("pos")) + abs(as_int(r.get("svlen"))))
@@ -362,7 +362,7 @@ def save_circos_sv_landscape(
         sector.text(contig, size=8, r=95)
         size = sector.size
 
-        # Outer stacked-type histogram track (r 60..88) — radii must be in 0..100.
+        # Outer stacked-type histogram track (r 60..88) - radii must be in 0..100.
         outer_track = sector.add_track((60, 88), r_pad_ratio=0.05)
         outer_track.axis(fc="#FAFAFA", ec="#CCCCCC", lw=0.5)
         # x-tick labels every ~quarter of the contig (tick method lives on
@@ -872,7 +872,7 @@ def save_two_speed_scatter(
 
 
 # =====================================================================
-# Panel-fold figures (Figure 1 of the manuscript) — read every per-query
+# Panel-fold figures (Figure 1 of the manuscript) - read every per-query
 # shard under a by_query/ directory and produce one figure per claim across
 # all samples. These are the validation panels: per-sample read-validation
 # rate (Fig 1A) and per-sample pangenome-lift stacked bars (Fig 1B).
@@ -1488,7 +1488,7 @@ def build_manuscript_table1(
                 pass
 
     # Count shards excluded by the MYCOSV_FAILED.txt gate so the caption can
-    # disclose them — manuscript tables should never silently drop samples.
+    # disclose them - manuscript tables should never silently drop samples.
     total_panel_shards = sum(1 for p in by_query_dir.iterdir() if p.is_dir())
     failed_shards = sum(
         1 for p in by_query_dir.iterdir()
@@ -2596,7 +2596,7 @@ def main(argv: list[str] | None = None) -> int:
         if fig.exists():
             figures.append(fig)
 
-        # Manhattan-style SV density along contigs — scales further than
+        # Manhattan-style SV density along contigs - scales further than
         # circos when the contig list is long.
         fig = outdir / "sv_density_manhattan.png"
         save_manhattan_sv_density(
@@ -2607,7 +2607,7 @@ def main(argv: list[str] | None = None) -> int:
         if fig.exists():
             figures.append(fig)
 
-        # Two-speed genome scatter — TE/RIP/HGT density vs other-class
+        # Two-speed genome scatter - TE/RIP/HGT density vs other-class
         # density per window. The Möller-Stukenbrock diagnostic.
         fig = outdir / "two_speed_genome_scatter.png"
         save_two_speed_scatter(
@@ -2679,7 +2679,7 @@ def main(argv: list[str] | None = None) -> int:
         save_heatmap(fig, ecology_table, title="Ecological mode by MycoSV genome-biology class")
         figures.append(fig)
 
-        # Hierarchically-clustered, row-z-scored heatmap of the same matrix —
+        # Hierarchically-clustered, row-z-scored heatmap of the same matrix -
         # surfaces class-specific eco enrichments that the raw-count heatmap
         # buries under the dominant RIP/TE rows.
         fig = outdir / "ecology_biology_clustermap.png"
