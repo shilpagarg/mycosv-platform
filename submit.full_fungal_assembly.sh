@@ -112,26 +112,29 @@ echo "anchorwave:        $(command -v anchorwave || echo MISSING)"
 # Python compile_binary_if_needed() also takes an flock, but a single
 # serialized build here keeps the per-task path a fast no-op.
 #
-# The lock file lives on node-local TMPDIR (or /tmp) because flock(2) on the
-# bmh01-rds NFS share returns ENOLCK ("No locks available") under array
-# contention. With the
-# lock local to the node, array tasks only contend with siblings on the same
-# node (rare for 32-CPU tasks) and a fresh binary mtime lets them no-op the
-# lock entirely.
+# Use a node-local lock because flock(2) can return ENOLCK on the shared NFS
+# mount under array contention. A fresh binary mtime lets array tasks skip the
+# lock and rebuild path entirely.
 MYCOSV_BIN="${MYCOSV_BIN:-${PROJECT_DIR}/fungi_graphsv_tol_bin}"
 BIN_LOCK="${BIN_LOCK:-${TMPDIR:-/tmp}/$(basename "${MYCOSV_BIN}").${USER}.lock}"
 if [[ -x "${MYCOSV_BIN}" && "${FORCE_PREBUILD:-0}" != "1" ]]; then
   BIN_MTIME=$(stat -c %Y "${MYCOSV_BIN}" 2>/dev/null || echo 0)
-  # Newest of main.cpp and every *.hpp. This must match Python _needs_build(),
-  # which also checks headers. Comparing only main.cpp meant a newer .hpp left
-  # the binary "stale" by the Python's reckoning, so each array task tried to
-  # lock+rebuild on the NFS share and ~half hit ENOLCK ("No locks available").
+  # Match Python _needs_build(): main.cpp plus headers. Header-only changes
+  # must make the binary stale here too, otherwise array tasks rebuild later.
   SRC_MTIME=$(stat -c %Y "${PROJECT_DIR}/main.cpp" ${PROJECT_DIR}/*.hpp 2>/dev/null | sort -nr | head -1)
   SRC_MTIME="${SRC_MTIME:-0}"
   if (( BIN_MTIME >= SRC_MTIME && BIN_MTIME > 0 )); then
     echo "[prebuild] ${MYCOSV_BIN} mtime ${BIN_MTIME} >= newest source ${SRC_MTIME} (main.cpp + *.hpp); skipping lock+rebuild"
     SKIP_PREBUILD=1
   fi
+fi
+# Array tasks share one binary; rebuilding it while sibling tasks execute it can
+# SIGBUS long-read panels. Require a serial prebuild unless explicitly allowed.
+# Non-array bootstrap/interactive runs still build normally below.
+if [[ "${SKIP_PREBUILD:-0}" != "1" && -n "${SLURM_ARRAY_TASK_ID:-}" && "${ALLOW_ARRAY_REBUILD:-0}" != "1" ]]; then
+  echo "[prebuild] REFUSING to rebuild inside array task ${SLURM_ARRAY_TASK_ID}: ${MYCOSV_BIN} is stale vs sources (main.cpp + *.hpp)." >&2
+  echo "[prebuild] Pre-build serially first so all array tasks skip the rebuild and never race on the lock-less NFS mount (set ALLOW_ARRAY_REBUILD=1 only if you accept the SIGBUS risk)." >&2
+  exit 2
 fi
 if [[ "${SKIP_PREBUILD:-0}" != "1" ]]; then
   echo "[prebuild] ensuring ${MYCOSV_BIN} is up to date (lock=${BIN_LOCK})"
