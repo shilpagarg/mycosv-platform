@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 import os
 import shutil
 import sys
@@ -44,30 +45,95 @@ MANIFEST_FIELDS = [
 ]
 
 
-def _pick_runs_for_query(row: dict[str, str], *, max_runs: int) -> tuple[list[str], list[dict[str, str]], str]:
-    """Return (urls, ena_meta_rows, mode) for a query row, preferring long reads."""
+def _assembly_accession_from_query(row: dict[str, str]) -> str:
+    """Recover a dotted GCA/GCF accession from query_manifest rows."""
+    for key in ("assembly_accession", "accession", "current_accession"):
+        acc = (row.get(key) or "").strip()
+        if acc.startswith(("GCA_", "GCF_")) and "." in acc:
+            return acc
+    qasm = (row.get("query_asm") or "").strip()
+    if qasm.startswith(("GCA_", "GCF_")):
+        stem, _, version = qasm.rpartition("_")
+        if stem and version.isdigit():
+            return f"{stem}.{version}"
+    path = (row.get("path") or "").strip()
+    name = Path(path).name
+    for prefix in ("GCA_", "GCF_"):
+        if prefix in name:
+            start = name.index(prefix)
+            token = name[start:].split("_", 2)
+            if len(token) >= 2 and token[1].split(".", 1)[0].isdigit():
+                acc = "_".join(token[:2])
+                if "." in acc:
+                    return acc
+    return ""
+
+
+def _fetch_assembly_biosample(row: dict[str, str]) -> str:
+    """Return the BioSample tied to this exact assembly, or empty string."""
+    acc = _assembly_accession_from_query(row)
+    if not acc:
+        return ""
+    url = f"https://api.ncbi.nlm.nih.gov/datasets/v2alpha/genome/accession/{acc}/dataset_report"
+    try:
+        with urllib.request.urlopen(url, timeout=60) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+    except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError) as exc:
+        sys.stderr.write(f"[reads] {row.get('query_asm', acc)}: assembly metadata lookup failed: {exc}\n")
+        return ""
+    reports = payload.get("reports") or []
+    if not reports:
+        return ""
+    biosample = ((reports[0].get("assembly_info") or {}).get("biosample") or {})
+    return str(biosample.get("accession") or "").strip()
+
+
+def _pick_runs_for_query(
+    row: dict[str, str],
+    *,
+    max_runs: int,
+    allow_species_fallback: bool,
+) -> tuple[list[str], list[dict[str, str]], str, str]:
+    """Return (urls, ena_meta_rows, mode, lookup_basis), preferring long reads.
+
+    By default this only uses reads tied to the exact submitted run or assembly
+    BioSample. Species-level fallback can select reads from a different isolate,
+    which is not independent validation for the held-out assembly.
+    """
     run_acc = (row.get("run_accession") or "").strip()
     candidates: list[dict[str, str]] = []
+    basis = ""
     if run_acc and run_acc != ".":
         try:
             candidates = fetch_ena_read_runs(run_acc)
+            basis = f"run:{run_acc}"
         except Exception as exc:  # network or parse error
             sys.stderr.write(f"[reads] {row['query_asm']}: run lookup {run_acc} failed: {exc}\n")
     if not candidates:
-        species = (row.get("species") or row.get("scientific_name") or "").strip()
-        if species and species != ".":
+        biosample = _fetch_assembly_biosample(row)
+        if biosample:
             try:
-                candidates = fetch_ena_read_runs_by_species(species, max_rows=200)
+                candidates = fetch_ena_read_runs(biosample)
+                basis = f"biosample:{biosample}"
             except Exception as exc:
-                sys.stderr.write(f"[reads] {row['query_asm']}: species lookup '{species}' failed: {exc}\n")
+                sys.stderr.write(f"[reads] {row['query_asm']}: BioSample lookup {biosample} failed: {exc}\n")
     if not candidates:
-        return [], [], "long-reads"
+        if allow_species_fallback:
+            species = (row.get("species") or row.get("scientific_name") or "").strip()
+            if species and species != ".":
+                try:
+                    candidates = fetch_ena_read_runs_by_species(species, max_rows=200)
+                    basis = f"species:{species}"
+                except Exception as exc:
+                    sys.stderr.write(f"[reads] {row['query_asm']}: species lookup '{species}' failed: {exc}\n")
+        if not candidates:
+            return [], [], "long-reads", basis or "exact_accession_or_biosample"
 
     for mode in ("long-reads", "short-reads"):
         urls, meta = select_ena_read_sources(candidates, mode, max_runs)
         if urls:
-            return urls, meta, mode
-    return [], [], "long-reads"
+            return urls, meta, mode, basis
+    return [], [], "long-reads", basis
 
 
 def _download_capped(url: str, dest: Path, *, max_bytes: int) -> tuple[bool, int]:
@@ -119,6 +185,10 @@ def main() -> int:
                          "(~1-2M PacBio HiFi or ~600k ONT reads)")
     ap.add_argument("--max-runs-per-query", type=int, default=1,
                     help="cap number of ENA runs fetched per query (default 1)")
+    ap.add_argument("--allow-species-fallback", action="store_true",
+                    help="allow reads from any ENA run matching the species if "
+                         "the exact run/BioSample has no reads. Off by default "
+                         "because this can mix isolates.")
     ap.add_argument("--force", action="store_true",
                     help="re-emit manifest even if it exists")
     args = ap.parse_args()
@@ -144,13 +214,17 @@ def main() -> int:
         qasm = (q.get("query_asm") or "").strip()
         if not qasm:
             continue
-        urls, meta, mode = _pick_runs_for_query(q, max_runs=args.max_runs_per_query)
+        urls, meta, mode, basis = _pick_runs_for_query(
+            q,
+            max_runs=args.max_runs_per_query,
+            allow_species_fallback=args.allow_species_fallback,
+        )
         if not urls:
             sys.stderr.write(f"[reads] {qasm}: no public ENA reads found\n")
             availability_log.append({
                 "query_asm": qasm,
                 "status": "reads_unavailable",
-                "reason": "no_ena_run_for_species_or_accession",
+                "reason": f"no_ena_run_for_{basis}",
             })
             continue
         # Download the first FASTQ URL only (multi-file pair handled by mycosv).
@@ -174,12 +248,12 @@ def main() -> int:
             "library_layout": meta[0].get("library_layout", "."),
             "run_accession": run_acc,
             "source_url": url,
-            "status": f"downloaded:{nbytes}B",
+            "status": f"downloaded:{nbytes}B:{basis}",
         })
         availability_log.append({
             "query_asm": qasm,
             "status": "available",
-            "reason": f"{run_acc}:{nbytes}B",
+            "reason": f"{basis}:{run_acc}:{nbytes}B",
         })
         sys.stderr.write(f"[reads] {qasm}: {run_acc} {mode} {nbytes}B -> {dest}\n")
 

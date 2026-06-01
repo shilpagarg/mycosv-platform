@@ -950,6 +950,10 @@ def aggregate_panel_read_validation(
     read-validated, which the BAM-to-benchmark-ref file structurally cannot
     do). Dedup is on (ref_contig, pos, end, svtype) inside each (query, source)
     bucket so a call appearing in both files is counted once.
+
+    Intrinsic-only MycoSV assembly anchors are intentionally excluded here.
+    Rows only enter this panel when an external/reference-free validation
+    attempt produced a definitive `validated` or `not_validated` status.
     """
     rows: list[dict[str, object]] = []
     for qname, shard in _iter_shards(by_query_dir):
@@ -966,6 +970,9 @@ def aggregate_panel_read_validation(
                 for r in reader:
                     src = (r.get("source") or "").strip()
                     if not src:
+                        continue
+                    status = (r.get("status") or "").strip()
+                    if status not in {"validated", "not_validated"}:
                         continue
                     try:
                         key = (
@@ -1938,26 +1945,37 @@ def build_manuscript_table2_longread(
             for r in csv.DictReader(fh, delimiter="\t"):
                 if (r.get("coordinate_space") or "") != "reference":
                     continue
-                if (r.get("validation_basis") or "") != "comparator_baseline":
-                    continue
                 if (r.get("svtype") or "") != "ALL":
                     continue
                 if (r.get("status") or "") != "ok":
                     continue
+                # Only the full MycoSV-as-predictor rows. The summary also emits
+                # method=mycosv_read_supported (a stricter pred subset) and
+                # method=<caller> (the comparator scored against a truth); mixing
+                # them conflated MycoSV's call count with its read-supported subset
+                # and made the reported F1 depend on TSV row order.
+                if (r.get("method") or "") != "mycosv":
+                    continue
+                basis = (r.get("validation_basis") or "")
                 label = (r.get("truth_label") or "").lower()
                 try:
                     truth_n = int(r.get("truth_calls") or 0)
                     pred_n = int(r.get("pred_calls") or 0)
+                    tp_n = int(r.get("tp") or 0)
                     f1 = float(r.get("f1") or 0)
                 except ValueError:
                     continue
-                if label in LR_LABELS:
+                if basis == "comparator_baseline" and label in LR_LABELS:
+                    # truth_calls = that caller's own callset size; pred_calls =
+                    # MycoSV's reference-projected callset (constant across labels).
                     comp_calls[label] = truth_n
                     comp_f1[label] = f1
                     if mycosv_calls == 0 and pred_n > 0:
                         mycosv_calls = pred_n
-                elif label == "consensus_2of_3":
-                    consensus_count = max(consensus_count, truth_n)
+                elif basis == "comparator_agreement" and label == "consensus_2of_3":
+                    # MycoSV calls intersecting the 2-of-3 long-read consensus =
+                    # the true positives of MycoSV vs that consensus truth set.
+                    consensus_count = max(consensus_count, tp_n)
 
         # MycoSV's own VCF row count (split-read fallback if comparator rows absent)
         my_vcf = shard / "mycosv" / "calls.vcf"

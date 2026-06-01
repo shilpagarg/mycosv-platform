@@ -155,3 +155,26 @@ def test_aggregate_panel_read_validation_unions_bam_and_refree(tmp_path: Path) -
     assert rec["total"] == 3
     assert rec["yes"] == 3
     assert rec["rate"] == 1.0
+
+
+def test_aggregate_panel_read_validation_excludes_intrinsic_anchors(tmp_path: Path) -> None:
+    plot = _load_plot_module()
+    by_query = tmp_path / "by_query"
+    shard = by_query / "q1"
+    shard.mkdir(parents=True)
+    header = (
+        "query_asm\tref_contig\tpos\tend\tsvtype\tsource\tcoord_space\t"
+        "read_support\tvalidation_support\tsupport_source\tread_validated\tstatus\n"
+    )
+    (shard / "read_validated_truth.tsv").write_text(
+        header
+        + "q1\tctgA\t100\t200\tDEL\tmycosv\tquery\t8\t-1\tmycosv_assembly_anchors\tyes\tvalidation_unavailable\n"
+        + "q1\tctgC\t300\t400\tINV\tmycosv\tquery\t8\t-1\tmycosv_assembly_anchors\tyes\tquery_space_not_reference_validated\n"
+        + "q1\tctgB\t50\t50\tINS\tmycosv\tquery\t-1\t5\texternal_validation\tyes\tvalidated\n",
+        encoding="utf-8",
+    )
+    out = tmp_path / "panel_read_validation_rate.tsv"
+    rows = plot.aggregate_panel_read_validation(by_query, out)
+    rec = [r for r in rows if r["source"] == "mycosv"][0]
+    assert rec["total"] == 1
+    assert rec["yes"] == 1

@@ -1,9 +1,5 @@
 #!/usr/bin/env python3
-"""Build a Nature Biotechnology-style assembly-mode Figure 1.
-
-This composite is intentionally assembly-only. Long-read data are reserved for
-Table 2, and the panel-200 run is reserved for Figure 2.
-"""
+"""Build a Nature Biotechnology-style assembly-mode Figure 1."""
 
 from __future__ import annotations
 
@@ -122,7 +118,7 @@ def short_species(name: str) -> str:
 
 
 def add_panel_label(ax, label: str) -> None:
-    ax.text(-0.12, 1.08, label, transform=ax.transAxes, fontsize=13,
+    ax.text(-0.12, 1.09, label, transform=ax.transAxes, fontsize=16,
             fontweight="bold", va="bottom", ha="left")
 
 
@@ -147,17 +143,33 @@ def plot_validation(ax, rv_rows, sample_order, sample_label) -> None:
                 color=CALLER_COLOR[caller], mec="white", mew=0.5,
                 elinewidth=1.0, capsize=2.2, alpha=0.95, zorder=3,
             )
+        if not by_sample.get(sample):
+            ax.text(
+                i, 0.52, "exact\nreads\nn/a",
+                ha="center", va="center", fontsize=9.0, color="#555555",
+                fontweight="bold",
+                linespacing=0.9,
+                bbox={
+                    "boxstyle": "round,pad=0.18",
+                    "facecolor": "#F3F3F3",
+                    "edgecolor": "#D0D0D0",
+                    "linewidth": 0.6,
+                },
+                zorder=2,
+            )
     ax.set_ylim(-0.04, 1.18)
+    ax.set_xlim(-0.55, len(sample_order) - 0.45)
     ax.set_yticks([0.0, 0.25, 0.5, 0.75, 1.0])
-    ax.set_ylabel("Read-validation rate")
+    ax.set_ylabel("Read-validation rate", fontweight="bold")
     ax.set_xticks(range(len(sample_order)))
     ax.set_xticklabels([sample_label[s] for s in sample_order], rotation=30, ha="right",
-                       fontstyle="italic")
+                       fontstyle="italic", fontweight="bold")
     ax.tick_params(axis="x", pad=2)
     ax.axhline(1.0, color="#CCCCCC", lw=0.6, zorder=1)
     ax.grid(axis="y", color="#EAEAEA", lw=0.6)
     ax.set_axisbelow(True)
-    ax.set_title("Independent support across five assemblies", loc="left", pad=22)
+    ax.set_title("Independent support across five assemblies", loc="left", pad=24,
+                 fontweight="bold")
     add_panel_label(ax, "a")
 
 
@@ -182,14 +194,18 @@ def plot_pangenome_lift(ax, lift_rows, sample_order, sample_label) -> None:
         pct_labels.append((y, pct))
     pct_x = max_total * 1.08
     for y, pct in pct_labels:
-        ax.text(pct_x, y, f"{pct:.0f}%", va="center", ha="left", fontsize=8.2, color="#222222")
-    ax.text(pct_x, -0.74, "pangenome-\nonly", va="bottom", ha="left", fontsize=7.6, color="#555555")
+        ax.text(pct_x, y, f"{pct:.0f}%", va="center", ha="left", fontsize=9.4,
+                color="#222222", fontweight="bold")
+    ax.text(pct_x, -0.74, "pangenome-\nonly", va="bottom", ha="left", fontsize=8.6,
+            color="#555555", fontweight="bold")
     ax.set_xlim(0, max_total * 1.22)
     ax.set_yticks(y_positions)
-    ax.set_yticklabels([sample_label[s] for s in sample_order], fontstyle="italic")
+    ax.set_yticklabels([sample_label[s] for s in sample_order], fontstyle="italic",
+                       fontweight="bold")
     ax.invert_yaxis()
-    ax.set_xlabel("MycoSV loci by representability class")
-    ax.set_title("Pangenome-only loci dominate assembly calls", loc="left")
+    ax.set_xlabel("MycoSV loci by representability class", fontweight="bold")
+    ax.set_title("Pangenome-only loci dominate assembly calls", loc="left",
+                 fontweight="bold")
     ax.grid(axis="x", color="#EAEAEA", lw=0.6)
     ax.set_axisbelow(True)
     add_panel_label(ax, "b")
@@ -207,7 +223,7 @@ def add_clean_legends(fig, ax_a, ax_b) -> None:
         loc="lower left",
         bbox_to_anchor=(0.0, 1.04),
         frameon=False,
-        fontsize=8,
+        fontsize=9.2,
         columnspacing=1.1,
         handletextpad=0.32,
         borderaxespad=0,
@@ -225,7 +241,7 @@ def add_clean_legends(fig, ax_a, ax_b) -> None:
         loc="upper left",
         bbox_to_anchor=(bbox.x0, bbox.y0 - 0.035),
         frameon=False,
-        fontsize=7.8,
+        fontsize=9.0,
         handlelength=1.2,
         columnspacing=1.25,
         handletextpad=0.4,
@@ -254,14 +270,15 @@ def plot_svlen_violin(ax, calls, sample_order, sample_label) -> None:
         ax.vlines(i, q1, q3, color="#333333", lw=2.1, zorder=4)
     ax.set_xticks(range(len(sample_order)))
     ax.set_xticklabels([sample_label[s] for s in sample_order], rotation=30, ha="right",
-                       fontstyle="italic")
-    ax.set_ylabel("SV length")
+                       fontstyle="italic", fontweight="bold")
+    ax.set_ylabel("SV length", fontweight="bold")
     ticks = [2, 3, 4, 5, 6]
     ax.set_yticks(ticks)
     ax.set_yticklabels([f"$10^{t}$" for t in ticks])
     ax.set_ylim(1.7, 6.25)
     ax.grid(axis="y", color="#E5E5E5", lw=0.7)
-    ax.set_title("SV-size spectra span focal and chromosome-scale events", loc="left")
+    ax.set_title("SV-size spectra span focal and chromosome-scale events", loc="left",
+                 fontweight="bold")
     add_panel_label(ax, "c")
 
 
@@ -289,18 +306,19 @@ def plot_density(ax, calls, sample_order, sample_label, bin_size: int = 100_000)
         for x, (_key, count) in enumerate(ranked):
             ax.scatter(x, y, s=10 + 18 * (count / max_count), color=cmap(norm(count)),
                        edgecolor="none", alpha=0.9)
-        ax.text(-8, y, sample_label[sample], va="center", ha="right", fontsize=8,
-                fontstyle="italic")
+        ax.text(-8, y, sample_label[sample], va="center", ha="right", fontsize=9,
+                fontstyle="italic", fontweight="bold")
     ax.set_ylim(-0.6, len(sample_order) - 0.4)
     ax.invert_yaxis()
     ax.set_yticks([])
     ax.set_xticks([])
-    ax.set_xlabel("Contig-ordered 100 kb windows (top occupied windows per sample)")
-    ax.set_title("Genome-wide SV-density hotspots", loc="left")
+    ax.set_xlabel("Contig-ordered 100 kb windows (top occupied windows per sample)",
+                  fontweight="bold")
+    ax.set_title("Genome-wide SV-density hotspots", loc="left", fontweight="bold")
     sm = mpl.cm.ScalarMappable(norm=norm, cmap=cmap)
     cbar = plt.colorbar(sm, ax=ax, fraction=0.032, pad=0.015)
-    cbar.set_label("SVs / 100 kb", fontsize=8, labelpad=4)
-    cbar.ax.tick_params(labelsize=8)
+    cbar.set_label("SVs / 100 kb", fontsize=9, labelpad=4, fontweight="bold")
+    cbar.ax.tick_params(labelsize=8.5)
     add_panel_label(ax, "d")
 
 
@@ -333,13 +351,15 @@ def plot_biology_heatmap(ax, table1_rows, sample_order, sample_label) -> None:
     ax.grid(which="minor", color="white", linewidth=1.3)
     ax.tick_params(which="minor", bottom=False, left=False)
     ax.set_yticks(range(len(sample_order)))
-    ax.set_yticklabels([sample_label[s] for s in sample_order], fontstyle="italic")
+    ax.set_yticklabels([sample_label[s] for s in sample_order], fontstyle="italic",
+                       fontweight="bold")
     ax.set_xticks(range(len(cols)))
     ax.set_xticklabels([label for _key, label in cols])
-    ax.set_title("Routed biological annotation is sample-specific", loc="left")
+    ax.set_title("Routed biological annotation is sample-specific", loc="left",
+                 fontweight="bold")
     cbar = plt.colorbar(im, ax=ax, fraction=0.045, pad=0.02)
-    cbar.set_label("% of MycoSV loci", fontsize=8)
-    cbar.ax.tick_params(labelsize=8)
+    cbar.set_label("% of MycoSV loci", fontsize=9, fontweight="bold")
+    cbar.ax.tick_params(labelsize=8.5)
     add_panel_label(ax, "e")
 
 
@@ -367,19 +387,21 @@ def main() -> int:
     args.out_prefix.parent.mkdir(parents=True, exist_ok=True)
     mpl.rcParams.update({
         "font.family": ["DejaVu Sans", "Liberation Sans", "sans-serif"],
-        "font.size": 8.5,
-        "axes.titlesize": 10,
-        "axes.labelsize": 8.5,
-        "xtick.labelsize": 8,
-        "ytick.labelsize": 8,
-        "legend.fontsize": 8,
+        "font.size": 10,
+        "axes.titlesize": 11.4,
+        "axes.labelsize": 10.2,
+        "xtick.labelsize": 9.2,
+        "ytick.labelsize": 9.2,
+        "legend.fontsize": 9.2,
+        "axes.titleweight": "bold",
+        "axes.labelweight": "bold",
         "axes.spines.top": False,
         "axes.spines.right": False,
         "figure.facecolor": "white",
         "savefig.dpi": 300,
     })
-    fig = plt.figure(figsize=(13.8, 10.2), constrained_layout=False)
-    gs = GridSpec(3, 4, figure=fig, height_ratios=[1.0, 1.05, 1.0], hspace=0.78, wspace=0.62)
+    fig = plt.figure(figsize=(14.6, 10.8), constrained_layout=False)
+    gs = GridSpec(3, 4, figure=fig, height_ratios=[1.0, 1.06, 1.0], hspace=0.82, wspace=0.68)
     ax_a = fig.add_subplot(gs[0, :2])
     ax_b = fig.add_subplot(gs[0, 2:])
     ax_c = fig.add_subplot(gs[1, :2])
@@ -393,11 +415,8 @@ def main() -> int:
     plot_biology_heatmap(ax_e, table1_samples, sample_order, sample_label)
 
     fig.suptitle("Assembly-mode pangenome SV discovery across five fungal genomes",
-                 x=0.02, ha="left", y=0.985, fontsize=13, fontweight="bold")
-    fig.text(0.02, 0.955,
-             "Figure 1 uses assembly-mode calls only; long-read benchmarking is reported separately in Table 2.",
-             ha="left", va="top", fontsize=8.5, color="#555555")
-    fig.subplots_adjust(top=0.875, left=0.07, right=0.965, bottom=0.08)
+                 x=0.02, ha="left", y=0.985, fontsize=16, fontweight="bold")
+    fig.subplots_adjust(top=0.90, left=0.075, right=0.965, bottom=0.085)
     add_clean_legends(fig, ax_a, ax_b)
     for ext in ("png", "svg"):
         fig.savefig(args.out_prefix.with_suffix(f".{ext}"))
