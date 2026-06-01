@@ -154,6 +154,10 @@ https://github.com/shilpagarg/mycosv-platform
 
 Citation metadata is also provided in `CITATION.cff`.
 
+## Acknowledgements
+
+The authors acknowledge the help of AI tools like Claude and Codex.
+
 ## License
 
 MycoSV-platform is released under the MIT License. See `LICENSE`.

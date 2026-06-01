@@ -1019,6 +1019,8 @@ taxonomy levels, matching the PanTEon paper's evaluation format.
 
 If you use this repository, please credit MycoSV-platform. For issues, feature requests, benchmark contributions, or other questions, email shilpa.garg2k7@gmail.com.
 
+Acknowledgements: The authors acknowledge the help of AI tools like Claude and Codex.
+
 ---
 
 **Version**: 1.1  
