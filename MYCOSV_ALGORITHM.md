@@ -1017,7 +1017,7 @@ taxonomy levels, matching the PanTEon paper's evaluation format.
 
 **MycoSV** is part of the Tree-of-Life (TOL) pangenome framework for fungal diversity analysis.
 
-For issues, feature requests, or benchmark contributions, please contact the maintainers.
+If you use this repository, please credit MycoSV-platform. For issues, feature requests, benchmark contributions, or other questions, email shilpa.garg2k7@gmail.com.
 
 ---
 
