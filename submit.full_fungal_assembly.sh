@@ -326,6 +326,7 @@ run_benchmark_dir() {
     --mycosv-arg=--tol-base-graph-build \
     --mycosv-arg=--max-ref-memory-mb --mycosv-arg="${MYCOSV_MAX_REF_MEMORY_MB:-8192}" \
     --mycosv-arg=--max-flat-ref-contigs --mycosv-arg="${MAX_FLAT_REF_CONTIGS:-256}" \
+    --mycosv-arg=--lr-max-pseudo-contigs --mycosv-arg="${LR_MAX_PSEUDO_CONTIGS:-1200}" \
     --mycosv-arg=--skip-flat-if-hier-calls --mycosv-arg="${SKIP_FLAT_IF_HIER_CALLS:-5}"
 }
 

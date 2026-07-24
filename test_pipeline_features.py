@@ -1006,7 +1006,12 @@ def test_vcf_header_contains_required_info_fields(tmp_path: Path):
                   '##INFO=<ID=VT', '##INFO=<ID=NR', '##INFO=<ID=TOPO',
                   '##INFO=<ID=OFF_REF_TIER', '##INFO=<ID=CHR2',
                   '##INFO=<ID=MATE_OFFREF', '##INFO=<ID=PHYLUM',
-                  '##INFO=<ID=CLADE_RANK']:
+                  '##INFO=<ID=CLADE_RANK',
+                  # Extended Starship/HGT annotation (boundary, captain gene,
+                  # donor lineage, transfer age) — self-contained, no ext. tools.
+                  '##INFO=<ID=EBND', '##INFO=<ID=FLANK',
+                  '##INFO=<ID=CAPTAIN', '##INFO=<ID=CAPTAIN_SC',
+                  '##INFO=<ID=DONOR', '##INFO=<ID=XFERAGE']:
         assert field in vcf, f'Required VCF header field missing: {field}'
 
 
@@ -1778,6 +1783,108 @@ int main() {
     assert rows['rip_no'] == 'no'
     assert rows['starship_asco'] == 'yes'
     assert rows['starship_amf_blocked'] == 'yes'
+
+
+def test_extended_element_annotation_boundary_captain_donor(tmp_path: Path):
+    """Self-contained Starship/HGT annotation: boundary + flank, captain gene,
+    donor lineage direction, and transfer-age amelioration state.
+
+    Uses only the sequence-intrinsic annotators (no external tools, HMMs, or
+    reference databases), matching the production wiring in
+    apply_element_annotation()."""
+    harness = tmp_path / 'element_annot_harness.cpp'
+    harness.write_text(r'''
+#include <iostream>
+#include <random>
+#include <string>
+#include "layer1_clade_graph.hpp"
+
+static std::string rnd(size_t n, double gc, std::mt19937& g) {
+    std::string s(n, 'N');
+    std::bernoulli_distribution isgc(gc), coin(0.5);
+    for (auto& c : s) { if (isgc(g)) c = coin(g) ? 'G' : 'C'; else c = coin(g) ? 'A' : 'T'; }
+    return s;
+}
+
+int main() {
+    std::mt19937 g(7);
+
+    // (1) HGT island: high-GC block (0.70) inside a 0.50 host => recent transfer,
+    // higher-GC donor, boundary resolved to the shifted region.
+    std::string hgt = rnd(400, 0.50, g) + rnd(1500, 0.70, g) + rnd(400, 0.50, g);
+    auto a = tol::annotate_element(hgt, 0.50, "Glomeromycota");
+    std::cout << "hgt_ec\t"        << tol::element_class_name(a.ec) << "\n";
+    std::cout << "hgt_bounded\t"   << (a.boundary.resolved ? "yes" : "no") << "\n";
+    std::cout << "hgt_donor\t"     << a.donor.donorClass << "\n";
+    std::cout << "hgt_age\t"       << a.donor.transferAge << "\n";
+    std::cout << "hgt_applic\t"    << (a.donorApplicable ? "yes" : "no") << "\n";
+
+    // (2) Flanking TSD recovery: an AT-rich hull flanked by an 8 bp direct
+    // repeat should be resolved with a TSD/DR flank of that length.
+    std::string tsd = "ACGTACAG";
+    std::string body = rnd(1400, 0.34, g) + rnd(1200, 0.55, g) + rnd(1400, 0.34, g);
+    std::string flanked = rnd(300, 0.50, g) + tsd + body + tsd + rnd(300, 0.50, g);
+    auto b = tol::find_element_boundary(flanked, tol::ElementClass::STARSHIP, 0.50);
+    std::cout << "flank_type\t"    << b.flankType << "\n";
+    std::cout << "flank_len\t"     << b.flankLen  << "\n";
+
+    // (3) Captain gene: an ORF carrying the ordered R..H..R..Y catalytic tetrad
+    // is detected; a random sequence of equal length is not.
+    auto bt = [](char aa) -> std::string {
+        switch (aa) { case 'M': return "ATG"; case 'L': return "CTG"; case 'A': return "GCT";
+                      case 'R': return "CGT"; case 'H': return "CAT"; case 'Y': return "TAT";
+                      default: return "GCT"; } };
+    std::string pep = "M";
+    for (int i = 0; i < 40; ++i) pep += "LA";
+    pep += "R"; for (int i = 0; i < 8; ++i)  pep += "LA"; pep += "H";
+    for (int i = 0; i < 6;  ++i) pep += "LA"; pep += "R";
+    for (int i = 0; i < 10; ++i) pep += "LA"; pep += "H";
+    for (int i = 0; i < 6;  ++i) pep += "LA"; pep += "Y";
+    for (int i = 0; i < 60; ++i) pep += "LA";
+    std::string dna; for (char c : pep) dna += bt(c); dna += "TAA";
+    std::string capseq = dna + rnd(2000, 0.40, g);
+    auto cg = tol::detect_captain_gene(capseq);
+    std::cout << "captain_present\t" << (cg.present ? "yes" : "no") << "\n";
+    std::cout << "captain_family\t"  << cg.family << "\n";
+
+    auto cn = tol::detect_captain_gene(rnd(6000, 0.5, g));
+    std::cout << "captain_ctrl\t"    << (cn.present ? "yes" : "no") << "\n";
+
+    // (4) Amelioration axis: a strong compositional shift reads as RECENT while
+    // a host-matched sequence reads as HOST_NATIVE.
+    tol::ElementBoundary none;
+    auto recent = tol::infer_donor_signature(rnd(1500, 0.70, g), none, 0.50);
+    auto native = tol::infer_donor_signature(rnd(1500, 0.50, g), none, 0.50);
+    std::cout << "age_shifted\t"  << recent.transferAge << "\n";
+    std::cout << "age_native\t"   << native.transferAge << "\n";
+    return 0;
+}
+''')
+    exe = tmp_path / 'element_annot_harness'
+    run(['g++', '-O2', '-std=c++17', '-I', str(ROOT), str(harness), '-o', str(exe)])
+    rows = dict(line.split('\t', 1) for line in run([str(exe)]).stdout.strip().splitlines())
+
+    # HGT island is classified and gets full donor/transfer annotation.
+    assert rows['hgt_ec'] == 'HGT'
+    assert rows['hgt_bounded'] == 'yes'
+    assert rows['hgt_donor'] == 'HIGHER_GC_DONOR'
+    assert rows['hgt_age'] == 'RECENT'
+    assert rows['hgt_applic'] == 'yes'
+
+    # Flanking short direct repeat (TSD) is recovered near its true length.
+    # Exact length is RNG-sensitive (the compositional boundary can jitter by a
+    # base against the random flanks), so accept the short-repeat band.
+    assert rows['flank_type'] in ('TSD', 'DR')
+    assert 5 <= int(rows['flank_len']) <= 8
+
+    # Captain tyrosine-recombinase motif fires on the synthetic ORF, not on noise.
+    assert rows['captain_present'] == 'yes'
+    assert rows['captain_family'] in ('YR_DUF3435', 'YR_GENERIC')
+    assert rows['captain_ctrl'] == 'no'
+
+    # Amelioration state separates a shifted (recent) from a host-native segment.
+    assert rows['age_shifted'] == 'RECENT'
+    assert rows['age_native'] == 'HOST_NATIVE'
 
 
 def test_graph_native_offref_windows_and_router_windowing(tmp_path: Path):

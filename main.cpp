@@ -250,6 +250,7 @@ struct Options {
     int    lrMinCluster     = 2;             // --lr-min-cluster-size
     int    lrMinReadLen     = 200;           // --lr-min-read-len
     int    lrMaxReadLen     = 300000;        // --lr-max-read-len
+    int    lrMaxPseudoContigs = 0;           // --lr-max-pseudo-contigs; 0=auto
 
     // Short-reads preprocessing
     int    srK              = 21;            // --sr-kmer-size
@@ -423,6 +424,8 @@ static void usage(const char* argv0) {
 "  --lr-min-cluster-size INT  Min reads per cluster to build consensus (default 2)\n"
 "  --lr-min-read-len INT    Drop reads shorter than this bp (default 200)\n"
 "  --lr-max-read-len INT    Drop reads longer than this bp, chimera guard (default 300000)\n"
+"  --lr-max-pseudo-contigs INT  Cap long-read pseudo-contigs before SV calling\n"
+"                             (0=auto; default auto caps large batches at 1200)\n"
 "\n"
 "  Short-reads preprocessing (--query-mode short-reads):\n"
 "  --sr-kmer-size INT       k-mer size for de Bruijn assembly (default 21)\n"
@@ -567,6 +570,7 @@ static Options parse_args(int argc, char** argv) {
         else if (x == "--lr-min-cluster-size")         o.lrMinCluster         = std::stoi(need(x.c_str(),i));
         else if (x == "--lr-min-read-len")             o.lrMinReadLen         = std::stoi(need(x.c_str(),i));
         else if (x == "--lr-max-read-len")             o.lrMaxReadLen         = std::stoi(need(x.c_str(),i));
+        else if (x == "--lr-max-pseudo-contigs")       o.lrMaxPseudoContigs   = std::stoi(need(x.c_str(),i));
         // Short-reads preprocessing
         else if (x == "--sr-kmer-size")                o.srK                  = std::stoi(need(x.c_str(),i));
         else if (x == "--sr-min-kmer-freq")            o.srMinKmerFreq        = std::stoi(need(x.c_str(),i));
@@ -2227,10 +2231,6 @@ simple_offref_fallback_calls(const std::string& qAsm,
             cladeGc = bestNamed->sequence.empty() ? 0.45
                 : static_cast<double>(gcCount) / static_cast<double>(bestNamed->sequence.size());
         }
-        const tol::ElementClass ec = seq.empty()
-            ? tol::ElementClass::NONE
-            : tol::classify_repeat_element(std::string_view(seq.data(), seq.size()), cladeGc);
-
         VariantCallBridge v;
         v.qAsm = qAsm;
         v.qContig = contigName;
@@ -2252,9 +2252,11 @@ simple_offref_fallback_calls(const std::string& qAsm,
         v.pantreeClass = "NON_REF";
         v.isNonRefVariant = true;
         v.triallelicTopology = ".";
-        v.elementClass = tol::element_class_name(ec);
         v.cladeRank = ".";
         v.phylum = ".";
+        // ElementClass + extended Starship/HGT annotation (boundary, captain
+        // gene, donor/transfer-age); phylum is set above so it is respected.
+        tol::apply_element_annotation(v, seq, cladeGc);
         out.push_back(std::move(v));
     }
     return out;
@@ -3296,6 +3298,12 @@ static void write_vcf_header(std::ostream& out,
         << "##INFO=<ID=MATE_CLADE,Number=1,Type=String,Description=\"Mate routed clade\">\n"
         << "##INFO=<ID=MATE_OFFREF,Number=0,Type=Flag,Description=\"Mate breakpoint is off-reference\">\n"
         << "##INFO=<ID=EC,Number=1,Type=String,Description=\"Element class: NONE/REPEAT/TE_LTR/TE_TIR/TE_LINE/TE_SINE/STARSHIP/HGT/RIP\">\n"
+        << "##INFO=<ID=EBND,Number=1,Type=String,Description=\"Resolved element extent 'start-end' (0-based) within the reported segment (self-contained compositional/flank boundary)\">\n"
+        << "##INFO=<ID=FLANK,Number=1,Type=String,Description=\"Flanking repeat at the element boundary: TSD/DR/TIR/COMPOSITIONAL/NONE\">\n"
+        << "##INFO=<ID=CAPTAIN,Number=1,Type=String,Description=\"Starship captain gene signature (tyrosine recombinase): YR_DUF3435/YR_GENERIC/NONE, from six-frame ORF + catalytic-tetrad scan, no external tool\">\n"
+        << "##INFO=<ID=CAPTAIN_SC,Number=1,Type=Float,Description=\"Captain tyrosine-recombinase motif confidence (0-1)\">\n"
+        << "##INFO=<ID=DONOR,Number=1,Type=String,Description=\"HGT donor compositional class from GC/signature divergence: HIGHER_GC_DONOR/LOWER_GC_DONOR/HOST_LIKE (direction only; no species named without a database)\">\n"
+        << "##INFO=<ID=XFERAGE,Number=1,Type=String,Description=\"Estimated transfer age from amelioration of the donor signature: RECENT/AMELIORATING/ANCIENT/HOST_NATIVE\">\n"
         << "##INFO=<ID=QMODE,Number=1,Type=String,Description=\"Query input mode: assembly/long-reads/short-reads\">\n"
         << "##INFO=<ID=SUPPORT,Number=1,Type=Integer,Description=\"Call support: assembly anchor count, long-read cluster size, or short-read k-mer/unitig support\">\n"
         << "##INFO=<ID=FUSED_POST,Number=1,Type=Float,Description=\"Posterior alt probability after probabilistic evidence fusion\">\n"
@@ -3383,6 +3391,19 @@ static void write_vcf_record(std::ostream& out,
     // EC: element class — emitted for all calls; meaningful for OFF_REF
     if (!v.elementClass.empty() && v.elementClass != "NONE")
         out << ";EC=" << v.elementClass;
+    // Extended Starship/HGT annotation (all self-contained, sequence-intrinsic).
+    if (!v.elemBoundary.empty() && v.elemBoundary != ".")
+        out << ";EBND=" << v.elemBoundary;
+    if (!v.elemFlank.empty() && v.elemFlank != "NONE")
+        out << ";FLANK=" << v.elemFlank;
+    if (!v.captainGene.empty() && v.captainGene != "NONE") {
+        out << ";CAPTAIN=" << v.captainGene
+            << ";CAPTAIN_SC=" << std::fixed << std::setprecision(3) << v.captainScore;
+    }
+    if (!v.donorClass.empty() && v.donorClass != ".")
+        out << ";DONOR=" << v.donorClass;
+    if (!v.transferAge.empty() && v.transferAge != ".")
+        out << ";XFERAGE=" << v.transferAge;
     if (!v.pantreeClass.empty() && v.pantreeClass != ".")
         out << ";VT=" << v.pantreeClass;
     if (v.isNonRefVariant) out << ";NR";
@@ -3430,6 +3451,7 @@ static query_input::InputConfig make_input_config(const Options& o) {
     cfg.lrMinCluster    = static_cast<size_t>(std::max(1, o.lrMinCluster));
     cfg.lrMinReadLen    = static_cast<size_t>(std::max(0, o.lrMinReadLen));
     cfg.lrMaxReadLen    = static_cast<size_t>(std::max(1, o.lrMaxReadLen));
+    cfg.lrMaxPseudoContigs = static_cast<size_t>(std::max(0, o.lrMaxPseudoContigs));
     cfg.srK             = o.srK;
     cfg.srMinKmerFreq   = static_cast<uint32_t>(std::max(0, o.srMinKmerFreq));
     cfg.srMinUnitigLen  = static_cast<size_t>(std::max(1, o.srMinUnitigLen));
@@ -3971,7 +3993,8 @@ static void write_gfa_segments(std::ostream& out,
                             const std::string& type,
                             const std::string& clade,
                             const std::string& elementClass,
-                            bool forcePlaceholder = false) {
+                            bool forcePlaceholder = false,
+                            const VariantCallBridge* ext = nullptr) {
         std::string seg = sanitize(rawId);
         if (!seen.insert("S:" + seg).second) return seg;
         const std::string* seq = contig.empty() || contig == "." ? nullptr : find_query_contig_seq(qr, contig);
@@ -3991,8 +4014,22 @@ static void write_gfa_segments(std::ostream& out,
         out << "\tAN:Z:" << annotation
             << "\tVT:Z:" << type
             << "\tCL:Z:" << clade
-            << "\tEC:Z:" << (elementClass.empty() ? "NONE" : elementClass)
-            << "\n";
+            << "\tEC:Z:" << (elementClass.empty() ? "NONE" : elementClass);
+        // Extended Starship/HGT annotation (self-contained). Emitted only when a
+        // non-default value is present, so plain segments stay compact.
+        if (ext) {
+            if (!ext->elemBoundary.empty() && ext->elemBoundary != ".")
+                out << "\tEB:Z:" << ext->elemBoundary;
+            if (!ext->elemFlank.empty() && ext->elemFlank != "NONE")
+                out << "\tFL:Z:" << ext->elemFlank;
+            if (!ext->captainGene.empty() && ext->captainGene != "NONE")
+                out << "\tCP:Z:" << ext->captainGene;
+            if (!ext->donorClass.empty() && ext->donorClass != ".")
+                out << "\tDN:Z:" << ext->donorClass;
+            if (!ext->transferAge.empty() && ext->transferAge != ".")
+                out << "\tXA:Z:" << ext->transferAge;
+        }
+        out << "\n";
         out << "P\t" << seg << "\t" << seg << "+\t*\n";
         return seg;
     };
@@ -4013,7 +4050,8 @@ static void write_gfa_segments(std::ostream& out,
                                                   c.type,
                                                   c.refAsm,
                                                   c.elementClass,
-                                                  false);
+                                                  false,
+                                                  &c);
 
             const int matePos = std::max(1, c.matePos);
             const int mateEnd = std::max(matePos, c.mateEnd);
@@ -4068,7 +4106,8 @@ static void write_gfa_segments(std::ostream& out,
             c.type,
             c.refAsm,
             c.elementClass,
-            placeholderOnly);
+            placeholderOnly,
+            &c);
         // Augmentation: every reference-anchored variant gets two L-edges
         // (ref→var, var→ref) to its parent reference contig.  OFF_REF variants
         // have no ref anchor, so they remain disconnected — that is the correct

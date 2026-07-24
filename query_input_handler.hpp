@@ -43,6 +43,7 @@
 #include <cctype>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <deque>
 #include <ext/stdio_filebuf.h>
 #include <filesystem>
@@ -121,6 +122,7 @@ struct InputConfig {
     size_t   lrMinCluster      = 2;
     size_t   lrMinReadLen      = 200;
     size_t   lrMaxReadLen      = 300000;
+    size_t   lrMaxPseudoContigs = 0;     // 0 = auto; long-reads only
 
     // Short-reads preprocessing
     int      srK               = 21;
@@ -834,13 +836,28 @@ inline std::unordered_map<std::string, std::string>
 long_reads_to_pseudocontigs(const std::vector<RawRead>& reads,
                              int anchorK,
                              size_t minCluster,
+                             size_t maxPseudoContigsOverride,
                              bool quiet) {
     const size_t N = reads.size();
     if (N == 0) return {};
     const size_t maxAnchorsPerRead = 96;
     const bool largeBatch = N > 20000;
     const size_t maxClusterReadsForConsensus = largeBatch ? 32 : 128;
-    const size_t maxPseudoContigs = largeBatch ? 5000 : std::numeric_limits<size_t>::max();
+    // Pseudo-contigs are handed unchanged to the single-threaded hierarchical
+    // caller, whose cost scales with contig count x per-contig complexity. High
+    // coverage (-> 5000 long, repeat-heavy clusters) or repeat-rich genomes can
+    // exceed wall-time at the 5000 default. MYCOSV_MAX_LR_PSEUDO_CONTIGS bounds
+    // caller work per query; clusters are kept best-supported-first below, so a
+    // lower cap drops the lowest-support (often singleton/noise) loci. Unset or
+    // <=0 uses the long-read large-batch default; env still has final say for
+    // one-off production tuning without recompilation.
+    size_t maxPseudoContigs = largeBatch ? 1200 : std::numeric_limits<size_t>::max();
+    if (maxPseudoContigsOverride > 0) maxPseudoContigs = maxPseudoContigsOverride;
+    if (const char* e = std::getenv("MYCOSV_MAX_LR_PSEUDO_CONTIGS")) {
+        char* endp = nullptr;
+        unsigned long v = std::strtoul(e, &endp, 10);
+        if (endp != e && v > 0) maxPseudoContigs = static_cast<size_t>(v);
+    }
     struct Candidate {
         std::string name;
         std::string seq;
@@ -982,7 +999,7 @@ long_reads_to_pseudocontigs(const std::vector<RawRead>& reads,
         if (members.size() < minCluster) {
             if (members.size() == 1 && reads[members[0]].seq.size() >= 100) {
                 candidates.push_back({
-                    "lr_pc" + std::to_string(idx++),
+                    "lr_pc" + std::to_string(idx++) + "_n1",
                     reads[members[0]].seq,
                     1,
                 });
@@ -1102,7 +1119,7 @@ long_reads_to_pseudocontigs(const std::vector<RawRead>& reads,
         if (beforeCap > out.size())
             std::cerr << "[query-input][long-reads] capped pseudo-contigs "
                       << beforeCap << " -> " << out.size()
-                      << " for large read batch\n";
+                      << " for long-read caller budget\n";
     }
     return out;
 }
@@ -1338,7 +1355,8 @@ prepare_query(const std::string& path,
             filtered = detail::coverage_downsample_reads(
                 std::move(filtered), modeHint, tuned.cfg.genomeSizeHint, quiet, dropped);
             result.contigs = detail::long_reads_to_pseudocontigs(
-                filtered, tuned.cfg.lrAnchorK, tuned.cfg.lrMinCluster, quiet);
+                filtered, tuned.cfg.lrAnchorK, tuned.cfg.lrMinCluster,
+                tuned.cfg.lrMaxPseudoContigs, quiet);
             if (result.contigs.empty() && !filtered.empty()) {
                 if (!quiet)
                     std::cerr << "[query-input][long-reads] no pseudo-contigs assembled; emitting "
@@ -1348,7 +1366,9 @@ prepare_query(const std::string& path,
             }
             // Filter pseudo-contigs by read support (cluster size encoded in _n<N>)
             {
-                const int minSupport = (tuned.preReport.coverageTier == CoverageTier::LOW) ? 2 : 3;
+                const int minSupport =
+                    (tuned.preReport.coverageTier == CoverageTier::LOW) ? 1 :
+                    (tuned.preReport.coverageTier == CoverageTier::HIGH) ? 4 : 3;
                 size_t nDropped = 0;
                 std::unordered_map<std::string, std::string> kept;
                 kept.reserve(result.contigs.size());
@@ -1358,7 +1378,7 @@ prepare_query(const std::string& path,
                     if (npos != std::string::npos) {
                         try { support = std::stoi(name.substr(npos + 2)); } catch (...) {}
                     }
-                    if (support < 0 || support >= minSupport)
+                    if (support >= minSupport)
                         kept.emplace(std::move(name), std::move(seq));
                     else
                         ++nDropped;

@@ -6539,11 +6539,27 @@ def _samtools_count_breakpoint_support(
     svlen: int | None = None,
     flank_bp: int = 250,
     min_clip: int = 30,
+    span_mode: bool = False,
+    min_anchor: int = 30,
 ) -> int:
-    """Return the number of reads with split/clipped alignments spanning the
-    candidate breakpoint window. Uses `samtools view` and counts reads whose
-    CIGAR carries a soft/hard clip >= min_clip on either side, or that have an
-    SA tag (supplementary alignment), within +/-flank_bp of the breakpoint.
+    """Return the number of reads supporting the candidate breakpoint window.
+
+    Two evidence models, because the two validators align reads to different
+    things and the correct signal is the opposite in each:
+
+    `span_mode=False` (default, reference-anchored): reads are aligned to the
+    benchmark *reference*, which lacks the variant, so a read carrying the
+    variant must disagree with the reference - it clips, splits, or carries a
+    matching CIGAR indel. Counting split/clip evidence is correct here.
+
+    `span_mode=True` (reference-free): the junction window is extracted from
+    the *query's own assembly*, which already contains the variant. Reads from
+    that same sample therefore align contiguously across a true junction and
+    carry no clip at all, so requiring split/clip evidence rejects exactly the
+    reads that confirm the junction. In this mode a read counts as support if
+    its aligned block covers the breakpoint with at least `min_anchor` matched
+    bases on both sides. Split/clip evidence is still accepted, so support is a
+    superset of the split-only count and never lower.
 
     A breakpoint with >= K supporting reads (K=3 default elsewhere) is treated
     as raw-data confirmed; below K it is dropped from truth.
@@ -6551,9 +6567,16 @@ def _samtools_count_breakpoint_support(
     if not tool_path("samtools"):
         return 0
     region = f"{contig}:{max(1, pos - flank_bp)}-{end + flank_bp}"
+    # In span_mode the junction windows overlap (small windows are substrings of
+    # large ones), so a read's coverage of a given window is frequently recorded
+    # as a secondary alignment. Excluding secondaries (0x100) here would discard
+    # exactly that evidence, so only unmapped reads are dropped. Supplementary
+    # (0x800) split records are kept in both modes as they carry breakpoint
+    # evidence. Reference-anchored mode keeps the original primary-only filter.
+    view_filter = "0x4" if span_mode else "0x900"
     try:
         proc = subprocess.run(
-            ["samtools", "view", "-F", "0x900", str(bam_path), region],
+            ["samtools", "view", "-F", view_filter, str(bam_path), region],
             text=True, capture_output=True, check=True,
             timeout=_READ_VALIDATION_VIEW_TIMEOUT,
         )
@@ -6579,6 +6602,12 @@ def _samtools_count_breakpoint_support(
             cigar, read_pos, ref_end, fields, pos, end,
             svtype=svtype, flank_bp=flank_bp, min_clip=min_clip,
         ):
+            support += 1
+        elif span_mode and read_pos <= pos - min_anchor and ref_end >= end + min_anchor:
+            # Contiguous spanning read: the junction is present in the sequence
+            # the read came from, so it aligns straight through with anchors on
+            # both sides. This is the confirming signal for the reference-free
+            # test; see the span_mode note in this function's docstring.
             support += 1
     return support
 
@@ -7130,7 +7159,17 @@ def _align_reads_to_junction_fasta(
     threads: int,
 ) -> Path | None:
     """minimap2 reads -> junction fasta -> sorted+indexed BAM. preset selects
-    map-hifi / map-pb / map-ont for long reads or `sr` for short reads."""
+    map-hifi / map-pb / map-ont for long reads or `sr` for short reads.
+
+    Secondary alignments are retained aggressively (`-N`/`-p`) because the
+    junction windows are not disjoint references: small breakpoint windows are
+    substrings of the same query genome as the large OFF_REF whole-contig
+    windows. Under minimap2's default single-best assignment a read that spans
+    a small window aligns primarily to a large window instead and is dropped
+    from the small window, which starves most windows of reads. Keeping
+    low-ratio secondaries lets each window be scored on every read that covers
+    it. The support counter must correspondingly stop filtering secondaries.
+    """
     if not tool_path("minimap2") or not tool_path("samtools"):
         return None
     if not junction_fasta.exists() or junction_fasta.stat().st_size == 0:
@@ -7140,6 +7179,7 @@ def _align_reads_to_junction_fasta(
         with sam_path.open("wb") as sam_out:
             subprocess.run(
                 ["minimap2", "-ax", preset, "-t", str(threads),
+                 "-N", "100", "-p", "0.01", "--secondary=yes",
                  str(junction_fasta), str(reads_path)],
                 stdout=sam_out, stderr=subprocess.PIPE, check=True,
                 timeout=_COMPARATOR_TIMEOUT,
@@ -7311,6 +7351,7 @@ def validate_calls_reference_free(
                 bp_off, bp_off,
                 svtype=call.svtype, svlen=call.svlen,
                 flank_bp=bp_flank, min_clip=min_clip,
+                span_mode=True,
             )
             if support > best_support:
                 best_support = support

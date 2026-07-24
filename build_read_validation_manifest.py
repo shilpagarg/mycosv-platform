@@ -69,6 +69,66 @@ def _assembly_accession_from_query(row: dict[str, str]) -> str:
     return ""
 
 
+def _fetch_specimen_ids(biosample: str) -> dict[str, str]:
+    """Return {specimen_id, tolid} attributes of an ENA BioSample, if present.
+
+    Used for consortium data (Darwin Tree of Life and similar) where the
+    assembly BioSample and the read BioSample differ but both descend from one
+    catalogued specimen. Empty values are dropped so they can never match.
+    """
+    if not biosample:
+        return {}
+    import urllib.request
+    import xml.etree.ElementTree as ET
+    url = f"https://www.ebi.ac.uk/ena/browser/api/xml/{biosample}"
+    try:
+        with urllib.request.urlopen(url, timeout=60) as fh:
+            root = ET.fromstring(fh.read())
+    except Exception:
+        return {}
+    out: dict[str, str] = {}
+    for attr in root.iter("SAMPLE_ATTRIBUTE"):
+        tag = (attr.findtext("TAG") or "").strip().lower()
+        val = (attr.findtext("VALUE") or "").strip()
+        if tag in {"specimen_id", "tolid"} and val and val.upper() != "NOT PROVIDED":
+            out[tag] = val
+    return out
+
+
+def fetch_ena_read_runs_by_specimen(
+    specimen: dict[str, str], species: str, max_candidates: int = 60,
+) -> list[dict[str, str]]:
+    """ENA read runs whose BioSample descends from the same specimen.
+
+    `specimen_id` and `tolid` are BioSample attributes and are not queryable
+    fields in the ENA portal API, so the match is made in two stages: species
+    supplies the candidate pool, then each candidate run's BioSample is fetched
+    and kept only if it carries an identical specimen_id or ToLID. The species
+    query is therefore only a search shortcut - admission is decided by
+    specimen identity, so reads from a different individual of the same species
+    are still rejected.
+    """
+    if not specimen or not species:
+        return []
+    try:
+        candidates = fetch_ena_read_runs_by_species(species, max_rows=max_candidates)
+    except Exception:
+        return []
+    wanted = {k: v for k, v in specimen.items() if v}
+    kept: list[dict[str, str]] = []
+    checked: dict[str, bool] = {}
+    for run in candidates:
+        bs = str(run.get("sample_accession") or "").strip()
+        if not bs:
+            continue
+        if bs not in checked:
+            got = _fetch_specimen_ids(bs)
+            checked[bs] = any(got.get(k) == v for k, v in wanted.items())
+        if checked[bs]:
+            kept.append(run)
+    return kept
+
+
 def _fetch_assembly_biosample(row: dict[str, str]) -> str:
     """Return the BioSample tied to this exact assembly, or empty string."""
     acc = _assembly_accession_from_query(row)
@@ -117,6 +177,25 @@ def _pick_runs_for_query(
                 basis = f"biosample:{biosample}"
             except Exception as exc:
                 sys.stderr.write(f"[reads] {row['query_asm']}: BioSample lookup {biosample} failed: {exc}\n")
+    if not candidates:
+        # Specimen-level match. Consortium projects such as Darwin Tree of Life
+        # register one BioSample for the specimen the assembly was built from
+        # and separate derived BioSamples per sequencing library, so assembly
+        # and reads carry different accessions while originating from the same
+        # physical individual. A BioSample-equality test rejects that data even
+        # though specimen identity is a stronger guarantee than same-isolate.
+        # Two BioSamples match here only if they share a non-empty specimen_id
+        # or ToLID, which cannot span individuals.
+        specimen = _fetch_specimen_ids(_fetch_assembly_biosample(row))
+        if specimen:
+            try:
+                candidates = fetch_ena_read_runs_by_specimen(
+                    specimen,
+                    (row.get("species") or row.get("scientific_name") or "").strip(),
+                )
+                basis = "specimen:" + ",".join(f"{k}={v}" for k, v in sorted(specimen.items()))
+            except Exception as exc:
+                sys.stderr.write(f"[reads] {row['query_asm']}: specimen lookup {specimen} failed: {exc}\n")
     if not candidates:
         if allow_species_fallback:
             species = (row.get("species") or row.get("scientific_name") or "").strip()

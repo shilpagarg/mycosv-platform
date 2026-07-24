@@ -25,6 +25,15 @@
 //   detect_hgt_island         - GC deviation >+/-0.10 over >=500 bp
 //   detect_rip_window         - lightweight RIP-product index in a 500 bp window
 //   classify_repeat_element   - master dispatcher returning ElementClass
+//
+// Extended element annotation (new in v15; fully self-contained, no external
+// tools / HMMs / reference databases):
+//   find_element_boundary     - refine element extent + flanking TSD/DR/TIR
+//   detect_captain_gene       - 6-frame ORF scan for a Starship tyrosine-
+//                               recombinase (DUF3435) captain signature
+//   infer_donor_signature     - compositional donor-class + amelioration age
+//                               (RECENT / AMELIORATING / ANCIENT) for HGT
+//   annotate_element          - fills an ElementAnnotation (class + the above)
 
 #include <algorithm>
 #include <array>
@@ -949,6 +958,543 @@ inline ElementClass classify_repeat_element(std::string_view seq,
     if (detect_tandem_repeat(seq))                     return ElementClass::REPEAT;
 
     return ElementClass::NONE;
+}
+
+// =========================================================================
+// EXTENDED ELEMENT ANNOTATION (v15)
+//
+// Adds three layers of biological annotation on top of the ElementClass call
+// for Starship / HGT-island events.  Everything here is alignment-free and
+// self-contained: no external tools (starfish, HHsuite, BLAST), no HMM
+// libraries, and no reference database is consulted.  Each field is a
+// sequence-intrinsic estimate and is labelled UNDETERMINED when the signal is
+// absent, so downstream consumers never mistake a heuristic for a database
+// hit.
+//   1. find_element_boundary  - resolves the element extent within the queried
+//                               segment and the flanking repeat left by the
+//                               insertion (TSD for Starships, DR/TIR for TEs).
+//   2. detect_captain_gene    - the Starship "captain" is a tyrosine
+//                               recombinase (DUF3435) at the 5' terminus that
+//                               mobilises the element; detected by six-frame
+//                               ORF translation + catalytic-tetrad motif scan.
+//   3. infer_donor_signature  - compositional donor class + amelioration state
+//                               (recent vs historical transfer) from GC / GC3 /
+//                               Karlin dinucleotide genomic signature.
+// =========================================================================
+
+// -------------------------------------------------------------------------
+// 1. Element boundary + flanking repeat
+// -------------------------------------------------------------------------
+struct ElementBoundary {
+    bool        resolved     = false;  // a compositional or flank boundary was found
+    size_t      start        = 0;      // 0-based inclusive, within the queried segment
+    size_t      end          = 0;      // 0-based exclusive
+    std::string flankType    = "NONE"; // TSD | DR | TIR | COMPOSITIONAL | NONE
+    int         flankLen     = 0;      // length of the resolved flanking repeat (bp)
+    double      flankIdentity = 0.0;   // fractional identity of the two flanks
+};
+
+// Refine the element extent inside a candidate segment and detect the short
+// repeat left flanking the insertion.
+//
+// Two independent signals are combined:
+//   (a) Compositional edge: for a Starship the hull is AT-rich, so the element
+//       body is the maximal contiguous run of windows with GC below the host
+//       background; for an HGT island it is the run of windows whose GC
+//       deviates from the host.  This yields COMPOSITIONAL start/end.
+//   (b) Flanking repeat: mobile-element insertion duplicates a short target
+//       site (TSD) or leaves a direct/inverted terminal repeat.  We look for a
+//       short repeat (5-30 bp) straddling the compositional ends and, if found,
+//       snap the boundary to it and label the flank TSD/DR (direct) or TIR
+//       (inverted).
+inline ElementBoundary find_element_boundary(std::string_view seq,
+                                             ElementClass ec,
+                                             double hostGc = 0.45) {
+    ElementBoundary b;
+    const size_t n = seq.size();
+    if (n < 100u) return b;
+
+    const int    win  = 200;
+    const int    step = 50;
+    // Element-direction predicate on a window's GC.
+    auto in_element = [&](double wgc) -> bool {
+        switch (ec) {
+            case ElementClass::STARSHIP:
+                return wgc < (hostGc - 0.06);            // AT-rich hull
+            case ElementClass::HGT:
+                return std::fabs(wgc - hostGc) > 0.06;   // GC-shifted island
+            default:
+                return std::fabs(wgc - hostGc) > 0.05;
+        }
+    };
+
+    // (a) longest contiguous element-direction run of windows.
+    long bestStart = -1, bestEnd = -1, bestLen = -1;
+    long curStart = -1;
+    for (long i = 0; i + win <= static_cast<long>(n); i += step) {
+        const double wgc = gc_content(seq.substr(static_cast<size_t>(i),
+                                                 static_cast<size_t>(win)));
+        if (in_element(wgc)) {
+            if (curStart < 0) curStart = i;
+        } else if (curStart >= 0) {
+            const long len = (i + win) - curStart;
+            if (len > bestLen) { bestLen = len; bestStart = curStart; bestEnd = i + win; }
+            curStart = -1;
+        }
+    }
+    if (curStart >= 0) {
+        const long len = static_cast<long>(n) - curStart;
+        if (len > bestLen) { bestLen = len; bestStart = curStart; bestEnd = static_cast<long>(n); }
+    }
+
+    if (bestStart < 0) {
+        // No compositional edge; fall back to the whole segment.
+        b.start = 0; b.end = n; b.flankType = "NONE";
+        return b;
+    }
+    b.start = static_cast<size_t>(bestStart);
+    b.end   = static_cast<size_t>(std::min<long>(bestEnd, static_cast<long>(n)));
+    b.flankType = "COMPOSITIONAL";
+    b.resolved  = true;
+
+    // (b) flanking repeat search around the compositional ends.
+    // Scan a small margin outside each end for a matching short repeat.
+    const int margin  = 40;
+    const int minK    = 5;
+    const int maxK    = 30;
+    const double idThresh = 0.85;
+
+    const long lo = std::max<long>(0, static_cast<long>(b.start) - margin);
+    const long hi = std::min<long>(static_cast<long>(n), static_cast<long>(b.end) + margin);
+
+    auto direct_identity = [&](long a, long c, int k) -> double {
+        if (a < 0 || c < 0 || a + k > static_cast<long>(n) || c + k > static_cast<long>(n))
+            return 0.0;
+        int match = 0;
+        for (int j = 0; j < k; ++j)
+            if (std::toupper((unsigned char)seq[static_cast<size_t>(a + j)]) ==
+                std::toupper((unsigned char)seq[static_cast<size_t>(c + j)])) ++match;
+        return static_cast<double>(match) / k;
+    };
+    auto inverted_identity = [&](long a, long c, int k) -> double {
+        // seq[a..a+k) vs revcomp(seq[c..c+k))
+        if (a < 0 || c < 0 || a + k > static_cast<long>(n) || c + k > static_cast<long>(n))
+            return 0.0;
+        int match = 0;
+        for (int j = 0; j < k; ++j) {
+            char left  = std::toupper((unsigned char)seq[static_cast<size_t>(a + j)]);
+            char right = std::toupper((unsigned char)seq[static_cast<size_t>(c + k - 1 - j)]);
+            char rc;
+            switch (right) { case 'A': rc='T';break; case 'T': rc='A';break;
+                             case 'C': rc='G';break; case 'G': rc='C';break; default: rc='N'; }
+            if (left == rc) ++match;
+        }
+        return static_cast<double>(match) / k;
+    };
+
+    // Prefer the longest high-identity flank; TIR only for TE_TIR context.
+    const bool wantInverted = (ec == ElementClass::TE_TIR);
+    for (int k = maxK; k >= minK; --k) {
+        double bestId = 0.0; long bestL = -1, bestR = -1;
+        for (long l = lo; l <= static_cast<long>(b.start) && l + k <= hi; ++l) {
+            for (long r = std::max<long>(l + k, static_cast<long>(b.end) - k);
+                 r + k <= hi; ++r) {
+                const double id = wantInverted ? inverted_identity(l, r, k)
+                                               : direct_identity(l, r, k);
+                if (id > bestId) { bestId = id; bestL = l; bestR = r; }
+                if (bestId >= 0.999) break;
+            }
+            if (bestId >= 0.999) break;
+        }
+        if (bestId >= idThresh && bestL >= 0) {
+            b.start        = static_cast<size_t>(bestL);
+            b.end          = static_cast<size_t>(std::min<long>(bestR + k, static_cast<long>(n)));
+            b.flankLen     = k;
+            b.flankIdentity = bestId;
+            if (wantInverted)              b.flankType = "TIR";
+            else if (k <= 15)              b.flankType = "TSD"; // short target-site duplication
+            else                          b.flankType = "DR";  // longer direct repeat
+            break;
+        }
+    }
+    return b;
+}
+
+// -------------------------------------------------------------------------
+// 2. Captain gene (Starship tyrosine recombinase / DUF3435)
+// -------------------------------------------------------------------------
+struct CaptainGene {
+    bool        present   = false;   // tyrosine-recombinase captain signature found
+    std::string family    = "NONE";  // YR_DUF3435 | YR_GENERIC | NONE
+    int         frame     = 0;       // +1..+3 forward, -1..-3 reverse
+    size_t      ntStart   = 0;       // nt offset of the ORF start within the segment
+    int         orfLenAa  = 0;       // ORF length in amino acids
+    double      score     = 0.0;     // 0..1 motif confidence
+};
+
+// Standard genetic code (codon -> amino acid, '*' = stop).
+inline char translate_codon(char a, char b, char c) {
+    auto up = [](char x){ return static_cast<char>(std::toupper((unsigned char)x)); };
+    a = up(a); b = up(b); c = up(c);
+    static const std::unordered_map<std::string, char>& CODE = *[](){
+        static std::unordered_map<std::string, char> m = {
+            {"TTT",'F'},{"TTC",'F'},{"TTA",'L'},{"TTG",'L'},
+            {"CTT",'L'},{"CTC",'L'},{"CTA",'L'},{"CTG",'L'},
+            {"ATT",'I'},{"ATC",'I'},{"ATA",'I'},{"ATG",'M'},
+            {"GTT",'V'},{"GTC",'V'},{"GTA",'V'},{"GTG",'V'},
+            {"TCT",'S'},{"TCC",'S'},{"TCA",'S'},{"TCG",'S'},
+            {"CCT",'P'},{"CCC",'P'},{"CCA",'P'},{"CCG",'P'},
+            {"ACT",'T'},{"ACC",'T'},{"ACA",'T'},{"ACG",'T'},
+            {"GCT",'A'},{"GCC",'A'},{"GCA",'A'},{"GCG",'A'},
+            {"TAT",'Y'},{"TAC",'Y'},{"TAA",'*'},{"TAG",'*'},
+            {"CAT",'H'},{"CAC",'H'},{"CAA",'Q'},{"CAG",'Q'},
+            {"AAT",'N'},{"AAC",'N'},{"AAA",'K'},{"AAG",'K'},
+            {"GAT",'D'},{"GAC",'D'},{"GAA",'E'},{"GAG",'E'},
+            {"TGT",'C'},{"TGC",'C'},{"TGA",'*'},{"TGG",'W'},
+            {"CGT",'R'},{"CGC",'R'},{"CGA",'R'},{"CGG",'R'},
+            {"AGT",'S'},{"AGC",'S'},{"AGA",'R'},{"AGG",'R'},
+            {"GGT",'G'},{"GGC",'G'},{"GGA",'G'},{"GGG",'G'},
+        };
+        return &m;
+    }();
+    const std::string codon = {a, b, c};
+    auto it = CODE.find(codon);
+    return (it == CODE.end()) ? 'X' : it->second;
+}
+
+// Score a protein window for the tyrosine-recombinase (phage-integrase-like)
+// catalytic architecture that defines a Starship captain (Pfam DUF3435 is a
+// diverged YR).  Fully self-contained proxy for an HMM: the YR catalytic
+// pocket presents an ordered R ... H ... R ... [H/W] ... Y tetrad with
+// characteristic inter-residue spacings.  We slide over the ORF, and for each
+// candidate catalytic tyrosine we test whether the three upstream conserved
+// residues occur in order within YR-like spacing windows.  Score is the
+// fraction of spacing constraints satisfied, so a partial architecture scores
+// partially rather than being silently dropped.
+inline double yr_catalytic_score(const std::string& aa) {
+    if (aa.size() < 120u) return 0.0;
+    double best = 0.0;
+    for (size_t y = 60; y < aa.size(); ++y) {
+        if (aa[y] != 'Y') continue;
+        // Walk upstream looking for R2, then H, then R1 in YR spacing windows.
+        // Windows (residues upstream of Y) follow the integrase core spacing:
+        //   R2:  8-40,  H: +6-45 further,  R1: +8-70 further.
+        auto find_up = [&](size_t from, char res, int lo, int hi, size_t& hit) -> bool {
+            for (int d = lo; d <= hi; ++d) {
+                if (from < static_cast<size_t>(d)) break;
+                if (aa[from - static_cast<size_t>(d)] == res) { hit = from - static_cast<size_t>(d); return true; }
+            }
+            return false;
+        };
+        int sat = 0;
+        size_t r2 = 0, h = 0, r1 = 0;
+        const bool okR2 = find_up(y, 'R', 8, 40, r2);
+        if (okR2) ++sat;
+        const bool okH  = okR2 && find_up(r2, 'H', 6, 45, h);
+        if (okH) ++sat;
+        const bool okR1 = okH && find_up(h, 'R', 8, 70, r1);
+        if (okR1) ++sat;
+        // Optional secondary H/W between R1 and H (the "K/H" of patch II).
+        if (okR1) {
+            for (size_t p = r1; p < h; ++p)
+                if (aa[p] == 'H' || aa[p] == 'W') { ++sat; break; }
+        }
+        const double s = static_cast<double>(sat) / 4.0;
+        if (s > best) best = s;
+        if (best >= 0.999) break;
+    }
+    return best;
+}
+
+// Six-frame ORF scan for a captain gene.  Starship captains sit at the 5'
+// terminus of the element and are transcribed into the element, so ORFs are
+// weighted toward the 5' end and long ORFs are preferred.  Returns the best
+// candidate; present=true only above a conservative score gate so a bare ORF
+// is never reported as a captain.
+inline CaptainGene detect_captain_gene(std::string_view seq,
+                                       size_t scanLimit = 12000,
+                                       int    minOrfAa  = 150,
+                                       double scoreGate = 0.75) {
+    CaptainGene cg;
+    const size_t n = seq.size();
+    if (n < static_cast<size_t>(minOrfAa) * 3) return cg;
+
+    // Restrict the search to the 5'-proximal region (captain locus) but cap by
+    // scanLimit so we never translate a whole megabase-scale segment.
+    const size_t region = std::min(n, scanLimit);
+
+    auto revcomp = [&](std::string_view s) {
+        std::string r(s.size(), 'N');
+        for (size_t i = 0; i < s.size(); ++i) {
+            char c = static_cast<char>(std::toupper((unsigned char)s[s.size() - 1 - i]));
+            switch (c) { case 'A': r[i]='T';break; case 'T': r[i]='A';break;
+                         case 'C': r[i]='G';break; case 'G': r[i]='C';break; default: r[i]='N'; }
+        }
+        return r;
+    };
+
+    // For reverse frames the captain would sit at the 3' end of the segment
+    // (5' of the element on the minus strand), so scan the 3'-proximal window.
+    const std::string fwd(seq.substr(0, region));
+    const std::string rev = revcomp(seq.substr(n - region, region));
+
+    double bestScore = 0.0;
+    auto scan_strand = [&](const std::string& dna, int strandSign) {
+        for (int f = 0; f < 3; ++f) {
+            // Translate frame f into amino acids, tracking ORF spans (M..*).
+            std::string aa;
+            aa.reserve(dna.size() / 3);
+            std::vector<size_t> ntOfAa;
+            ntOfAa.reserve(dna.size() / 3);
+            for (size_t i = static_cast<size_t>(f); i + 3 <= dna.size(); i += 3) {
+                aa.push_back(translate_codon(dna[i], dna[i + 1], dna[i + 2]));
+                ntOfAa.push_back(i);
+            }
+            // Walk ORFs delimited by stops.
+            size_t orfStart = 0;
+            for (size_t i = 0; i <= aa.size(); ++i) {
+                const bool atStop = (i == aa.size()) || aa[i] == '*';
+                if (atStop) {
+                    if (i > orfStart) {
+                        const std::string orf = aa.substr(orfStart, i - orfStart);
+                        if (static_cast<int>(orf.size()) >= minOrfAa) {
+                            double sc = yr_catalytic_score(orf);
+                            // 5'-proximity bonus (captain is terminal): decays
+                            // over the scanned region.
+                            const size_t ntpos = ntOfAa.empty() ? 0 : ntOfAa[std::min(orfStart, ntOfAa.size()-1)];
+                            const double prox = 1.0 - 0.3 * (static_cast<double>(ntpos) /
+                                                             static_cast<double>(region + 1));
+                            sc *= prox;
+                            if (sc > bestScore) {
+                                bestScore   = sc;
+                                cg.frame    = strandSign * (f + 1);
+                                cg.orfLenAa = static_cast<int>(orf.size());
+                                cg.score    = sc;
+                                // Map back to segment coordinates.
+                                cg.ntStart  = (strandSign > 0)
+                                    ? ntpos
+                                    : (n - region) + (region - (ntpos + orf.size() * 3));
+                            }
+                        }
+                    }
+                    orfStart = i + 1;
+                }
+            }
+        }
+    };
+    scan_strand(fwd, +1);
+    scan_strand(rev, -1);
+
+    if (bestScore >= scoreGate) {
+        cg.present = true;
+        // A high-scoring, long, 5'-terminal YR is the canonical DUF3435 captain;
+        // a weaker/internal hit is reported as a generic tyrosine recombinase.
+        cg.family = (cg.score >= 0.85 && cg.ntStart < 8000 && cg.orfLenAa >= 250)
+                        ? "YR_DUF3435" : "YR_GENERIC";
+    }
+    return cg;
+}
+
+// -------------------------------------------------------------------------
+// 3. Donor lineage / historical-transfer signature
+// -------------------------------------------------------------------------
+struct DonorSignature {
+    double      hostGc        = 0.0;
+    double      elementGc     = 0.0;
+    double      deltaGc       = 0.0;   // elementGc - hostGc
+    double      gc3Skew       = 0.0;   // 3rd-codon-position GC deviation proxy
+    double      signatureDist = 0.0;   // Karlin dinucleotide delta*-distance (x1000)
+    std::string donorClass    = "UNDETERMINED"; // HIGHER_GC_DONOR | LOWER_GC_DONOR | HOST_LIKE
+    std::string transferAge   = "UNDETERMINED"; // RECENT | AMELIORATING | ANCIENT | HOST_NATIVE
+};
+
+// Karlin genomic signature: sum over the 16 dinucleotides of |rho_elem - rho_host|
+// where rho_xy = f_xy / (f_x * f_y) is the odds ratio of observed to expected
+// dinucleotide frequency.  Host expectation is taken from the flanking host
+// sequence when the boundary leaves flanks inside the segment; otherwise a
+// composition null derived from hostGc is used.  Returned x1000, as is
+// conventional for delta* distances.
+inline double dinuc_signature_distance(std::string_view elem, std::string_view host,
+                                       double hostGc) {
+    auto idx = [](char c) -> int {
+        switch (std::toupper((unsigned char)c)) {
+            case 'A': return 0; case 'C': return 1; case 'G': return 2; case 'T': return 3;
+            default:  return -1;
+        }
+    };
+    auto profile = [&](std::string_view s, std::array<double,4>& mono,
+                       std::array<double,16>& di) {
+        mono.fill(0.0); di.fill(0.0);
+        double mc = 0, dc = 0;
+        for (size_t i = 0; i < s.size(); ++i) {
+            int a = idx(s[i]);
+            if (a >= 0) { mono[static_cast<size_t>(a)] += 1.0; mc += 1.0; }
+            if (i + 1 < s.size()) {
+                int b = idx(s[i + 1]);
+                if (a >= 0 && b >= 0) { di[static_cast<size_t>(a * 4 + b)] += 1.0; dc += 1.0; }
+            }
+        }
+        if (mc > 0) for (auto& v : mono) v /= mc;
+        if (dc > 0) for (auto& v : di)   v /= dc;
+    };
+
+    std::array<double,4>  monoE, monoH;
+    std::array<double,16> diE, diH;
+    profile(elem, monoE, diE);
+    if (host.size() >= 200u) {
+        profile(host, monoH, diH);
+    } else {
+        // Composition null from hostGc: A=T=(1-gc)/2, C=G=gc/2, independent.
+        const double at = (1.0 - hostGc) / 2.0, gcp = hostGc / 2.0;
+        monoH = {at, gcp, gcp, at};
+        for (int a = 0; a < 4; ++a)
+            for (int b = 0; b < 4; ++b)
+                diH[static_cast<size_t>(a * 4 + b)] = monoH[static_cast<size_t>(a)] *
+                                                      monoH[static_cast<size_t>(b)];
+    }
+    double dist = 0.0;
+    for (int a = 0; a < 4; ++a) {
+        for (int b = 0; b < 4; ++b) {
+            const double expE = monoE[static_cast<size_t>(a)] * monoE[static_cast<size_t>(b)];
+            const double expH = monoH[static_cast<size_t>(a)] * monoH[static_cast<size_t>(b)];
+            const double rhoE = expE > 1e-9 ? diE[static_cast<size_t>(a*4+b)] / expE : 0.0;
+            const double rhoH = expH > 1e-9 ? diH[static_cast<size_t>(a*4+b)] / expH : 0.0;
+            dist += std::fabs(rhoE - rhoH);
+        }
+    }
+    return 1000.0 * dist / 16.0;
+}
+
+// GC at 3rd codon position (frame-agnostic proxy): average GC of every third
+// base across the three frames' modal frame is unknown without a gene model,
+// so we report the maximum |GC3 - hostGc| across the three frames, which peaks
+// when a coding donor signature is retained (recent transfer) and flattens as
+// codon usage ameliorates toward the host.
+inline double gc3_skew(std::string_view seq, double hostGc) {
+    double best = 0.0;
+    for (int f = 0; f < 3; ++f) {
+        size_t gc = 0, tot = 0;
+        for (size_t i = static_cast<size_t>(f) + 2; i < seq.size(); i += 3) {
+            char c = static_cast<char>(std::toupper((unsigned char)seq[i]));
+            if (c == 'A' || c == 'C' || c == 'G' || c == 'T') {
+                ++tot;
+                if (c == 'G' || c == 'C') ++gc;
+            }
+        }
+        if (tot > 30) {
+            const double g3 = static_cast<double>(gc) / static_cast<double>(tot);
+            best = std::max(best, std::fabs(g3 - hostGc));
+        }
+    }
+    return best;
+}
+
+// Infer donor compositional class and the age of the transfer from the
+// element's divergence from the host genomic signature.  We cannot name a
+// donor species without a reference database (and deliberately do not fake
+// one); instead we report the *direction* of the donor's compositional bias
+// and how far the element has ameliorated toward the host, which is the
+// classic recent-vs-ancient HGT discriminator (Lawrence & Ochman 1997):
+// recent transfers retain the donor signature, ancient ones ameliorate.
+inline DonorSignature infer_donor_signature(std::string_view seq,
+                                            const ElementBoundary& b,
+                                            double hostGc) {
+    DonorSignature d;
+    d.hostGc = hostGc;
+    if (seq.size() < 200u) return d;
+
+    // Element body and host flanks (if the boundary left any inside the segment).
+    std::string_view body = (b.resolved && b.end > b.start)
+        ? seq.substr(b.start, b.end - b.start) : seq;
+    std::string host;
+    if (b.resolved) {
+        if (b.start > 50) host.append(seq.substr(0, b.start));
+        if (seq.size() - b.end > 50) host.append(seq.substr(b.end));
+    }
+
+    d.elementGc     = gc_content(body);
+    d.deltaGc       = d.elementGc - hostGc;
+    d.gc3Skew       = gc3_skew(body, hostGc);
+    d.signatureDist = dinuc_signature_distance(body, host, hostGc);
+
+    // Donor compositional direction.
+    if (std::fabs(d.deltaGc) < 0.03)       d.donorClass = "HOST_LIKE";
+    else if (d.deltaGc > 0.0)              d.donorClass = "HIGHER_GC_DONOR";
+    else                                   d.donorClass = "LOWER_GC_DONOR";
+
+    // Amelioration state == transfer age.  A strong donor signature that still
+    // differs from the host => recent; a decayed signature that has drifted
+    // toward the host => historical (Lawrence & Ochman 1997).
+    //
+    // The dinucleotide signature term is only trustworthy when a *real* host
+    // sequence was available to compare against (the boundary left host flanks
+    // inside the segment).  Measured against the composition-only null, a finite
+    // host-native sequence carries sampling noise that would spuriously inflate
+    // the distance, so when there is no host context we decide on GC divergence
+    // alone rather than over-trust the null-based signature.
+    const bool   hasHostContext = host.size() >= 200u;
+    const double gcDiv = std::fabs(d.deltaGc);
+    const double sig   = d.signatureDist;
+    if (hasHostContext) {
+        if (gcDiv < 0.03 && sig < 40.0)            d.transferAge = "HOST_NATIVE";
+        else if (gcDiv >= 0.08 || sig >= 90.0)     d.transferAge = "RECENT";
+        else if (gcDiv >= 0.05 || sig >= 60.0)     d.transferAge = "AMELIORATING";
+        else                                       d.transferAge = "ANCIENT";
+    } else {
+        if (gcDiv < 0.03)                          d.transferAge = "HOST_NATIVE";
+        else if (gcDiv >= 0.08)                    d.transferAge = "RECENT";
+        else if (gcDiv >= 0.05)                    d.transferAge = "AMELIORATING";
+        else                                       d.transferAge = "ANCIENT";
+    }
+    return d;
+}
+
+// -------------------------------------------------------------------------
+// Master extended annotator
+// -------------------------------------------------------------------------
+struct ElementAnnotation {
+    ElementClass    ec = ElementClass::NONE;
+    ElementBoundary boundary;
+    CaptainGene     captain;
+    DonorSignature  donor;
+    bool            donorApplicable = false;   // donor/age fields meaningful (HGT/Starship)
+};
+
+// Runs the ElementClass dispatcher, then augments Starship / HGT / TE calls
+// with boundary, captain-gene, and donor-signature annotation.  Boundary is
+// resolved for every non-trivial element; captain detection runs only for
+// Starship (that is where the DUF3435 captain is biologically expected); donor
+// signature runs for the horizontally mobile classes (Starship + HGT).
+inline ElementAnnotation annotate_element(std::string_view seq,
+                                          double cladeGc = 0.45,
+                                          std::string_view phylum = ".") {
+    ElementAnnotation a;
+    a.ec = classify_repeat_element(seq, cladeGc, phylum);
+    if (a.ec == ElementClass::NONE || seq.size() < 100u) return a;
+
+    a.boundary = find_element_boundary(seq, a.ec, cladeGc);
+
+    // Captain / donor annotation is keyed on the underlying biology, NOT on
+    // which class won the priority-ordered dispatch.  A genuine Starship hull is
+    // AT-rich and frequently RIP'd, so it can be labelled RIP by
+    // classify_repeat_element yet still be a horizontally mobile element with a
+    // captain and a donor signature.  We therefore re-test the mobile-element
+    // detectors directly here so the extended annotation is not suppressed by
+    // dispatch priority.
+    const bool starshipLike =
+        (a.ec == ElementClass::STARSHIP) ||
+        (starship_supported_phylum(phylum) && detect_starship(seq, cladeGc));
+    const bool hgtLike =
+        (a.ec == ElementClass::HGT) || detect_hgt_island(seq, cladeGc);
+
+    if (starshipLike) {
+        a.captain = detect_captain_gene(seq);
+    }
+    if (starshipLike || hgtLike) {
+        a.donor = infer_donor_signature(seq, a.boundary, cladeGc);
+        a.donorApplicable = true;
+    }
+    return a;
 }
 
 // =========================================================================

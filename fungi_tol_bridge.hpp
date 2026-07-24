@@ -104,6 +104,14 @@ struct VariantCallBridge {
     bool        mateOffReference = false;
     // ElementClass tag written to GFA S-lines for off-reference calls
     std::string elementClass        = "NONE";
+    // Extended element annotation (Starship / HGT); all self-contained,
+    // sequence-intrinsic estimates — see layer1_clade_graph.hpp annotate_element.
+    std::string elemBoundary        = ".";      // "start-end" (0-based) within the segment
+    std::string elemFlank           = "NONE";   // TSD | DR | TIR | COMPOSITIONAL | NONE
+    std::string captainGene         = "NONE";   // YR_DUF3435 | YR_GENERIC | NONE
+    double      captainScore        = 0.0;      // 0..1 captain motif confidence
+    std::string donorClass          = ".";      // HIGHER_GC_DONOR | LOWER_GC_DONOR | HOST_LIKE
+    std::string transferAge         = ".";      // RECENT | AMELIORATING | ANCIENT | HOST_NATIVE
     // Routed taxonomic context for VCF/TSV/GFA reporting
     std::string cladeRank           = ".";
     std::string phylum              = ".";
@@ -2177,6 +2185,36 @@ inline VariantCallBridge make_insdel_call(const std::string& qAsm,
 }
 
 // make_offref_call
+// Runs the self-contained extended annotator (ElementClass + boundary +
+// captain gene + donor/transfer-age signature) over a segment and copies the
+// results into the call's reporting fields.  Leaves the defaults ("NONE"/".")
+// untouched when nothing fires, so unannotated calls stay clean.  Used by every
+// off-reference constructor so Starship/HGT annotation is uniform across modes.
+inline void apply_element_annotation(VariantCallBridge& v,
+                                     std::string_view seq,
+                                     double cladeGc) {
+    if (seq.empty()) { v.elementClass = "NONE"; return; }
+    const ElementAnnotation a =
+        annotate_element(seq, cladeGc, v.phylum.empty() ? std::string_view(".")
+                                                        : std::string_view(v.phylum));
+    v.elementClass = element_class_name(a.ec);
+    if (a.ec == ElementClass::NONE) return;
+
+    if (a.boundary.resolved) {
+        v.elemBoundary = std::to_string(a.boundary.start) + "-" +
+                         std::to_string(a.boundary.end);
+        v.elemFlank    = a.boundary.flankType;
+    }
+    if (a.captain.present) {
+        v.captainGene  = a.captain.family;
+        v.captainScore = a.captain.score;
+    }
+    if (a.donorApplicable) {
+        v.donorClass  = a.donor.donorClass;
+        v.transferAge = a.donor.transferAge;
+    }
+}
+
 // Classifies the element type and stores it in elementClass.
 inline VariantCallBridge make_offref_call(const std::string& qAsm,
                                           const std::string& qContig,
@@ -2210,11 +2248,8 @@ inline VariantCallBridge make_offref_call(const std::string& qAsm,
     v.cladeRank   = cladeRank.empty() ? "." : cladeRank;
     v.phylum      = phylum.empty() ? "." : phylum;
     v.readSupport = parse_pseudocontig_support(qContig);
-    // Classify element type for GFA EC tag
-    const ElementClass ec = seq.empty()
-        ? ElementClass::NONE
-        : classify_repeat_element(std::string_view(seq.data(), seq.size()), cladeGc, v.phylum);
-    v.elementClass = element_class_name(ec);
+    // Classify element type + extended Starship/HGT annotation for the GFA/VCF tags
+    apply_element_annotation(v, seq, cladeGc);
     return v;
 }
 

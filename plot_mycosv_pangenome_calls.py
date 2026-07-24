@@ -926,14 +926,43 @@ def _load_query_meta_map(by_query_dir: Path) -> dict[str, dict[str, str]]:
         candidates.append(ancestor / "prepared" / "query_manifest.tsv")
     for ancestor in by_query_dir.parents:
         candidates.append(ancestor / "prepared" / "query_manifest.tsv")
+        if ancestor.name == "million_real":
+            candidates.extend(
+                sorted(ancestor.glob("full_fungal_longread_table2_*/prepared/query_manifest.tsv"))
+            )
+            candidates.extend(
+                sorted(ancestor.glob("full_fungal*/prepared/query_manifest.tsv"))
+            )
     manifest = next((c for c in candidates if c.exists()), None)
     if manifest is None:
         return {}
+    tax_fields = ("phylum", "class", "order", "family")
+    species_taxonomy: dict[str, dict[str, str]] = {}
+    for cand in dict.fromkeys(c for c in candidates if c.exists()):
+        try:
+            with cand.open() as fh:
+                for row in csv.DictReader(fh, delimiter="\t"):
+                    species = (row.get("species") or "").strip()
+                    if not species or species == ".":
+                        continue
+                    current = species_taxonomy.setdefault(species, {})
+                    for field in tax_fields:
+                        value = (row.get(field) or "").strip()
+                        if value and value != "." and field not in current:
+                            current[field] = value
+        except OSError:
+            continue
     out: dict[str, dict[str, str]] = {}
     with manifest.open() as fh:
         for row in csv.DictReader(fh, delimiter="\t"):
             asm = (row.get("query_asm") or "").strip()
             if asm:
+                species = (row.get("species") or "").strip()
+                fallback = species_taxonomy.get(species, {})
+                for field in tax_fields:
+                    if ((row.get(field) or "").strip() in {"", "."}
+                            and fallback.get(field)):
+                        row[field] = fallback[field]
                 out[asm] = row
     return out
 
@@ -972,7 +1001,12 @@ def aggregate_panel_read_validation(
                     if not src:
                         continue
                     status = (r.get("status") or "").strip()
-                    if status not in {"validated", "not_validated"}:
+                    # Count external validation attempts as yes/no. MycoSV
+                    # long-read mode also emits `validated_intrinsic_no_bam`
+                    # for pseudo-contig cluster support; that is useful
+                    # evidence, but it is not the independent split-read
+                    # validation rate reported in manuscript tables.
+                    if status not in {"validated", "not_validated", "not_validated_externally"}:
                         continue
                     try:
                         key = (
@@ -1893,10 +1927,6 @@ def build_manuscript_table2_longread(
     benchmark reference for the comparator coordinate space. Two evaluation
     axes per the manuscript scoping:
       1. Independent read-level validation — split-read support % column.
-      2. Same single-reference coordinate space — the F1 vs <caller>
-         columns are computed against each comparator's call set on the
-         shared benchmark reference, so all four tools are directly
-         comparable on the same axis.
 
     Column choice follows Liao 2023 HPRC Table 2, Hickey 2024
     Minigraph-Cactus Table 3, and Heller & Vingron 2022 Sniffles2 Table 1.
@@ -1907,14 +1937,8 @@ def build_manuscript_table2_longread(
       Sniffles2 calls         — canonical ONT/PacBio SV caller
       cuteSV calls            — canonical long-read SV caller
       SVIM calls              — canonical long-read SV caller
-      MycoSV ∩ ≥2 LR callers  — consensus_2of_3 vs MycoSV agreement (intersection size)
-      MycoSV F1 vs sniffles   — exact-match F1 against sniffles truth
-      MycoSV F1 vs cuteSV     — exact-match F1 against cuteSV truth
-      MycoSV F1 vs SVIM       — exact-match F1 against SVIM truth
       MycoSV read-valid. (%)  — split-read support fraction
       OFF_REF novel (MycoSV)  — insertions with no homologous reference anchor
-
-    Plus a panel-aggregate row at the bottom.
     """
     by_asm_rv: dict[str, dict[str, dict[str, int]]] = defaultdict(dict)
     for r in rv_rows:
@@ -2037,10 +2061,6 @@ def build_manuscript_table2_longread(
             "sniffles_calls": comp_calls.get("sniffles", 0),
             "cutesv_calls": comp_calls.get("cutesv", 0),
             "svim_calls": comp_calls.get("svim", 0),
-            "mycosv_vs_2of3_consensus": consensus_count,
-            "f1_vs_sniffles": comp_f1.get("sniffles", 0.0),
-            "f1_vs_cutesv": comp_f1.get("cutesv", 0.0),
-            "f1_vs_svim": comp_f1.get("svim", 0.0),
             "off_ref_novel": off_ref,
         }
 
@@ -2061,50 +2081,15 @@ def build_manuscript_table2_longread(
             "sniffles_calls": s["sniffles_calls"],
             "cutesv_calls": s["cutesv_calls"],
             "svim_calls": s["svim_calls"],
-            "mycosv_vs_2of3_consensus": s["mycosv_vs_2of3_consensus"],
-            "f1_vs_sniffles": f"{s['f1_vs_sniffles']:.3f}",
-            "f1_vs_cutesv":   f"{s['f1_vs_cutesv']:.3f}",
-            "f1_vs_svim":     f"{s['f1_vs_svim']:.3f}",
             "mycosv_read_validated_pct": (
                 f"{(rv['yes'] / rv['total'] * 100):.1f}" if rv["total"] else "."
             ),
             "off_ref_novel": s["off_ref_novel"],
         })
 
-    # Panel-aggregate row.
-    if rows:
-        def _avg_f1(field: str) -> str:
-            vals = [per_sample[q][field] for q in queries
-                    if isinstance(per_sample[q][field], (int, float))
-                    and per_sample[q][field] > 0]
-            return f"{(sum(vals) / len(vals)):.3f}" if vals else "."
-        rv_all_yes = sum(by_asm_rv.get(q, {}).get("mycosv", {}).get("yes", 0)
-                         for q in queries)
-        rv_all_tot = sum(by_asm_rv.get(q, {}).get("mycosv", {}).get("total", 0)
-                         for q in queries)
-        rows.append({
-            "sample": f"Panel ({len(queries)} samples)",
-            "species": ".", "class": ".", "platform": ".", "coverage": ".",
-            "mycosv_calls": sum(per_sample[q]["mycosv_calls"] for q in queries),
-            "sniffles_calls": sum(per_sample[q]["sniffles_calls"] for q in queries),
-            "cutesv_calls": sum(per_sample[q]["cutesv_calls"] for q in queries),
-            "svim_calls": sum(per_sample[q]["svim_calls"] for q in queries),
-            "mycosv_vs_2of3_consensus": sum(
-                per_sample[q]["mycosv_vs_2of3_consensus"] for q in queries),
-            "f1_vs_sniffles": _avg_f1("f1_vs_sniffles"),
-            "f1_vs_cutesv": _avg_f1("f1_vs_cutesv"),
-            "f1_vs_svim": _avg_f1("f1_vs_svim"),
-            "mycosv_read_validated_pct": (
-                f"{(rv_all_yes / rv_all_tot * 100):.1f}" if rv_all_tot else "."
-            ),
-            "off_ref_novel": sum(off_ref_by_asm.get(q, 0) for q in queries),
-        })
-
     columns = [
         "sample", "species", "class", "platform", "coverage",
         "mycosv_calls", "sniffles_calls", "cutesv_calls", "svim_calls",
-        "mycosv_vs_2of3_consensus",
-        "f1_vs_sniffles", "f1_vs_cutesv", "f1_vs_svim",
         "mycosv_read_validated_pct", "off_ref_novel",
     ]
     write_tsv(out_tsv, rows, columns)
@@ -2119,10 +2104,6 @@ def build_manuscript_table2_longread(
         "sniffles_calls": "Sniffles2 calls",
         "cutesv_calls": "cuteSV calls",
         "svim_calls": "SVIM calls",
-        "mycosv_vs_2of3_consensus": "MycoSV ∩ ≥2 LR callers",
-        "f1_vs_sniffles": "F1 vs Sniffles2",
-        "f1_vs_cutesv":   "F1 vs cuteSV",
-        "f1_vs_svim":     "F1 vs SVIM",
         "mycosv_read_validated_pct": "MycoSV split-read support (%)",
         "off_ref_novel": "OFF_REF novel (MycoSV)",
     }
@@ -2134,11 +2115,7 @@ def build_manuscript_table2_longread(
         " same PB/ONT FASTQ input. Per-sample rows ordered by phylogeny."
         " *Coverage* is the auto-tuner's effective coverage estimate from the"
         " MycoSV preprocessing log (mean read length × read count / genome bp)."
-        " *MycoSV ∩ ≥2 LR callers* is the count of MycoSV calls supported by"
-        " the consensus_2of_3 long-read truth set (Sniffles2 ∩ cuteSV ∪ SVIM"
-        " pairwise majority). *F1 vs <caller>* is the exact-match F1 of"
-        " MycoSV's predictions against that caller's truth set on the same"
-        " single benchmark reference. *Split-read support (%)* is the fraction"
+        " *Split-read support (%)* is the fraction"
         " of MycoSV calls independently confirmed by raw split-read"
         " alignments. *OFF_REF novel* counts MycoSV insertions whose alt"
         " allele has no homologous anchor on the reference — a category only"

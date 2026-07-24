@@ -8,6 +8,9 @@ experiments/
 logs/
 .slurm*
 *bin*
+# Manuscript: ignore the whole tree, including every subfolder and file
+manuscript/
+manuscript/**
 
 # 🔹 Large files
 slurm*
