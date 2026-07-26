@@ -7,7 +7,7 @@
 #SBATCH --array=1-78%72
 #SBATCH --output=logs/slurm/slurm-libanno-%A_%a.out
 set -uo pipefail
-R=/mnt/bmh01-rds/Shilpa_Group/2024/projects/fungi/AMF/scale
+R="${MYCOSV_ROOT:-${SLURM_SUBMIT_DIR:-$PWD}}"
 cd $R; export PATH="$R/tools_src/elembench/bin:$PATH"
 R2=$R/experiments/biology_benchmark
 read -r tag k chunk lib < <(sed -n "${SLURM_ARRAY_TASK_ID}p" $R2/chunks/blast_tasks.tsv)

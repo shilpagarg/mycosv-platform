@@ -7,6 +7,8 @@ outputs/
 experiments/
 logs/
 .slurm*
+.agents*
+.pytest_cache/
 *bin*
 # Manuscript: ignore the whole tree, including every subfolder and file
 manuscript/

@@ -25,4 +25,4 @@ fi
 export MILLION_REAL_SINGLE_REF_CACHE_MB="${MILLION_REAL_SINGLE_REF_CACHE_MB:-4096}"
 export MILLION_REAL_MAX_REF_MEMORY_MB="${MILLION_REAL_MAX_REF_MEMORY_MB:-4096}"
 
-exec bash /mnt/bmh01-rds/Shilpa_Group/2024/projects/fungi/AMF/scale/run_all_experiments.sh --million-real "$@"
+exec bash "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/run_all_experiments.sh" --million-real "$@"

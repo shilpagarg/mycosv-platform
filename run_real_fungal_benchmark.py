@@ -793,12 +793,10 @@ def normalize_name(raw: str) -> str:
 
 
 _FALLBACK_ENV_BINS: tuple[Path, ...] = (
-    # Same default the install_tools.sh / Apptainer wrappers use. Looking here
-    # makes the comparator pre-flight see installed tools even when the user
-    # invoked python3 from a non-activated shell (e.g. via run_all_experiments.sh
-    # which does not source conda.sh). Honors $CONDA_PREFIX / $MYCOSV_ENV_PATH.
+    # Lets the comparator pre-flight see installed tools even when python3 was
+    # invoked from a non-activated shell (e.g. via run_all_experiments.sh, which
+    # does not source conda.sh). Honors $MYCOSV_ENV_PATH / $CONDA_PREFIX.
     Path(os.environ.get("MYCOSV_ENV_PATH", os.environ.get("CONDA_PREFIX", "/dev/null"))) / "bin",
-    Path("/mnt/bmh01-rds/Shilpa_Group/2024/projects/fungi/tools/envs/envs/fungi_graph_sv/bin"),
 )
 
 
@@ -7802,7 +7800,7 @@ def compile_binary_if_needed(binary_path: Path, force: bool = False) -> None:
     import fcntl
     lock_path = binary_path.with_suffix(binary_path.suffix + ".lock")
     lock_path.parent.mkdir(parents=True, exist_ok=True)
-    # flock(2) on the bmh01-rds NFS share returns ENOLCK ("No locks available")
+    # flock(2) on an NFS share can return ENOLCK ("No locks available")
     # under SLURM array contention - the prior panel lost ~half its shards to
     # exactly this when the binary looked stale (a .hpp newer than the binary)
     # and dozens of tasks raced to lock+rebuild. The submit wrapper prebuilds a

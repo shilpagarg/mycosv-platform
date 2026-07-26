@@ -76,13 +76,8 @@ try:
     import numpy as np
     import pandas as pd
 except ModuleNotFoundError:
-    fallback_python = Path(
-        os.environ.get(
-            "MYCOSV_ENV_PYTHON",
-            "/mnt/bmh01-rds/Shilpa_Group/2024/projects/fungi/tools/envs/envs/fungi_graph_sv/bin/python",
-        )
-    )
-    if fallback_python.exists() and Path(sys.executable).resolve() != fallback_python.resolve():
+    fallback_python = Path(os.environ.get("MYCOSV_ENV_PYTHON", ""))
+    if str(fallback_python) and fallback_python.exists() and Path(sys.executable).resolve() != fallback_python.resolve():
         os.execv(str(fallback_python), [str(fallback_python), *sys.argv])
     raise
 

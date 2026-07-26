@@ -7,7 +7,7 @@
 #SBATCH --array=1-5
 #SBATCH --output=logs/slurm/slurm-tesorter-%A_%a.out
 set -uo pipefail
-R=/mnt/bmh01-rds/Shilpa_Group/2024/projects/fungi/AMF/scale
+R="${MYCOSV_ROOT:-${SLURM_SUBMIT_DIR:-$PWD}}"
 cd $R; export PATH="$R/tools_src/elembench/bin:$PATH"
 read -r tag stem < <(sed -n "${SLURM_ARRAY_TASK_ID}p" $R/experiments/biology_benchmark/genomes.tsv)
 cd $R/experiments/biology_benchmark; mkdir -p tesorter; cd tesorter

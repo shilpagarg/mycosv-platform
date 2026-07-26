@@ -11,8 +11,8 @@ set -euo pipefail
 PROJECT_DIR="${SLURM_SUBMIT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
 cd "${PROJECT_DIR}"
 
-COMPARATOR_ENV="/mnt/bmh01-rds/Shilpa_Group/2024/projects/fungi/tools/envs/envs/fungi_graph_sv"
-if [[ -d "${COMPARATOR_ENV}/bin" ]]; then
+COMPARATOR_ENV="${COMPARATOR_ENV:-${CONDA_PREFIX:-}}"
+if [[ -n "${COMPARATOR_ENV}" && -d "${COMPARATOR_ENV}/bin" ]]; then
   export PATH="${COMPARATOR_ENV}/bin:${PATH}"
 fi
 

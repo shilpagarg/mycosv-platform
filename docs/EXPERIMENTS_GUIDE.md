@@ -2,10 +2,16 @@
 
 Quick reference for executing all experiments from shell.
 
+Set `MYCOSV_ROOT` to your clone before running any command below:
+
+```bash
+export MYCOSV_ROOT=/path/to/mycosv-platform
+```
+
 ## Quick Start
 
 ```bash
-cd /mnt/bmh01-rds/Shilpa_Group/2024/projects/fungi/AMF/scale
+cd $MYCOSV_ROOT
 
 # Run ALL experiments (small-scale + large-scale + real data)
 bash run_all_experiments.sh

@@ -1,25 +1,31 @@
 # Quick Command Reference
 
+Set `MYCOSV_ROOT` to your clone before running any command below:
+
+```bash
+export MYCOSV_ROOT=/path/to/mycosv-platform
+```
+
 ## One-Liner Commands to Run All Experiments
 
 ### Complete Suite (All experiments with all outputs)
 ```bash
-cd /mnt/bmh01-rds/Shilpa_Group/2024/projects/fungi/AMF/scale && bash run_all_experiments.sh
+cd $MYCOSV_ROOT && bash run_all_experiments.sh
 ```
 
 ### Small-Scale Only (Quick validation, ~30 min)
 ```bash
-cd /mnt/bmh01-rds/Shilpa_Group/2024/projects/fungi/AMF/scale && bash run_all_experiments.sh --small
+cd $MYCOSV_ROOT && bash run_all_experiments.sh --small
 ```
 
 ### Large-Scale Only (Million-scale benchmarks, ~90 min)
 ```bash
-cd /mnt/bmh01-rds/Shilpa_Group/2024/projects/fungi/AMF/scale && bash run_all_experiments.sh --large
+cd $MYCOSV_ROOT && bash run_all_experiments.sh --large
 ```
 
 ### Real Data Only (Fungal genome benchmarks, ~2 hours)
 ```bash
-cd /mnt/bmh01-rds/Shilpa_Group/2024/projects/fungi/AMF/scale && bash run_all_experiments.sh --real
+cd $MYCOSV_ROOT && bash run_all_experiments.sh --real
 ```
 
 ---
@@ -28,20 +34,20 @@ cd /mnt/bmh01-rds/Shilpa_Group/2024/projects/fungi/AMF/scale && bash run_all_exp
 
 ### Small-Scale Simulated Tests Only
 ```bash
-cd /mnt/bmh01-rds/Shilpa_Group/2024/projects/fungi/AMF/scale
+cd $MYCOSV_ROOT
 mkdir -p experiments/small_tests/$(date +%Y%m%d_%H%M%S)
 python3 -m pytest test_pipeline_features.py test_amf.py test_all_use_cases.py -v --tb=short
 ```
 
 ### Small-Scale Real Data Tests Only
 ```bash
-cd /mnt/bmh01-rds/Shilpa_Group/2024/projects/fungi/AMF/scale
+cd $MYCOSV_ROOT
 python3 -m pytest test_real_fungal_benchmark.py test_new_biology_candidates.py -v --tb=short
 ```
 
 ### Million-Scale Benchmark Only (All modes)
 ```bash
-cd /mnt/bmh01-rds/Shilpa_Group/2024/projects/fungi/AMF/scale
+cd $MYCOSV_ROOT
 mkdir -p experiments/large_scale/$(date +%Y%m%d_%H%M%S)
 python3 run_million_mode_query_benchmark.py \
   --out-dir experiments/large_scale/$(date +%Y%m%d_%H%M%S)/million_scale \
@@ -54,7 +60,7 @@ python3 run_million_mode_query_benchmark.py \
 
 ### Million-Scale Per-Mode Benchmark
 ```bash
-cd /mnt/bmh01-rds/Shilpa_Group/2024/projects/fungi/AMF/scale
+cd $MYCOSV_ROOT
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 
 for mode in assembly short-reads long-reads; do
@@ -69,7 +75,7 @@ done
 
 ### Visualization Report (HTML + PNG)
 ```bash
-cd /mnt/bmh01-rds/Shilpa_Group/2024/projects/fungi/AMF/scale
+cd $MYCOSV_ROOT
 python3 sv_visualization_report.py \
   --sv-tsv experiments/large_scale/$TIMESTAMP/results.sv.tsv \
   --out-dir reports/$TIMESTAMP
@@ -82,7 +88,7 @@ python3 sv_visualization_report.py \
 
 ### Real Fungal Data - Single Panel (e.g., compact_yeast)
 ```bash
-cd /mnt/bmh01-rds/Shilpa_Group/2024/projects/fungi/AMF/scale
+cd $MYCOSV_ROOT
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 PANEL="compact_yeast"
 mkdir -p experiments/real_data/$TIMESTAMP/$PANEL/{prepared,benchmark_assembly,benchmark_short-reads,benchmark_long-reads}
@@ -111,7 +117,7 @@ python3 run_real_fungal_benchmark.py benchmark \
 
 ### Real Fungal Data - Expanded Default Panels
 ```bash
-cd /mnt/bmh01-rds/Shilpa_Group/2024/projects/fungi/AMF/scale
+cd $MYCOSV_ROOT
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 mkdir -p experiments/real_data/$TIMESTAMP
 
@@ -142,37 +148,37 @@ done
 
 ### List all experiment outputs
 ```bash
-ls -lah /mnt/bmh01-rds/Shilpa_Group/2024/projects/fungi/AMF/scale/experiments/
+ls -lah $MYCOSV_ROOT/experiments/
 ```
 
 ### See intermediate files for a specific experiment
 ```bash
 TIMESTAMP="YYYYMMDD_HHMMSS"  # Replace with actual timestamp
-find /mnt/bmh01-rds/Shilpa_Group/2024/projects/fungi/AMF/scale/experiments -type f \( -name "*.vcf" -o -name "*.tsv" -o -name "*.fasta" -o -name "*.fastq" \) | head -20
+find $MYCOSV_ROOT/experiments -type f \( -name "*.vcf" -o -name "*.tsv" -o -name "*.fasta" -o -name "*.fastq" \) | head -20
 ```
 
 ### Check disk usage
 ```bash
-du -sh /mnt/bmh01-rds/Shilpa_Group/2024/projects/fungi/AMF/scale/experiments/small_tests
-du -sh /mnt/bmh01-rds/Shilpa_Group/2024/projects/fungi/AMF/scale/experiments/large_scale
-du -sh /mnt/bmh01-rds/Shilpa_Group/2024/projects/fungi/AMF/scale/experiments/real_data
+du -sh $MYCOSV_ROOT/experiments/small_tests
+du -sh $MYCOSV_ROOT/experiments/large_scale
+du -sh $MYCOSV_ROOT/experiments/real_data
 ```
 
 ### View test logs
 ```bash
 TIMESTAMP="YYYYMMDD_HHMMSS"
-cat /mnt/bmh01-rds/Shilpa_Group/2024/projects/fungi/AMF/scale/experiments/small_tests/$TIMESTAMP/simulated/pytest_output.log
-cat /mnt/bmh01-rds/Shilpa_Group/2024/projects/fungi/AMF/scale/experiments/small_tests/$TIMESTAMP/real_data/pytest_output.log
+cat $MYCOSV_ROOT/experiments/small_tests/$TIMESTAMP/simulated/pytest_output.log
+cat $MYCOSV_ROOT/experiments/small_tests/$TIMESTAMP/real_data/pytest_output.log
 ```
 
 ### Check for errors in all logs
 ```bash
-grep -r "ERROR\|FAIL\|Exception" /mnt/bmh01-rds/Shilpa_Group/2024/projects/fungi/AMF/scale/experiments/ 2>/dev/null | head -20
+grep -r "ERROR\|FAIL\|Exception" $MYCOSV_ROOT/experiments/ 2>/dev/null | head -20
 ```
 
 ### Count total intermediate files saved
 ```bash
-find /mnt/bmh01-rds/Shilpa_Group/2024/projects/fungi/AMF/scale/experiments -type f \( -name "*.vcf" -o -name "*.vcf.gz" -o -name "*.tsv" -o -name "*.fasta" -o -name "*.fastq" \) | wc -l
+find $MYCOSV_ROOT/experiments -type f \( -name "*.vcf" -o -name "*.vcf.gz" -o -name "*.tsv" -o -name "*.fasta" -o -name "*.fastq" \) | wc -l
 ```
 
 ---
@@ -181,7 +187,7 @@ find /mnt/bmh01-rds/Shilpa_Group/2024/projects/fungi/AMF/scale/experiments -type
 
 ### Activate virtual environment (if needed)
 ```bash
-source /mnt/bmh01-rds/Shilpa_Group/2024/projects/fungi/AMF/scale/.venv/bin/activate
+source $MYCOSV_ROOT/.venv/bin/activate
 ```
 
 ### Check Python version
@@ -206,28 +212,28 @@ pip install pytest numpy scipy pandas
 ### Watch experiment in progress
 ```bash
 # In one terminal
-cd /mnt/bmh01-rds/Shilpa_Group/2024/projects/fungi/AMF/scale && bash run_all_experiments.sh
+cd $MYCOSV_ROOT && bash run_all_experiments.sh
 
 # In another terminal, monitor
-watch -n 5 "du -sh /mnt/bmh01-rds/Shilpa_Group/2024/projects/fungi/AMF/scale/experiments"
+watch -n 5 "du -sh $MYCOSV_ROOT/experiments"
 ```
 
 ### See test progress
 ```bash
 # Watch for new log files being created
-watch -n 5 "find /mnt/bmh01-rds/Shilpa_Group/2024/projects/fungi/AMF/scale/experiments -name '*.log' | wc -l"
+watch -n 5 "find $MYCOSV_ROOT/experiments -name '*.log' | wc -l"
 ```
 
 ### Monitor resource usage
 ```bash
 # CPU and memory
-top -u q33190sg
+top -u $USER
 
 # Disk I/O
 iostat -x 1 5
 
 # File count growth
-watch -n 5 "find /mnt/bmh01-rds/Shilpa_Group/2024/projects/fungi/AMF/scale/experiments -type f | wc -l"
+watch -n 5 "find $MYCOSV_ROOT/experiments -type f | wc -l"
 ```
 
 ---

@@ -20,7 +20,7 @@
 set -u
 set -o pipefail
 
-WORK_DIR="/mnt/bmh01-rds/Shilpa_Group/2024/projects/fungi/AMF/scale"
+WORK_DIR="${WORK_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 EXPERIMENT_TYPE="${1:-all}"  # all, simulated, real, million-real
 

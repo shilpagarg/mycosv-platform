@@ -34,7 +34,7 @@
 set -u
 set -o pipefail
 
-readonly DEFAULT_ENV_PATH="/mnt/bmh01-rds/Shilpa_Group/2024/projects/fungi/tools/envs/envs/fungi_graph_sv"
+readonly DEFAULT_ENV_PATH="${CONDA_PREFIX:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/envs/fungi_graph_sv}"
 readonly DEFAULT_CONDA_INIT="/opt/apps/apps/binapps/conda/miniforge3/25.9.1-0/etc/profile.d/conda.sh"
 
 ENV_PATH="${ENV_PATH:-$DEFAULT_ENV_PATH}"

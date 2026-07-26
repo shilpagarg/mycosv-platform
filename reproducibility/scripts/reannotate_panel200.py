@@ -15,7 +15,7 @@ import subprocess
 import sys
 from collections import defaultdict
 
-ROOT = "/mnt/bmh01-rds/Shilpa_Group/2024/projects/fungi/AMF/scale"
+ROOT = os.environ.get("MYCOSV_ROOT", os.getcwd())
 PANEL = f"{ROOT}/experiments/million_real/full_fungal_assembly_panel200_20260526_053633"
 REANN = "/tmp/reannotate"
 OUT = f"{ROOT}/experiments/biology_benchmark/panel200_reann"

@@ -5,9 +5,9 @@
 #SBATCH --mem=5300M
 #SBATCH --time=12:00:00
 #SBATCH --array=1-5
-#SBATCH --output=/mnt/bmh01-rds/Shilpa_Group/2024/projects/fungi/AMF/scale/logs/slurm/slurm-starfish-%A_%a.out
+#SBATCH --output=logs/slurm/slurm-starfish-%A_%a.out
 set -uo pipefail
-R=/mnt/bmh01-rds/Shilpa_Group/2024/projects/fungi/AMF/scale
+R="${MYCOSV_ROOT:-${SLURM_SUBMIT_DIR:-$PWD}}"
 cd $R; export PATH="$R/tools_src/starfish/bin:$R/tools_src/elembench/bin:$PATH"
 DB="$R/tools_src/starfish/db"; GEN="$R/experiments/biology_benchmark/genomes"
 read -r tag stem < <(sed -n "${SLURM_ARRAY_TASK_ID}p" $R/experiments/biology_benchmark/genomes.tsv)
