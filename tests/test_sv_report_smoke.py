@@ -22,7 +22,7 @@ from sv_visualization_report import (
 )
 
 
-ROOT = Path(__file__).resolve().parent
+ROOT = Path(__file__).resolve().parent.parent
 REPORT = ROOT / "sv_visualization_report.py"
 
 

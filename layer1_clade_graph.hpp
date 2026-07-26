@@ -863,12 +863,9 @@ inline bool detect_starship(std::string_view seq,
     return false;
 }
 
-// Starships are restricted to Pezizomycotina (the filamentous Ascomycota).
-// They are not found in the yeast subphyla Saccharomycotina or Taphrinomycotina,
-// so a phylum-only gate ("Ascomycota") wrongly admits yeasts and generates
-// compositional false positives there. When a class is available we therefore
-// deny the known non-Pezizomycotina Ascomycota classes; phylum still gates out
-// non-Ascomycota. With no class we fall back to the phylum-only behaviour.
+// Starships are Pezizomycotina-only; deny the yeast subphyla (Saccharomycotina,
+// Taphrinomycotina) by class. Phylum still gates out non-Ascomycota; with no
+// class, falls back to the phylum-only check.
 inline bool starship_supported(std::string_view phylum, std::string_view taxonClass = ".") {
     const bool phylumUnknown =
         phylum.empty() || phylum == "." || phylum == "unknown" || phylum == "UNKNOWN";
@@ -884,12 +881,9 @@ inline bool starship_supported(std::string_view phylum, std::string_view taxonCl
     return true;
 }
 
-// Repeat-Induced Point mutation (RIP) is a genome-defence process of the
-// filamentous ascomycetes and is absent in the budding-yeast subphyla
-// Saccharomycotina and Taphrinomycotina. Labelling AT-rich composition as RIP
-// in those lineages is therefore a false positive. When a class is available we
-// deny the same yeast classes used for Starship; with no class we keep the
-// sequence-only behaviour so standalone detector tests are unchanged.
+// RIP is a filamentous-ascomycete process, absent in the budding-yeast subphyla
+// (Saccharomycotina, Taphrinomycotina); deny those classes so AT-rich yeast
+// composition is not mislabelled RIP. No class -> sequence-only behaviour.
 inline bool rip_supported(std::string_view /*phylum*/, std::string_view taxonClass = ".") {
     static const std::string_view kNonRipClasses[] = {
         "Saccharomycetes", "Pichiomycetes", "Lipomycetes", "Dipodascomycetes",
@@ -914,19 +908,11 @@ inline bool detect_hgt_island(std::string_view seq,
     const int n = static_cast<int>(seq.size());
     if (n < minLen) return false;
 
-    // An HGT island is a SUSTAINED compositional shift over a multi-gene
-    // region, not a single deviating window, so at least minConsecWin
-    // consecutive windows must deviate.
-    //
-    // The deviation threshold is made adaptive to the genome background rather
-    // than fixed. A genome whose background GC is far from the typical fungal
-    // value (~0.50) - most importantly the low-GC budding yeasts - has a wider
-    // intrinsic spread of genic GC, so its ordinary coding windows deviate from
-    // the mean by more than a fixed 0.10 and are wrongly called HGT. Scaling
-    // the threshold by the distance of the background from 0.50 keeps the
-    // requirement near 0.10 for typical fungi while demanding a proportionally
-    // larger shift in compositionally atypical genomes. This is a candidate
-    // compositional screen, not proof of transfer.
+    // Require a SUSTAINED shift (>= minConsecWin consecutive deviating windows),
+    // not a single window. The threshold is adaptive: genomes far from typical
+    // fungal GC (~0.50), e.g. low-GC yeasts, have a wider intrinsic genic-GC
+    // spread, so scaling the requirement by |0.50 - cladeGc| avoids calling
+    // their ordinary coding windows HGT. Candidate screen, not proof of transfer.
     const double adaptiveDev =
         std::max(gcDeviation, gcDeviation + 0.6 * std::fabs(0.50 - cladeGc));
     int consec = 0;
@@ -990,19 +976,12 @@ inline ElementClass classify_repeat_element(std::string_view seq,
     if (seq.size() < 50u) return ElementClass::NONE;
 
     // Structural elements are classified BEFORE the generic RIP composition
-    // screen. RIP is a point-mutation signature (C->T / G->A) that AFFECTS a
-    // repeated element; it is not itself an element class, and a RIP-mutated
-    // Starship or TE is still a Starship or TE. Testing RIP first (as an
-    // earlier version did) let its AT-rich signature pre-empt Starship and TE
-    // labels - the AT-rich Starship hull and many TE bodies trip the RIP
-    // window - which zeroed the strict STARSHIP class and starved TE labels
-    // while over-labelling RIP (including in taxa with no RIP machinery). Most
-    // specific structural class first, RIP only when nothing structural fires.
+    // screen: RIP is a point-mutation signature that affects an element, not an
+    // element class, and a RIP-mutated Starship/TE is still a Starship/TE.
+    // (Testing RIP first zeroed STARSHIP and starved TE, since AT-rich hulls and
+    // TE bodies trip the RIP window.) Most-specific structural class first.
 
-    // Starship: large AT-rich element with GC-rich cargo.  Treat this as a
-    // taxon-aware label when phylum is known; without context use the
-    // sequence-only classifier for standalone detector tests and callers that
-    // do not pass taxonomy.
+    // Starship: taxon-aware when phylum/class known, else sequence-only.
     if (starship_supported(phylum, taxonClass) &&
         detect_starship(seq, cladeGc))                 return ElementClass::STARSHIP;
 

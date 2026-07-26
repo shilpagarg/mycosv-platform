@@ -24,9 +24,9 @@ def read_text_tsv(path: Path) -> str:
     return path.read_text()
 
 # Derive ROOT from this file's location so tests work from any checkout path.
-ROOT = Path(__file__).resolve().parent
+ROOT = Path(__file__).resolve().parent.parent
 MAIN = ROOT / 'main.cpp'
-SIM = ROOT / 'test_amf.py'
+SIM = ROOT / 'tests' / 'test_amf.py'
 BIN = ROOT / 'fungi_graphsv_tol_bin'
 EXE_CACHE = ROOT / '.codex_exe_cache'
 RUN_EXE_CACHE = ROOT / '.codex_run_exe'

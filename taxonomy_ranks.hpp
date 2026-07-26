@@ -7,7 +7,7 @@
 // iteration pass through rank_from_string / rank_to_string so a typo is
 // caught in one place at compile-time or parse-time.
 //
-// C++ mirror of the Python RANKS list in test_amf.py; both must be kept in sync.
+// C++ mirror of the Python RANKS list in tests/test_amf.py; both must be kept in sync.
 
 #include <string>
 

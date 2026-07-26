@@ -114,14 +114,14 @@ files such as `PREFIX.vcf` and `PREFIX.hits.tsv`.
 Run the quick smoke tests:
 
 ```bash
-pytest -q test_golden_smoke.py test_sv_report_smoke.py
+pytest -q tests/test_golden_smoke.py tests/test_sv_report_smoke.py
 ```
 
 Run the main small validation suite:
 
 ```bash
-python3 -m pytest test_pipeline_features.py test_amf.py test_all_use_cases.py -v
-python3 -m pytest test_real_fungal_benchmark.py test_new_biology_candidates.py -v
+python3 -m pytest tests/ -v
+python3 -m pytest tests/test_real_fungal_benchmark.py tests/test_new_biology_candidates.py -v
 ```
 
 Run the project experiment wrapper:
@@ -132,16 +132,16 @@ bash run_all_experiments.sh --large
 bash run_all_experiments.sh --real
 ```
 
-For full workflow details, see `EXPERIMENTS_GUIDE.md` and
-`QUICK_COMMAND_REFERENCE.md`.
+For full workflow details, see `docs/EXPERIMENTS_GUIDE.md` and
+`docs/QUICK_COMMAND_REFERENCE.md`.
 
 ## Documentation
 
-- `MYCOSV_ALGORITHM.md`: full algorithm and implementation specification
-- `MYCOSV_QUICK_REFERENCE.md`: concise architecture, parameters, and outputs
-- `DOCUMENTATION_INDEX.md`: map of project scripts, tests, and docs
-- `SV_TYPE_COVERAGE.md`: structural-variant type coverage notes
-- `BENCHMARKING_STRATEGY.md`: benchmark design and interpretation
+- `docs/MYCOSV_ALGORITHM.md`: full algorithm and implementation specification
+- `docs/MYCOSV_QUICK_REFERENCE.md`: concise architecture, parameters, and outputs
+- `docs/DOCUMENTATION_INDEX.md`: map of project scripts, tests, and docs
+- `docs/SV_TYPE_COVERAGE.md`: structural-variant type coverage notes
+- `docs/BENCHMARKING_STRATEGY.md`: benchmark design and interpretation
 
 ## Citation And Credit
 

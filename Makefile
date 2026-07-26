@@ -10,7 +10,7 @@ $(BIN): main.cpp $(wildcard *.hpp)
 	$(CXX) $(CXXFLAGS) main.cpp -o $@
 
 test: $(BIN)
-	python3 test_golden_smoke.py
+	python3 tests/test_golden_smoke.py
 
 clean:
 	rm -f $(BIN)

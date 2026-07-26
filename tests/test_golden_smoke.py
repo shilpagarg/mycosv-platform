@@ -6,9 +6,9 @@ import sys
 from pathlib import Path
 
 
-ROOT = Path(__file__).resolve().parent
+ROOT = Path(__file__).resolve().parent.parent
 BIN = ROOT / "fungi_graphsv_tol_bin"
-SIM = ROOT / "test_amf.py"
+SIM = ROOT / "tests" / "test_amf.py"
 MAIN = ROOT / "main.cpp"
 
 

@@ -16,7 +16,7 @@ from sv_pr_utils import expand_to_multisample_vcf, score_pr, write_pr_artifacts
 
 
 ROOT = Path(__file__).resolve().parent
-DEFAULT_SIM = ROOT / "test_amf.py"
+DEFAULT_SIM = ROOT / "tests" / "test_amf.py"
 DEFAULT_MAIN = ROOT / "main.cpp"
 DEFAULT_BIN = ROOT / "fungi_graphsv_tol_bin"
 DEFAULT_ANALYZE = ROOT / "analyze_new_biology_candidates.py"
