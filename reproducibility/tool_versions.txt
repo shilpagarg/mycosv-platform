@@ -1,0 +1,10 @@
+# Tool versions (comparators + core)
+g++: g++ (GCC) 11.5.0 20240719 (Red Hat 11.5.0-11)
+OcculterCut: v1.1 (SourceForge source build)
+RIPCAL: elembench bin
+TEsorter: 1.4.7 / REXdb
+starfish: tools_src/starfish
+genometools/LTRharvest: tools_src/genometools-1.6.5/bin/gt (GenomeTools) 1.6.5
+MycoMobilome: v1.1 (Zenodo 10.5281/zenodo.17473060)
+starbase: Zenodo 10.5281/zenodo.17533381
+minimap2/samtools: fungi_graph_sv conda env

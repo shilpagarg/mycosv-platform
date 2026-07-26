@@ -115,6 +115,7 @@ struct VariantCallBridge {
     // Routed taxonomic context for VCF/TSV/GFA reporting
     std::string cladeRank           = ".";
     std::string phylum              = ".";
+    std::string taxonClass          = ".";  // Pezizomycotina Starship gate
     // Query input mode - provenance label written to TSV/VCF
     std::string queryMode           = "assembly";
     // Probabilistic multi-evidence fusion summary for downstream ranking/reporting.
@@ -239,6 +240,9 @@ struct CladeGraphDescriptor {
     std::string cladeName;
     std::string cladeRank;
     std::string phylum;
+    std::string cls;        // taxonomic class; used to gate Pezizomycotina-only
+                            // element rules (Starship). Empty on legacy
+                            // registries -> classifier falls back to phylum.
     std::string graphPath;
     size_t      genomeCount     = 0;
     size_t      svBubbles       = 0;
@@ -487,6 +491,7 @@ public:
             d.cladeName       = get("clade_name", 0);
             d.cladeRank       = get("clade_rank", 1);
             d.phylum          = get("phylum", 2);
+            d.cls             = get("class", SIZE_MAX);  // absent on legacy registries
             d.graphPath       = get("graph_path", 3);
             d.genomeCount     = static_cast<size_t>(std::stoull(get("genome_count", 4)));
             d.svBubbles       = static_cast<size_t>(std::stoull(get("sv_bubbles", 5)));
@@ -1643,6 +1648,7 @@ public:
         std::shared_ptr<const std::string> seqShared;
         std::string cladeRank; // populated in multi-rank mode
         std::string phylum;
+        std::string cls = "."; // taxonomic class (Pezizomycotina Starship gate)
         double      cladeGc = 0.45; // background GC for HGT detection
 
         const std::string& seq() const {
@@ -1793,6 +1799,7 @@ public:
                         r.seqShared = kv.second;
                         r.cladeRank = d.cladeRank;
                         r.phylum    = d.phylum;
+                        r.cls       = d.cls.empty() ? "." : d.cls;
                         r.cladeGc   = cgc;
                         refsByContig_[kv.first].push_back(r);
                         allRefs_.push_back(std::move(r));
@@ -2180,6 +2187,7 @@ inline VariantCallBridge make_insdel_call(const std::string& qAsm,
     v.triallelicTopology = ".";
     v.cladeRank   = ref.cladeRank.empty() ? "." : ref.cladeRank;
     v.phylum      = ref.phylum.empty() ? "." : ref.phylum;
+    v.taxonClass  = ref.cls.empty() ? "." : ref.cls;
     v.readSupport = parse_pseudocontig_support(qContig);
     return v;
 }
@@ -2195,8 +2203,9 @@ inline void apply_element_annotation(VariantCallBridge& v,
                                      double cladeGc) {
     if (seq.empty()) { v.elementClass = "NONE"; return; }
     const ElementAnnotation a =
-        annotate_element(seq, cladeGc, v.phylum.empty() ? std::string_view(".")
-                                                        : std::string_view(v.phylum));
+        annotate_element(seq, cladeGc,
+                         v.phylum.empty() ? std::string_view(".") : std::string_view(v.phylum),
+                         v.taxonClass.empty() ? std::string_view(".") : std::string_view(v.taxonClass));
     v.elementClass = element_class_name(a.ec);
     if (a.ec == ElementClass::NONE) return;
 
@@ -2223,8 +2232,10 @@ inline VariantCallBridge make_offref_call(const std::string& qAsm,
                                           double cladeGc               = 0.45,
                                           const std::string& refAsm    = "OFF_REFERENCE",
                                           const std::string& cladeRank = ".",
-                                          const std::string& phylum    = ".") {
+                                          const std::string& phylum    = ".",
+                                          const std::string& taxonClass = ".") {
     VariantCallBridge v;
+    v.taxonClass = taxonClass.empty() ? "." : taxonClass;
     v.qAsm    = qAsm;
     v.qContig = qContig;
     v.refAsm  = refAsm;
@@ -2337,6 +2348,7 @@ discover_graph_native_offref_windows(const std::string& seq,
         std::string bestAsm = "OFF_REFERENCE";
         std::string bestRank = ".";
         std::string bestPhylum = ".";
+        std::string bestClass = ".";
         for (const auto* ref : scanRefs) {
             if (ref == nullptr || !ref->has_seq()) continue;
             const double ov = sparse_window_ref_overlap(windowHashes, ref);
@@ -2346,6 +2358,7 @@ discover_graph_native_offref_windows(const std::string& seq,
                 bestAsm = ref->clade.empty() ? ref->asmName : ref->clade;
                 bestRank = ref->cladeRank.empty() ? "." : ref->cladeRank;
                 bestPhylum = ref->phylum.empty() ? "." : ref->phylum;
+                bestClass = ref->cls.empty() ? "." : ref->cls;
             }
         }
         const std::string tier = infer_novelty_tier(bestOverlap);
@@ -2364,7 +2377,7 @@ discover_graph_native_offref_windows(const std::string& seq,
         ow.phylum = bestPhylum;
         ow.tier = tier;
         ow.elementClass = element_class_name(classify_repeat_element(
-            window, bestCladeGc, bestPhylum));
+            window, bestCladeGc, bestPhylum, bestClass));
         if (!out.empty() && out.back().tier == ow.tier && out.back().bestAsm == ow.bestAsm && out.back().end >= ow.start) {
             out.back().end = ow.end;
             if (out.back().elementClass == "NONE") out.back().elementClass = ow.elementClass;
@@ -2730,7 +2743,8 @@ static bool try_mem_chain_call(
                     std::string_view(qSeq.data() + teS,
                                      static_cast<size_t>(teE - teS)),
                     gcBg,
-                    (primaryRef != nullptr) ? primaryRef->phylum : ".");
+                    (primaryRef != nullptr) ? primaryRef->phylum : ".",
+                    (primaryRef != nullptr) ? primaryRef->cls : ".");
                 if (ec != ElementClass::NONE)
                     out.call.elementClass = element_class_name(ec);
             }
@@ -2751,7 +2765,8 @@ static bool try_mem_chain_call(
                     std::string_view(refSeq.data() + safeS,
                                      static_cast<size_t>(safeE - safeS)),
                     gcBg,
-                    primaryRef->phylum);
+                    primaryRef->phylum,
+                    primaryRef->cls);
                 if (ec != ElementClass::NONE)
                     out.call.elementClass = element_class_name(ec);
             }
@@ -3467,7 +3482,8 @@ static bool try_mem_chain_call_multi(
                         std::string_view(qSeq.data() + teS,
                                          static_cast<size_t>(teE - teS)),
                         gcBg,
-                        (eventRef != nullptr) ? eventRef->phylum : ".");
+                        (eventRef != nullptr) ? eventRef->phylum : ".",
+                        (eventRef != nullptr) ? eventRef->cls : ".");
                     if (ec != ElementClass::NONE)
                         v.elementClass = element_class_name(ec);
                 }
@@ -3487,7 +3503,8 @@ static bool try_mem_chain_call_multi(
                         std::string_view(refSeq.data() + safeS,
                                          static_cast<size_t>(safeE - safeS)),
                         gcBg,
-                        eventRef->phylum);
+                        eventRef->phylum,
+                        eventRef->cls);
                     if (ec != ElementClass::NONE)
                         v.elementClass = element_class_name(ec);
                 }
@@ -3815,10 +3832,12 @@ hierarchical_call_assembly(const std::string& qAsm,
         std::string bestAsmName = "OFF_REFERENCE";
         std::string bestCladeRank = ".";
         std::string bestPhylum = ".";
+        std::string bestClass = ".";
         double bestOtherCladeGc = 0.45;
         std::string bestOtherAsmName = "OFF_REFERENCE";
         std::string bestOtherCladeRank = ".";
         std::string bestOtherPhylum = ".";
+        std::string bestOtherClass = ".";
         // Path C novelty k: was clamped to 5-9, which made k-mer Jaccard
         // saturate for any two fungal sequences (4^7 = 16384 keys vs 30+ Mb
         // of reference) so the NOVEL tier almost never fired. Raise the
@@ -3839,6 +3858,7 @@ hierarchical_call_assembly(const std::string& qAsm,
                     bestAsmName   = ref.clade.empty() ? ref.asmName : ref.clade;
                     bestCladeRank = ref.cladeRank.empty() ? "." : ref.cladeRank;
                     bestPhylum    = ref.phylum.empty() ? "." : ref.phylum;
+                    bestClass     = ref.cls.empty() ? "." : ref.cls;
                 }
             } else {
                 if (ov > otherCladeOverlap) {
@@ -3847,6 +3867,7 @@ hierarchical_call_assembly(const std::string& qAsm,
                     bestOtherAsmName   = ref.clade.empty() ? ref.asmName : ref.clade;
                     bestOtherCladeRank = ref.cladeRank.empty() ? "." : ref.cladeRank;
                     bestOtherPhylum    = ref.phylum.empty() ? "." : ref.phylum;
+                    bestOtherClass     = ref.cls.empty() ? "." : ref.cls;
                 }
             }
         }
@@ -3862,11 +3883,13 @@ hierarchical_call_assembly(const std::string& qAsm,
             bestAsmName   = bestOtherAsmName;
             bestCladeRank = bestOtherCladeRank;
             bestPhylum    = bestOtherPhylum;
+            bestClass     = bestOtherClass;
         } else if (sameCladeOverlap <= 0.0 && otherCladeOverlap > 0.0) {
             bestCladeGc   = bestOtherCladeGc;
             bestAsmName   = bestOtherAsmName;
             bestCladeRank = bestOtherCladeRank;
             bestPhylum    = bestOtherPhylum;
+            bestClass     = bestOtherClass;
         }
         const OffRefNoveltyTier noveltyTier = hasRoutingCtx
             ? score_cross_clade_novelty(sameCladeOverlap, otherCladeOverlap)
@@ -3884,7 +3907,7 @@ hierarchical_call_assembly(const std::string& qAsm,
             append_window_calls(name, seq);
             if (out.size() == windowsBefore) {
                 auto ofcall = make_offref_call(qAsm, name, seq, tier,
-                                               bestCladeGc, bestAsmName, bestCladeRank, bestPhylum);
+                                               bestCladeGc, bestAsmName, bestCladeRank, bestPhylum, bestClass);
                 if (isHgt) ofcall.elementClass = "HGT";
                 out.push_back(std::move(ofcall));
             } else if (isHgt) {
@@ -4132,10 +4155,12 @@ hierarchical_call_assembly_multirank(
                 std::string bestAsmName = "OFF_REFERENCE";
                 std::string bestCladeRank = ".";
                 std::string bestPhylum = ".";
+                std::string bestClass = ".";
                 double bestOtherCladeGc = 0.45;
                 std::string bestOtherAsmName = "OFF_REFERENCE";
                 std::string bestOtherCladeRank = ".";
                 std::string bestOtherPhylum = ".";
+                std::string bestOtherClass = ".";
                 // Same Path C novelty-k change as in hierarchical_call_assembly:
                 // raise the clamp from 5-9 to 11-17 and combine Jaccard with
                 // best-containment so HGT/STARSHIP blocks bordered by host
@@ -4154,6 +4179,7 @@ hierarchical_call_assembly_multirank(
                             bestAsmName   = ref.clade.empty() ? ref.asmName : ref.clade;
                             bestCladeRank = ref.cladeRank.empty() ? "." : ref.cladeRank;
                             bestPhylum    = ref.phylum.empty() ? "." : ref.phylum;
+                    bestClass     = ref.cls.empty() ? "." : ref.cls;
                         }
                     } else {
                         if (ov > otherCladeOverlap) {
@@ -4162,6 +4188,7 @@ hierarchical_call_assembly_multirank(
                             bestOtherAsmName   = ref.clade.empty() ? ref.asmName : ref.clade;
                             bestOtherCladeRank = ref.cladeRank.empty() ? "." : ref.cladeRank;
                             bestOtherPhylum    = ref.phylum.empty() ? "." : ref.phylum;
+                    bestOtherClass     = ref.cls.empty() ? "." : ref.cls;
                         }
                     }
                 }
@@ -4176,11 +4203,13 @@ hierarchical_call_assembly_multirank(
                     bestAsmName   = bestOtherAsmName;
                     bestCladeRank = bestOtherCladeRank;
                     bestPhylum    = bestOtherPhylum;
+            bestClass     = bestOtherClass;
                 } else if (sameCladeOverlap <= 0.0 && otherCladeOverlap > 0.0) {
                     bestCladeGc   = bestOtherCladeGc;
                     bestAsmName   = bestOtherAsmName;
                     bestCladeRank = bestOtherCladeRank;
                     bestPhylum    = bestOtherPhylum;
+            bestClass     = bestOtherClass;
                 }
                 const OffRefNoveltyTier noveltyTier = hasRoutingCtx
                     ? score_cross_clade_novelty(sameCladeOverlap, otherCladeOverlap)
@@ -4192,7 +4221,7 @@ hierarchical_call_assembly_multirank(
                     append_rank_window_calls(name, seq);
                     if (rankCalls.size() == windowsBefore) {
                         auto ofcall = make_offref_call(qAsm, name, seq, tier,
-                                                       bestCladeGc, bestAsmName, bestCladeRank, bestPhylum);
+                                                       bestCladeGc, bestAsmName, bestCladeRank, bestPhylum, bestClass);
                         if (isHgt) ofcall.elementClass = "HGT";
                         rankCalls.push_back(std::move(ofcall));
                     } else if (isHgt) {

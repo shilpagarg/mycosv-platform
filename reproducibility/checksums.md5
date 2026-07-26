@@ -1,0 +1,5 @@
+1ce9f8e27122309ebbb9cf3b57a361e4  experiments/biology_benchmark/biology_comparator_pr.tsv
+df22b84207ce693695a11b42aaf7634b  experiments/biology_benchmark/ltr_benchmark_summary.tsv
+559819f944d4175ac4397115b00daa23  experiments/population/aflavus_pop_clean29.summary.tsv
+e0dae61389f59249c153a5f4fe5a0a1e  manuscript/tables/table1_pangenome_vs_single_reference.tsv
+880e6629d13c70159d5d80840ef8732f  manuscript/data/panel_read_validation_rate.tsv

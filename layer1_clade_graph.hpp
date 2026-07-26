@@ -863,10 +863,42 @@ inline bool detect_starship(std::string_view seq,
     return false;
 }
 
-inline bool starship_supported_phylum(std::string_view phylum) {
-    if (phylum.empty() || phylum == "." || phylum == "unknown" || phylum == "UNKNOWN")
-        return true;  // no taxonomic context available; preserve sequence-only classifier.
-    return phylum == "Ascomycota";
+// Starships are restricted to Pezizomycotina (the filamentous Ascomycota).
+// They are not found in the yeast subphyla Saccharomycotina or Taphrinomycotina,
+// so a phylum-only gate ("Ascomycota") wrongly admits yeasts and generates
+// compositional false positives there. When a class is available we therefore
+// deny the known non-Pezizomycotina Ascomycota classes; phylum still gates out
+// non-Ascomycota. With no class we fall back to the phylum-only behaviour.
+inline bool starship_supported(std::string_view phylum, std::string_view taxonClass = ".") {
+    const bool phylumUnknown =
+        phylum.empty() || phylum == "." || phylum == "unknown" || phylum == "UNKNOWN";
+    if (!phylumUnknown && phylum != "Ascomycota") return false;
+    // Saccharomycotina + Taphrinomycotina (yeast lineages): no Starships.
+    static const std::string_view kNonStarshipClasses[] = {
+        "Saccharomycetes", "Pichiomycetes", "Lipomycetes", "Dipodascomycetes",
+        "Trigonomycetes", "Schizosaccharomycetes", "Taphrinomycetes",
+        "Neolectomycetes", "Pneumocystidomycetes", "Archaeorhizomycetes",
+    };
+    for (const auto& c : kNonStarshipClasses)
+        if (taxonClass == c) return false;
+    return true;
+}
+
+// Repeat-Induced Point mutation (RIP) is a genome-defence process of the
+// filamentous ascomycetes and is absent in the budding-yeast subphyla
+// Saccharomycotina and Taphrinomycotina. Labelling AT-rich composition as RIP
+// in those lineages is therefore a false positive. When a class is available we
+// deny the same yeast classes used for Starship; with no class we keep the
+// sequence-only behaviour so standalone detector tests are unchanged.
+inline bool rip_supported(std::string_view /*phylum*/, std::string_view taxonClass = ".") {
+    static const std::string_view kNonRipClasses[] = {
+        "Saccharomycetes", "Pichiomycetes", "Lipomycetes", "Dipodascomycetes",
+        "Trigonomycetes", "Schizosaccharomycetes", "Taphrinomycetes",
+        "Neolectomycetes", "Pneumocystidomycetes", "Archaeorhizomycetes",
+    };
+    for (const auto& c : kNonRipClasses)
+        if (taxonClass == c) return false;
+    return true;
 }
 
 // detect_hgt_island
@@ -877,14 +909,35 @@ inline bool starship_supported_phylum(std::string_view phylum) {
 inline bool detect_hgt_island(std::string_view seq,
                                double cladeGc     = 0.45,
                                double gcDeviation = 0.10,  // candidate screen, not proof of HGT
-                               int    minLen      = 500) {
+                               int    minLen      = 500,
+                               int    minConsecWin = 3) {
     const int n = static_cast<int>(seq.size());
     if (n < minLen) return false;
 
+    // An HGT island is a SUSTAINED compositional shift over a multi-gene
+    // region, not a single deviating window, so at least minConsecWin
+    // consecutive windows must deviate.
+    //
+    // The deviation threshold is made adaptive to the genome background rather
+    // than fixed. A genome whose background GC is far from the typical fungal
+    // value (~0.50) - most importantly the low-GC budding yeasts - has a wider
+    // intrinsic spread of genic GC, so its ordinary coding windows deviate from
+    // the mean by more than a fixed 0.10 and are wrongly called HGT. Scaling
+    // the threshold by the distance of the background from 0.50 keeps the
+    // requirement near 0.10 for typical fungi while demanding a proportionally
+    // larger shift in compositionally atypical genomes. This is a candidate
+    // compositional screen, not proof of transfer.
+    const double adaptiveDev =
+        std::max(gcDeviation, gcDeviation + 0.6 * std::fabs(0.50 - cladeGc));
+    int consec = 0;
     for (int i = 0; i + minLen <= n; i += minLen / 2) {
         double wgc = gc_content(seq.substr(static_cast<size_t>(i),
                                            static_cast<size_t>(minLen)));
-        if (std::fabs(wgc - cladeGc) > gcDeviation) return true;
+        if (std::fabs(wgc - cladeGc) > adaptiveDev) {
+            if (++consec >= minConsecWin) return true;
+        } else {
+            consec = 0;
+        }
     }
     return false;
 }
@@ -932,27 +985,40 @@ inline bool detect_rip_window(std::string_view seq,
 // cladeGc: pass the background GC for the relevant clade; default 0.45.
 inline ElementClass classify_repeat_element(std::string_view seq,
                                              double cladeGc = 0.45,
-                                             std::string_view phylum = ".") {
+                                             std::string_view phylum = ".",
+                                             std::string_view taxonClass = ".") {
     if (seq.size() < 50u) return ElementClass::NONE;
 
-    // RIP takes priority (post-translational; affects any repeated element)
-    if (detect_rip_window(seq))                        return ElementClass::RIP;
+    // Structural elements are classified BEFORE the generic RIP composition
+    // screen. RIP is a point-mutation signature (C->T / G->A) that AFFECTS a
+    // repeated element; it is not itself an element class, and a RIP-mutated
+    // Starship or TE is still a Starship or TE. Testing RIP first (as an
+    // earlier version did) let its AT-rich signature pre-empt Starship and TE
+    // labels - the AT-rich Starship hull and many TE bodies trip the RIP
+    // window - which zeroed the strict STARSHIP class and starved TE labels
+    // while over-labelling RIP (including in taxa with no RIP machinery). Most
+    // specific structural class first, RIP only when nothing structural fires.
 
     // Starship: large AT-rich element with GC-rich cargo.  Treat this as a
     // taxon-aware label when phylum is known; without context use the
     // sequence-only classifier for standalone detector tests and callers that
     // do not pass taxonomy.
-    if (starship_supported_phylum(phylum) &&
+    if (starship_supported(phylum, taxonClass) &&
         detect_starship(seq, cladeGc))                 return ElementClass::STARSHIP;
-
-    // HGT: GC-shifted island
-    if (detect_hgt_island(seq, cladeGc))               return ElementClass::HGT;
 
     // TE subtypes
     if (detect_sine(seq))                              return ElementClass::TE_SINE;
     if (detect_tir_element(seq))                       return ElementClass::TE_TIR;
     if (detect_ltr_element(seq))                       return ElementClass::TE_LTR;
     if (detect_line_helitron(seq))                     return ElementClass::TE_LINE;
+
+    // HGT: GC-shifted island (structural donor signal, distinct from RIP)
+    if (detect_hgt_island(seq, cladeGc))               return ElementClass::HGT;
+
+    // RIP: composition signature, only when no structural element was found and
+    // the lineage actually undergoes RIP (excludes budding yeasts).
+    if (rip_supported(phylum, taxonClass) &&
+        detect_rip_window(seq))                        return ElementClass::RIP;
 
     // Generic tandem repeat
     if (detect_tandem_repeat(seq))                     return ElementClass::REPEAT;
@@ -1467,9 +1533,10 @@ struct ElementAnnotation {
 // signature runs for the horizontally mobile classes (Starship + HGT).
 inline ElementAnnotation annotate_element(std::string_view seq,
                                           double cladeGc = 0.45,
-                                          std::string_view phylum = ".") {
+                                          std::string_view phylum = ".",
+                                          std::string_view taxonClass = ".") {
     ElementAnnotation a;
-    a.ec = classify_repeat_element(seq, cladeGc, phylum);
+    a.ec = classify_repeat_element(seq, cladeGc, phylum, taxonClass);
     if (a.ec == ElementClass::NONE || seq.size() < 100u) return a;
 
     a.boundary = find_element_boundary(seq, a.ec, cladeGc);
@@ -1483,7 +1550,7 @@ inline ElementAnnotation annotate_element(std::string_view seq,
     // dispatch priority.
     const bool starshipLike =
         (a.ec == ElementClass::STARSHIP) ||
-        (starship_supported_phylum(phylum) && detect_starship(seq, cladeGc));
+        (starship_supported(phylum, taxonClass) && detect_starship(seq, cladeGc));
     const bool hgtLike =
         (a.ec == ElementClass::HGT) || detect_hgt_island(seq, cladeGc);
 
