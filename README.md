@@ -46,7 +46,7 @@ off-reference sequence that single-reference pipelines can miss.
 From the repository root:
 
 ```bash
-g++ -O2 -std=c++17 -pthread -I. main.cpp -o fungi_graphsv_tol_bin
+make            # or: g++ -O2 -std=c++17 -pthread -I. main.cpp -o fungi_graphsv_tol_bin
 ```
 
 To inspect available CLI options:
